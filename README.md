@@ -1,3 +1,5 @@
+<p align="center"><img src="https://raw.githubusercontent.com/go-ruby-parser/brand/main/social/go-ruby-parser.png" alt="go-ruby-parser/parser" width="720"></p>
+
 # parser — go-ruby-parser
 
 [![ci](https://github.com/go-ruby-parser/parser/actions/workflows/ci.yml/badge.svg)](https://github.com/go-ruby-parser/parser/actions/workflows/ci.yml)
