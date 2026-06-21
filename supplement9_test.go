@@ -68,3 +68,12 @@ func TestDefWithReceiver(t *testing.T) {
 		}
 	}
 }
+
+// TestStringControlEscapes exercises the single-character control escapes in
+// double-quoted strings (\a \b \v \f \s, alongside the existing \n \t \r \e \0).
+func TestStringControlEscapes(t *testing.T) {
+	src := `x = "\a\b\v\f\s\n\t\r\e\0"`
+	if _, err := parser.Parse(src); err != nil {
+		t.Errorf("Parse(%q) returned error: %v", src, err)
+	}
+}

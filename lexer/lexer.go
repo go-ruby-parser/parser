@@ -1277,6 +1277,16 @@ func (l *Lexer) scanStringSegment() (string, bool) {
 				b = append(b, '\t')
 			case 'r':
 				b = append(b, '\r')
+			case 'a':
+				b = append(b, 0x07)
+			case 'b':
+				b = append(b, 0x08)
+			case 'v':
+				b = append(b, 0x0b)
+			case 'f':
+				b = append(b, 0x0c)
+			case 's':
+				b = append(b, ' ')
 			case '\\':
 				b = append(b, '\\')
 			case '"':
