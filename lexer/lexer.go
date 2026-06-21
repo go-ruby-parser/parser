@@ -108,6 +108,9 @@ func (l *Lexer) next() token.Token {
 	case c == '%' && l.state == exprBegin && l.atPercentArray():
 		// %w[…] / %i[…] word- and symbol-array literals.
 		return l.lexPercentArray(spaceBefore, line, col)
+	case c == '%' && l.state == exprBegin && l.atPercentString():
+		// %q(…) / %Q(…) / %(…) string literals.
+		return l.lexPercentString(spaceBefore, line, col)
 	case c == '\n' || c == ';':
 		l.advance()
 		l.state = exprBegin
@@ -795,6 +798,96 @@ func (l *Lexer) lexPercentArray(spaceBefore bool, line, col int) token.Token {
 		tt = token.SYMBOLS
 	}
 	return token.Token{Type: tt, Lit: string(content), Line: line, Col: col, SpaceBefore: spaceBefore}
+}
+
+// isPercentDelim reports whether b can open a %-literal.
+func isPercentDelim(b byte) bool {
+	switch b {
+	case '(', '[', '{', '<', '|', '!', '/':
+		return true
+	}
+	return false
+}
+
+// atPercentString reports whether the cursor (at '%') begins a %q/%Q/%(…)
+// string literal: %q or %Q followed by a delimiter, or a bare % directly
+// followed by a delimiter (== %Q).
+func (l *Lexer) atPercentString() bool {
+	if c := l.peek2(); c == 'q' || c == 'Q' {
+		return l.pos+2 < len(l.src) && isPercentDelim(l.src[l.pos+2])
+	}
+	return isPercentDelim(l.peek2())
+}
+
+// lexPercentString lexes %q(…) (non-interpolating; only \<delim> and \\ escape),
+// and %Q(…) / %(…) (interpolating, double-quote semantics). Bracket delimiters
+// nest. The interpolating forms are spliced as the equivalent "…" string.
+func (l *Lexer) lexPercentString(spaceBefore bool, line, col int) token.Token {
+	l.advance() // %
+	interp := true
+	if c := l.peek(); c == 'q' || c == 'Q' {
+		interp = c == 'Q'
+		l.advance()
+	}
+	open := l.advance()
+	closing := percentDelimClose(open)
+	depth := 1
+	var body []byte
+	for {
+		c := l.peek()
+		if c == 0 {
+			return token.Token{Type: token.ILLEGAL, Lit: "unterminated %-string literal", Line: line, Col: col, SpaceBefore: spaceBefore}
+		}
+		if c == '\\' { // keep escape pairs verbatim; an escaped delimiter never nests
+			body = append(body, l.advance())
+			if l.peek() != 0 {
+				body = append(body, l.advance())
+			}
+			continue
+		}
+		if open != closing && c == open {
+			depth++
+		} else if c == closing {
+			depth--
+			if depth == 0 {
+				l.advance() // closing delimiter
+				break
+			}
+		}
+		body = append(body, l.advance())
+	}
+	l.state = exprEnd
+	if !interp {
+		return token.Token{Type: token.STRING, Lit: unescapePercentQ(string(body), open, closing), Line: line, Col: col, SpaceBefore: spaceBefore}
+	}
+	// Interpolating: lex the body as the equivalent double-quoted string and
+	// splice its tokens (dropping the trailing EOF) ahead of the cursor.
+	hts := New(`"` + wrapHeredocDQ(string(body)) + `"`).Tokenize()
+	first := hts[0]
+	first.Line, first.Col, first.SpaceBefore = line, col, spaceBefore
+	rest := hts[1:]
+	for len(rest) > 0 && rest[len(rest)-1].Type == token.EOF {
+		rest = rest[:len(rest)-1]
+	}
+	l.pending = append(l.pending, rest...)
+	return first
+}
+
+// unescapePercentQ resolves the single-quote-style escapes of a %q body: only
+// \\ and the (escaped) delimiters become literal; every other backslash stays.
+func unescapePercentQ(body string, open, closing byte) string {
+	var b strings.Builder
+	for i := 0; i < len(body); i++ {
+		if body[i] == '\\' && i+1 < len(body) {
+			if n := body[i+1]; n == '\\' || n == open || n == closing {
+				b.WriteByte(n)
+				i++
+				continue
+			}
+		}
+		b.WriteByte(body[i])
+	}
+	return b.String()
 }
 
 // splicePercentInterp turns a %W/%I body into the tokens of the equivalent

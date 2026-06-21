@@ -182,6 +182,16 @@ func (p *Parser) isLocal(n string) bool {
 	return false
 }
 
+// barewordValue turns a bare name into the node it denotes: a local-variable
+// reference when the name is a visible local, otherwise a no-arg method call on
+// self. Used for `{x:}` hash shorthand.
+func (p *Parser) barewordValue(name string) ast.Node {
+	if p.isLocal(name) {
+		return &ast.VarRef{Name: name}
+	}
+	return &ast.Call{Name: name}
+}
+
 // --- statements ---
 
 var (
@@ -1254,8 +1264,13 @@ func (p *Parser) parseHashLiteral() ast.Node {
 		}
 		if p.is(token.LABEL) {
 			// `name: value` — the label is sugar for a symbol key.
-			k = &ast.SymbolLit{Name: p.advance().Lit}
-			v = p.parseExprOrAssign()
+			name := p.advance().Lit
+			k = &ast.SymbolLit{Name: name}
+			if p.is(token.COMMA) || p.is(token.RBRACE) || p.is(token.NEWLINE) {
+				v = p.barewordValue(name) // `{x:}` shorthand == `{x: x}`
+			} else {
+				v = p.parseExprOrAssign()
+			}
 		} else {
 			k = p.parseExprOrAssign()
 			p.expect(token.HASHROCKET)
@@ -1432,7 +1447,12 @@ func (p *Parser) parsePrimary() ast.Node {
 		return &ast.FloatLit{Value: f}
 	case token.STRING:
 		p.advance()
-		return &ast.StringLit{Value: t.Lit}
+		// Adjacent string literals concatenate: `"a" "b"` == `"ab"`.
+		s := t.Lit
+		for p.is(token.STRING) {
+			s += p.advance().Lit
+		}
+		return &ast.StringLit{Value: s}
 	case token.SYMBOL:
 		p.advance()
 		return &ast.SymbolLit{Name: t.Lit}

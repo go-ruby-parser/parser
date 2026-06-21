@@ -29,15 +29,41 @@ func TestExtraValid4(t *testing.T) {
 
 // extraErrors4 hits lexer/parser error branches (e.g. atPercentArray falses).
 var extraErrors4 = []string{
-	"x = %q(hi)", // %q not an array letter -> % treated as modulo -> error
-	"%w",         // %w at EOF (no delimiter)
-	"%wz",        // %w followed by a non-delimiter
+	"%w",  // %w at EOF (no delimiter)
+	"%wz", // %w followed by a non-delimiter
+	"x = %q(unterminated",
+	"x = %Q[unterminated",
 }
 
 func TestExtraErrors4(t *testing.T) {
 	for _, src := range extraErrors4 {
 		if _, err := parser.Parse(src); err == nil {
 			t.Errorf("expected a parse error for %q, got none", src)
+		}
+	}
+}
+
+// extraValid9 covers the parser-feature batch: %q/%Q/%() string literals,
+// {x:} hash shorthand, and adjacent string-literal concatenation.
+var extraValid9 = []string{
+	`x = %q(hi there)`,
+	`x = %q[a\]b]`,
+	`x = %q{nest (parens) ok}`,
+	`x = %q!bang!`,
+	`n = 1; x = %Q(val #{n})`,
+	`n = 1; x = %(plain #{n})`,
+	`x = %Q{a #{1 + 2} b}`,
+	`x = 1; h = {x:}`,
+	`def m(a, b); {a:, b:}; end`,
+	`h = {foo:}`, // foo is a method call (not local)
+	`p "a" "b"`,
+	`x = "one" "two" "three"`,
+}
+
+func TestExtraValid9(t *testing.T) {
+	for _, src := range extraValid9 {
+		if _, err := parser.Parse(src); err != nil {
+			t.Errorf("Parse(%q) returned error: %v", src, err)
 		}
 	}
 }
