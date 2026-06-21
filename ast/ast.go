@@ -187,6 +187,15 @@ type IvarAssign struct {
 	Value Node
 }
 
+// CVarRef reads a class variable (@@name).
+type CVarRef struct{ Name string }
+
+// CVarAssign is `@@Name = Value`.
+type CVarAssign struct {
+	Name  string
+	Value Node
+}
+
 // ClassDef defines or reopens a class. Super is the optional superclass name.
 type ClassDef struct {
 	Name  string
@@ -388,6 +397,8 @@ func (*ConstRef) node()   {}
 func (*ConstAssign) node() {}
 func (*GVarRef) node()    {}
 func (*GVarAssign) node() {}
+func (*CVarRef) node()    {}
+func (*CVarAssign) node() {}
 func (*MultiAssign) node() {}
 func (*MatchPattern) node() {}
 func (*IvarRef) node()    {}

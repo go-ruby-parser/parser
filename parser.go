@@ -980,6 +980,12 @@ func (p *Parser) parseExprOrAssign() ast.Node {
 		p.expect(token.ASSIGN)
 		return &ast.IvarAssign{Name: name, Value: p.parseExprOrAssign()}
 	}
+	// Class-variable assignment: @@name '=' expr.
+	if p.is(token.CVAR) && p.peekTok().Type == token.ASSIGN {
+		name := p.advance().Lit
+		p.expect(token.ASSIGN)
+		return &ast.CVarAssign{Name: name, Value: p.parseExprOrAssign()}
+	}
 	// Global-variable assignment: $name '=' expr.
 	if p.is(token.GVAR) && p.peekTok().Type == token.ASSIGN {
 		name := p.advance().Lit
@@ -1006,6 +1012,13 @@ func (p *Parser) parseExprOrAssign() ast.Node {
 		op := p.advance().Lit
 		rhs := p.parseExprOrAssign()
 		return &ast.GVarAssign{Name: name, Value: &ast.BinaryExpr{Op: op, Left: &ast.GVarRef{Name: name}, Right: rhs}}
+	}
+	// Compound assignment to a class variable: @@name OP= expr.
+	if p.is(token.CVAR) && p.peekTok().Type == token.OPASSIGN {
+		name := p.advance().Lit
+		op := p.advance().Lit
+		rhs := p.parseExprOrAssign()
+		return &ast.CVarAssign{Name: name, Value: &ast.BinaryExpr{Op: op, Left: &ast.CVarRef{Name: name}, Right: rhs}}
 	}
 	left := p.parseTernary()
 	if p.is(token.OPASSIGN) {
@@ -1545,6 +1558,9 @@ func (p *Parser) parsePrimary() ast.Node {
 	case token.GVAR:
 		p.advance()
 		return &ast.GVarRef{Name: t.Lit}
+	case token.CVAR:
+		p.advance()
+		return &ast.CVarRef{Name: t.Lit}
 	case token.BEGIN:
 		return p.parseBegin()
 	case token.CASE:
@@ -1629,7 +1645,7 @@ func (p *Parser) canStartCommandArg() bool {
 	}
 	switch t.Type {
 	case token.INT, token.FLOAT, token.STRING, token.STRBEG, token.SYMBOL, token.IDENT, token.CONST,
-		token.IVAR, token.GVAR, token.TRUE, token.FALSE, token.NIL, token.SELF, token.BANG, token.TILDE,
+		token.IVAR, token.CVAR, token.GVAR, token.TRUE, token.FALSE, token.NIL, token.SELF, token.BANG, token.TILDE,
 		token.LPAREN, token.LBRACKET, token.ARROW:
 		return true
 	case token.MINUS, token.PLUS:
