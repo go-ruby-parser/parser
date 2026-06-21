@@ -318,10 +318,20 @@ func (p *Parser) parseModule() ast.Node {
 func (p *Parser) parseDef() ast.Node {
 	p.expect(token.DEF)
 	singleton := false
-	if p.is(token.SELF) && p.peekTok().Type == token.DOT {
-		p.advance() // self
+	var recv ast.Node
+	// A receiver before the method name: def self.foo / def obj.foo / def Const.foo.
+	// The current-token check guards peekTok against running past EOF.
+	if (p.is(token.SELF) || p.is(token.IDENT) || p.is(token.CONST)) && p.peekTok().Type == token.DOT {
+		switch {
+		case p.is(token.SELF):
+			p.advance() // self
+			singleton = true
+		case p.is(token.IDENT): // def obj.foo — singleton method on a local's object
+			recv = &ast.VarRef{Name: p.advance().Lit}
+		default: // def Const.foo — class/module method
+			recv = &ast.ConstRef{Name: p.advance().Lit}
+		}
 		p.advance() // .
-		singleton = true
 	}
 	name, ok := p.parseDefName()
 	if !ok {
@@ -344,7 +354,7 @@ func (p *Parser) parseDef() ast.Node {
 	if p.accept(token.ASSIGN) {
 		body := []ast.Node{p.parseExprOrAssign()}
 		p.popScope()
-		return &ast.MethodDef{Name: name, Params: params, Defaults: defaults, SplatIndex: splat, KwParams: kwParams, KwRest: kwRest, BlockParam: blockParam, Singleton: singleton, Body: body}
+		return &ast.MethodDef{Name: name, Params: params, Defaults: defaults, SplatIndex: splat, KwParams: kwParams, KwRest: kwRest, BlockParam: blockParam, Singleton: singleton, Recv: recv, Body: body}
 	}
 	body := p.parseStatements(beginBodyEnd)
 	// A method body may carry rescue/ensure clauses without an explicit begin.
@@ -353,7 +363,7 @@ func (p *Parser) parseDef() ast.Node {
 	}
 	p.popScope()
 	p.expect(token.END)
-	return &ast.MethodDef{Name: name, Params: params, Defaults: defaults, SplatIndex: splat, KwParams: kwParams, KwRest: kwRest, BlockParam: blockParam, Singleton: singleton, Body: body}
+	return &ast.MethodDef{Name: name, Params: params, Defaults: defaults, SplatIndex: splat, KwParams: kwParams, KwRest: kwRest, BlockParam: blockParam, Singleton: singleton, Recv: recv, Body: body}
 }
 
 // parseDefName reads the name in a `def`: an identifier/constant, an operator

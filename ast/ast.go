@@ -132,6 +132,7 @@ type MethodDef struct {
 	KwRest     string    // name of the **rest keyword-splat param, or "" if none
 	BlockParam string    // name of the &block param, or "" if none
 	Singleton  bool      // def self.foo — a singleton (class) method
+	Recv       Node      // def recv.foo — explicit non-self receiver (nil otherwise)
 	Body   []Node
 }
 
