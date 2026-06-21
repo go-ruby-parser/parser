@@ -58,6 +58,13 @@ var extraValid9 = []string{
 	`h = {foo:}`, // foo is a method call (not local)
 	`p "a" "b"`,
 	`x = "one" "two" "three"`,
+	// operator-method calls
+	`x = 1.+(2)`,
+	`x = a.<=>(b)`,
+	`x = a.*(3).-(1)`,
+	// multi-value return
+	"def m; return 1, 2; end",
+	"def m; return 1, 2, 3; end",
 }
 
 func TestExtraValid9(t *testing.T) {

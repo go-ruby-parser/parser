@@ -524,7 +524,16 @@ func (p *Parser) parseReturn() ast.Node {
 	if p.is(token.NEWLINE) || p.is(token.EOF) || p.is(token.END) || p.is(token.ELSE) || p.is(token.ELSIF) {
 		return &ast.Return{}
 	}
-	return &ast.Return{Value: p.parseExprOrAssign()}
+	first := p.parseExprOrAssign()
+	if !p.is(token.COMMA) {
+		return &ast.Return{Value: first}
+	}
+	// `return a, b, …` returns an array of the values.
+	elems := []ast.Node{first}
+	for p.accept(token.COMMA) {
+		elems = append(elems, p.parseExprOrAssign())
+	}
+	return &ast.Return{Value: &ast.ArrayLit{Elems: elems}}
 }
 
 func (p *Parser) parseBreak() ast.Node {
@@ -1415,6 +1424,13 @@ func (p *Parser) parseYield() ast.Node {
 func (p *Parser) methodName() string {
 	t := p.cur()
 	if t.Type == token.IDENT || t.Type == token.CONST {
+		p.advance()
+		return t.Lit
+	}
+	switch t.Type {
+	// Operator methods called explicitly: 1.+(2), a.<=>(b), …
+	case token.SPACESHIP, token.LT, token.GT, token.LE, token.GE, token.EQ, token.NEQ,
+		token.SHOVEL, token.PLUS, token.MINUS, token.STAR, token.SLASH, token.PERCENT, token.POW:
 		p.advance()
 		return t.Lit
 	}
