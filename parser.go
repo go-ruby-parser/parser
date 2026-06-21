@@ -980,6 +980,12 @@ func (p *Parser) parseExprOrAssign() ast.Node {
 		p.expect(token.ASSIGN)
 		return &ast.IvarAssign{Name: name, Value: p.parseExprOrAssign()}
 	}
+	// Global-variable assignment: $name '=' expr.
+	if p.is(token.GVAR) && p.peekTok().Type == token.ASSIGN {
+		name := p.advance().Lit
+		p.expect(token.ASSIGN)
+		return &ast.GVarAssign{Name: name, Value: p.parseExprOrAssign()}
+	}
 	// Compound assignment to a local / ivar: LHS OP= expr → LHS = LHS OP expr.
 	if p.is(token.IDENT) && p.peekTok().Type == token.OPASSIGN {
 		name := p.advance().Lit
@@ -993,6 +999,13 @@ func (p *Parser) parseExprOrAssign() ast.Node {
 		op := p.advance().Lit
 		rhs := p.parseExprOrAssign()
 		return &ast.IvarAssign{Name: name, Value: &ast.BinaryExpr{Op: op, Left: &ast.IvarRef{Name: name}, Right: rhs}}
+	}
+	// Compound assignment to a global: $name OP= expr → $name = $name OP expr.
+	if p.is(token.GVAR) && p.peekTok().Type == token.OPASSIGN {
+		name := p.advance().Lit
+		op := p.advance().Lit
+		rhs := p.parseExprOrAssign()
+		return &ast.GVarAssign{Name: name, Value: &ast.BinaryExpr{Op: op, Left: &ast.GVarRef{Name: name}, Right: rhs}}
 	}
 	left := p.parseTernary()
 	if p.is(token.OPASSIGN) {

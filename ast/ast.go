@@ -158,6 +158,12 @@ type ScopedConst struct {
 // GVarRef references a global variable by name ("$~", "$1", "$stdout", …).
 type GVarRef struct{ Name string }
 
+// GVarAssign is `$Name = Value`.
+type GVarAssign struct {
+	Name  string
+	Value Node
+}
+
 // MultiAssign is a destructuring assignment to local targets: a, b = 1, 2 or
 // a, *b = list. SplatIndex is the index of the *splat target in Names, or -1.
 type MultiAssign struct {
@@ -381,6 +387,7 @@ func (*Return) node()     {}
 func (*ConstRef) node()   {}
 func (*ConstAssign) node() {}
 func (*GVarRef) node()    {}
+func (*GVarAssign) node() {}
 func (*MultiAssign) node() {}
 func (*MatchPattern) node() {}
 func (*IvarRef) node()    {}
