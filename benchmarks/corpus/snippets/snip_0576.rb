@@ -1,0 +1,1 @@
+puts Image.new(2, 2)

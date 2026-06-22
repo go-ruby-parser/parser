@@ -1,0 +1,1 @@
+p Math::sqrt(4)

@@ -1,0 +1,1 @@
+p NDArray.from([1, 2, 3, 4, 5, 6], [2, 3]).transpose.to_a

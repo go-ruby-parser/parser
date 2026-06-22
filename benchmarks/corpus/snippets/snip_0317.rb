@@ -1,0 +1,1 @@
+p NDArray.from([1, 100], [2]).log.to_a.map { |x| x.round(4) }

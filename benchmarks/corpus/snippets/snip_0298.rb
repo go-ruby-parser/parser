@@ -1,0 +1,1 @@
+p Image.new(8, 8).median(1).width

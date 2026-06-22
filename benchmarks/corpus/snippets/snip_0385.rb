@@ -1,0 +1,1 @@
+p Set.new([1, 2]).send(:==, Set.new([2, 1, 3]))

@@ -1,0 +1,1 @@
+p Rational(1, 2).class

@@ -1,0 +1,1 @@
+puts BigDecimal("1.5").send(:+, BigDecimal("0.5")).to_s

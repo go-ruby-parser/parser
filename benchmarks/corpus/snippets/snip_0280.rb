@@ -1,0 +1,1 @@
+p Image.new(2, 2).adjust_brightness(10.0).width

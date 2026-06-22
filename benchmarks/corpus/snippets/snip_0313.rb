@@ -1,0 +1,1 @@
+p NDArray.from([0, 1, 2], [3]).exp.to_a.map { |x| x.round(4) }

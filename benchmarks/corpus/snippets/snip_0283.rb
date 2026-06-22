@@ -1,0 +1,1 @@
+p Image.new(2, 2).to_s

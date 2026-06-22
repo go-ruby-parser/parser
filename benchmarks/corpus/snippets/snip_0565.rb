@@ -1,0 +1,1 @@
+puts BigDecimal(BigDecimal("3.5"))

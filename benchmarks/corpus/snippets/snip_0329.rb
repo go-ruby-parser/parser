@@ -1,0 +1,1 @@
+p NDArray.from([1, 2, 3], [3]).dot(NDArray.from([4, 5, 6], [3])).to_a

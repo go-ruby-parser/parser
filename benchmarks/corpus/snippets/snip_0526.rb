@@ -1,0 +1,1 @@
+print "A\rB\eC\0D\qE"

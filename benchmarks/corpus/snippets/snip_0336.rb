@@ -1,0 +1,1 @@
+p NDArray.ones(3).to_a

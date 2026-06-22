@@ -1,0 +1,1 @@
+p Image.new(8, 8).gaussian_blur(1.0).width

@@ -1,0 +1,1 @@
+p Image.new(8, 8).box_blur(1).width

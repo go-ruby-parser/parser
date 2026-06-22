@@ -1,0 +1,1 @@
+p Image.new(8, 8).dilate(1).width

@@ -1,0 +1,1 @@
+p Set.new(["a", :a, 1, 1.5, true, nil])

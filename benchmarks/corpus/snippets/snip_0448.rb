@@ -1,0 +1,1 @@
+p(BigDecimal("0.5") <=> Rational(1, 2))

@@ -1,0 +1,1 @@
+p FFT.bartlett(5).map { |x| x.round(6) }

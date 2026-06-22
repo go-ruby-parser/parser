@@ -1,0 +1,1 @@
+p Set.new([1]).to_set.class

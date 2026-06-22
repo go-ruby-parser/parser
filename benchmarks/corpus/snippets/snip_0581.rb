@@ -1,0 +1,1 @@
+puts Set.new([1, 2])

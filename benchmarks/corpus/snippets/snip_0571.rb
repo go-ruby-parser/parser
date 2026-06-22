@@ -1,0 +1,1 @@
+puts Date.new(2026, 6, 21).prev_day(2).to_s

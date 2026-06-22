@@ -1,0 +1,1 @@
+p Time.strptime("2026-06-21", "%Y-%m-%d").to_i

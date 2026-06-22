@@ -1,0 +1,1 @@
+Image.new(2, 2).save("/no/such/dir/x.png")

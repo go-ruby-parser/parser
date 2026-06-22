@@ -1,0 +1,1 @@
+NDArray.zeros(2).matmul("x")

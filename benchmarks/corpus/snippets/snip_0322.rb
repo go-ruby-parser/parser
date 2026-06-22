@@ -1,0 +1,1 @@
+p NDArray.from([1, 2, 3, 4], [2, 2]).inspect

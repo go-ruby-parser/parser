@@ -1,0 +1,1 @@
+p NDArray.from([0], [1]).cos.to_a

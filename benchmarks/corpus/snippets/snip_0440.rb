@@ -1,0 +1,1 @@
+p(/\((?<n>\d+)\)/.match("(42)").named_captures)

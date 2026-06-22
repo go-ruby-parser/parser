@@ -1,0 +1,1 @@
+puts Time.at(0)

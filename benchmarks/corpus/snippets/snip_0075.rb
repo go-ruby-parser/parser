@@ -1,0 +1,1 @@
+Image.load("/nonexistent-rbgo.png")

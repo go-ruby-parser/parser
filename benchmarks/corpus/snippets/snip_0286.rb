@@ -1,0 +1,1 @@
+p Image.new(4, 4).flip_horizontal.width

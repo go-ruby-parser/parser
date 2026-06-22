@@ -1,0 +1,1 @@
+Date.new(2026, 6, 21).prev_day("x")

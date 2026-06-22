@@ -1,0 +1,1 @@
+p NDArray.from([1, 2], [2]).to_s

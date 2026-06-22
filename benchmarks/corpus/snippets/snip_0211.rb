@@ -1,0 +1,1 @@
+p BigDecimal("1.5").to_s

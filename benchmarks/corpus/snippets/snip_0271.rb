@@ -1,0 +1,1 @@
+p FFT.ifft(FFT.fft([1, 2, 3, 4])).map { |c| c.real.round }

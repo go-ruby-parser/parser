@@ -1,0 +1,1 @@
+p BigDecimal("2.5").to_f

@@ -1,0 +1,1 @@
+FFT.spectrogram([1.0, 2.0, 3.0, 4.0], 4, 4, FFT.hann(4), 1.0)

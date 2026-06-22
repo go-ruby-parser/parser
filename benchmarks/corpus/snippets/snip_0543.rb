@@ -1,0 +1,1 @@
+puts (BigDecimal("2") * BigDecimal("3.5")).to_s

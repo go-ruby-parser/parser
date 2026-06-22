@@ -1,0 +1,1 @@
+p Set.new.empty?

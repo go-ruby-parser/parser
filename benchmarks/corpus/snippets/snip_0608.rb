@@ -1,0 +1,1 @@
+s = Set.new([1, 2, 3]); s.delete(2); p s

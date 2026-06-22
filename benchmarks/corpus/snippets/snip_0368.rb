@@ -1,0 +1,1 @@
+p Rational(4, 9) ** Rational(1, 2)

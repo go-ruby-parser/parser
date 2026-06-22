@@ -1,0 +1,1 @@
+a = NDArray.from([4, 6, 8, 10], [2, 2]); p (a - NDArray.from([1, 2, 3, 4], [2, 2])).to_a

@@ -1,0 +1,1 @@
+p(/(?<=a)(?<m>b)/.match("ab").named_captures)

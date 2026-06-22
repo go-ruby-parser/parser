@@ -1,0 +1,1 @@
+p NDArray.from([1, 2], [2]).neg.to_a

@@ -1,0 +1,1 @@
+NDArray.arange(6)

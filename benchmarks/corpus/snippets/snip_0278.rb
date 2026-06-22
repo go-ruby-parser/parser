@@ -1,0 +1,1 @@
+p Image.decode(Image.new(8, 8).to_jpeg).width

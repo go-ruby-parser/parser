@@ -1,0 +1,1 @@
+p Set.new([1, 2]).include?(2)

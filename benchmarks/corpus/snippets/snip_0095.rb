@@ -1,0 +1,1 @@
+Rational(1, 2) / Rational(0, 1)

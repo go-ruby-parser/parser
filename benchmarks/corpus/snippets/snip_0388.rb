@@ -1,0 +1,1 @@
+p Set.new([1, 4]).subset?(Set.new([1, 2, 3]))

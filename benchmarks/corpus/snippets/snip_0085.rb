@@ -1,0 +1,1 @@
+NDArray.zeros(0).mean

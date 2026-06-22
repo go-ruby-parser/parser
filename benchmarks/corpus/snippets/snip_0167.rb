@@ -1,0 +1,1 @@
+i = Image.new(2, 2); i.set(0, 0, 10, 20, 30); p i.invert.get(0, 0)

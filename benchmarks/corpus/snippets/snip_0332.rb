@@ -1,0 +1,1 @@
+p NDArray.from([1, 4, 9, 16], [4]).sqrt.to_a

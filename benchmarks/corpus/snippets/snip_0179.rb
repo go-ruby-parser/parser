@@ -1,0 +1,1 @@
+p "héllo".gsub(/héllo/, "world")

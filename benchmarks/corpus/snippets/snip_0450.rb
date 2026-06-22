@@ -1,0 +1,1 @@
+p(BigDecimal("1") <= BigDecimal("1"))

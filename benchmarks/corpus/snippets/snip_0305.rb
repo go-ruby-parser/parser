@@ -1,0 +1,1 @@
+p Math.log(Math::E).round(9)

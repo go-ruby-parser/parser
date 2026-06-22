@@ -1,0 +1,1 @@
+p Image.new(2, 2).adjust_contrast(1.2).width

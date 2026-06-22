@@ -1,0 +1,1 @@
+puts (BigDecimal("10") / BigDecimal("4")).to_s

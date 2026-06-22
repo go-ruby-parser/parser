@@ -1,0 +1,1 @@
+NDArray.zeros(2) % NDArray.zeros(2)

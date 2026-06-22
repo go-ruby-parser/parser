@@ -1,0 +1,1 @@
+p Image.new(8, 8).crop(2, 2, 3, 3).width

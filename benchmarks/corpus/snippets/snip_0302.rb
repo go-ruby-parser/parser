@@ -1,0 +1,1 @@
+p Math.cos(0)

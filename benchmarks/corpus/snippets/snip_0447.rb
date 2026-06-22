@@ -1,0 +1,1 @@
+p(BigDecimal("0.1") + BigDecimal("0.2") == BigDecimal("0.3"))

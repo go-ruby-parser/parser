@@ -1,0 +1,1 @@
+p Math.hypot(3, 4)

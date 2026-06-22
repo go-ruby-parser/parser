@@ -1,0 +1,1 @@
+p Image.new(4, 3).rotate90.height

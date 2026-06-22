@@ -1,0 +1,1 @@
+p Set.new([1]).union(Set.new([2]))

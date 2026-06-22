@@ -1,0 +1,1 @@
+Set.new([1, 2, 3]).each { |x| print x }

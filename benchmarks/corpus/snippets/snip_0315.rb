@@ -1,0 +1,1 @@
+p NDArray.from([0], [1]).sin.to_a

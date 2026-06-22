@@ -1,0 +1,1 @@
+p Set.new([1, 2]).intersection(Set.new([2]))

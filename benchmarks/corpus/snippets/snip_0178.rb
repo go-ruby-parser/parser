@@ -1,0 +1,1 @@
+p "héllo héllo".scan(/héllo/)

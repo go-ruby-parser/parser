@@ -70,6 +70,18 @@ A broad, practical subset of Ruby 4.0, all differential-tested against MRI:
   (`$g = …`), multiple assignment / destructuring, **adjacent string-literal
   concatenation** (`"a" "b"`).
 
+## Performance
+
+On the both-accept corpus (the 615 harvested snippets + 110 real CRuby-4.0.5
+stdlib files **both** engines parse), go-ruby-parser **beats MRI's reference C
+parser**: it parses **1.5× faster than `RubyVM::AbstractSyntaxTree.parse` on
+small snippets and 2.1× faster on real stdlib files**, ~6× faster than
+`Ripper.sexp`, and the lexer is ~24–30× faster than `Ripper.lex` — all while
+building a full Go AST. Methodology, full parity tables, and the allocation
+hotspots / action items are in [`BENCHMARKS.md`](BENCHMARKS.md); reproduce with
+[`benchmarks/run.sh`](benchmarks) (an isolated module, outside the coverage
+gate).
+
 ## Known limitations
 
 The following are not yet parsed (they remain on go-embedded-ruby's roadmap;

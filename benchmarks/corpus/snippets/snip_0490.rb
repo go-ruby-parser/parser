@@ -1,0 +1,1 @@
+p(NDArray.zeros(2) ? "y" : "n")

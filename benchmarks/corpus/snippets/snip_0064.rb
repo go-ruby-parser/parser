@@ -1,0 +1,1 @@
+FFT.fftfreq(4, "x")

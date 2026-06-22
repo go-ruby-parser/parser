@@ -1,0 +1,1 @@
+puts Rational(1, 2)

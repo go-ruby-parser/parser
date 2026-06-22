@@ -1,0 +1,1 @@
+p (begin; NDArray.arange(6); rescue ArgumentError; "caught"; end)

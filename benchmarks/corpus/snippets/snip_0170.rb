@@ -1,0 +1,1 @@
+i = Image.new(4, 3); p [i.width, i.height]

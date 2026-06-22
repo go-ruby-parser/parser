@@ -1,0 +1,1 @@
+puts Date.new(2026, 6, 21).send(:-, 1).to_s

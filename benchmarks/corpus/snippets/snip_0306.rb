@@ -1,0 +1,1 @@
+p Math.sin(0)

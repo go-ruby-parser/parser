@@ -1,0 +1,1 @@
+Image.decode(123)

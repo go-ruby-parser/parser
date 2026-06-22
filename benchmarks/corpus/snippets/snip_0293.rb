@@ -1,0 +1,1 @@
+p Image.new(8, 8).canny(1.0, 0.1, 0.2).width

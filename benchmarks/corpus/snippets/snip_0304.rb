@@ -1,0 +1,1 @@
+p Math.log(8, 2).round(9)

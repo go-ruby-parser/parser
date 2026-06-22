@@ -1,0 +1,1 @@
+p Image.new(8, 8).resize(16, 4).height

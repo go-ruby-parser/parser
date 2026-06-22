@@ -1,0 +1,4 @@
+case [1, 2, 3]
+in [a, b]
+ puts "x"
+end

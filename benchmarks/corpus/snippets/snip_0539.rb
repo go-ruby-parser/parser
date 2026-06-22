@@ -1,0 +1,1 @@
+puts (BigDecimal("1.5") + 2).to_s

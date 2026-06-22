@@ -1,0 +1,1 @@
+p(BigDecimal("0") ? "y" : "n")

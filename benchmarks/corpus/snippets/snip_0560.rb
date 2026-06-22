@@ -1,0 +1,1 @@
+puts BigDecimal("3").send(:/, BigDecimal("2")).to_s

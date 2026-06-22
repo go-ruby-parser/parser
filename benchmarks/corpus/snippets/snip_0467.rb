@@ -1,0 +1,1 @@
+p(BigDecimal("2") == 2)

@@ -1,0 +1,1 @@
+p [Rational(1, 3), Rational(1, 2), Rational(1, 4)].sort

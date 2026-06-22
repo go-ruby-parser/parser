@@ -1,0 +1,1 @@
+p Image.new(4, 4).rgb_to_hsv.width

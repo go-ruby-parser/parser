@@ -1,0 +1,1 @@
+BigDecimal("1") < "x"

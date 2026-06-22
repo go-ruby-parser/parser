@@ -1,0 +1,1 @@
+puts Time.at(0).strftime("100%% done")

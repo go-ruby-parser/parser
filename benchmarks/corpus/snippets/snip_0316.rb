@@ -1,0 +1,1 @@
+p NDArray.from([1, -2, 3], [3]).abs.to_a

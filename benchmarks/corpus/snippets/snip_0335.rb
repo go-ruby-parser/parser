@@ -1,0 +1,1 @@
+p NDArray.full(7, 2).to_a

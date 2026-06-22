@@ -1,0 +1,1 @@
+p FFT.rfft([1.0, 2.0, 3.0, 4.0]).map { |c| c.real.round }

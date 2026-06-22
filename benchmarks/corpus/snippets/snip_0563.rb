@@ -1,0 +1,1 @@
+puts BigDecimal(2.5)

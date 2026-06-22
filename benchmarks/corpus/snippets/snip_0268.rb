@@ -1,0 +1,1 @@
+p FFT.fftfreq(4, 2.0)

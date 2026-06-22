@@ -1,0 +1,1 @@
+s = Set.new([1]); s.add(1); p s.size

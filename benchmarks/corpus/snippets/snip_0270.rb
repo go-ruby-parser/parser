@@ -1,0 +1,1 @@
+p FFT.hann(4).map { |x| x.round(6) }

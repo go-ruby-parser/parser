@@ -1,0 +1,1 @@
+p NDArray.arange(0, 5, 1).to_a

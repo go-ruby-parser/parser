@@ -1,0 +1,1 @@
+p 5.clamp(nil, 3)

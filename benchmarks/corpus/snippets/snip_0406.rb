@@ -1,0 +1,1 @@
+p Time.at(1000).send(:-, 5).to_i

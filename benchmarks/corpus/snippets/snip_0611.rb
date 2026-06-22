@@ -1,0 +1,1 @@
+s = Set.new([1]); p s.add?(1)

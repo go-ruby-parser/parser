@@ -1,0 +1,1 @@
+true + NDArray.zeros(2)

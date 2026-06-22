@@ -1,0 +1,1 @@
+p Rational(2, 3).denominator

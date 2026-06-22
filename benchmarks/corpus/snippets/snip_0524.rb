@@ -1,0 +1,1 @@
+p(Time.now.to_i > 0)

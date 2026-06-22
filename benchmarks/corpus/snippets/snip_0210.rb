@@ -1,0 +1,1 @@
+p BigDecimal("1.5").send(:==, BigDecimal("1.5"))

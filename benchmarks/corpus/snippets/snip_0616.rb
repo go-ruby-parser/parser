@@ -1,0 +1,1 @@
+s = Set.new([1]); s.merge([2, 3], Set.new([4])); p s
