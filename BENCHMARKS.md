@@ -32,9 +32,9 @@ machine and the same on-disk Ruby corpus.
   false-positive acceptances. See "Coverage gap" below for what is *outside*
   the parser's documented subset.
 - **Timing:** load all sources into memory once (no I/O in the loop); warm up;
-  Go uses `go test -bench -count=6` (Go's own best-fit timing), Ruby takes the
-  **best of 12** timed full-corpus passes after 3 warmups. Throughput in KB/s
-  (KB = 1024 B) over the corpus byte total, plus ns per file.
+  both sides take the **best of N** timed full-corpus passes in the same quiet
+  window (Go via `go test -bench -count=8`, Ruby via 15 passes after 4 warmups).
+  Throughput in KB/s (KB = 1024 B) over the corpus byte total, plus ns per file.
 
 Reproduce: `benchmarks/run.sh` (Go module is isolated from the 100%-coverage
 CI gate — see `benchmarks/go.mod`).
