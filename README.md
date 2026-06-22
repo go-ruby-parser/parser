@@ -47,9 +47,11 @@ A broad, practical subset of Ruby 4.0, all differential-tested against MRI:
 
 - **Literals:** integers (with `Bignum`/arbitrary precision, radix `0x`/`0o`/
   `0b`/`0d`, underscores), floats (incl. **scientific `1.5e3`**), strings
-  (double- and **single-quoted**, interpolation, heredocs `<<`/`<<-`/`<<~`),
-  symbols (incl. quoted/operator), `%w`/`%i`/`%W`/`%I` arrays, arrays, hashes,
-  ranges (incl. beginless/endless), regexps (`/re/imx`), `true`/`false`/`nil`.
+  (double- and **single-quoted**, interpolation, heredocs `<<`/`<<-`/`<<~`,
+  `%q`/`%Q` literals, the `\a`/`\b`/`\v`/`\f`/`\s`/`\n`/`\t`/`\r`/`\e`/`\0`
+  escapes), symbols (incl. quoted/operator), `%w`/`%i`/`%W`/`%I` arrays, arrays,
+  hashes (incl. the `{x:}` value-shorthand), ranges (incl. beginless/endless),
+  regexps (`/re/imx`), `true`/`false`/`nil`.
 - **Operators:** arithmetic, comparison/`<=>`, `==`/`===`, bitwise/shift,
   `&&`/`||`/`and`/`or`/`not`, ternary, `::` scope, safe navigation `&.`,
   compound assignment (`+=`, `-=`, `*=`, `/=`, `%=`, `<<=`, `||=`, `&&=`).
@@ -59,23 +61,23 @@ A broad, practical subset of Ruby 4.0, all differential-tested against MRI:
   `else`/`ensure`/`retry`, `break`/`next`/`return`, `loop`.
 - **Methods/blocks:** required/optional/`*splat`/keyword/`**rest`/`&block`
   params, endless methods (`def f = expr`), setters, operator/`[]`/`[]=` method
-  names, `{ }` / `do…end` blocks, `(a, b)` destructuring group params, stabby
-  lambdas `->(){}`, numbered params (`_1`) and `it`, `yield`, `super`.
+  names, **operator-method calls** (`1.+(2)`), `{ }` / `do…end` blocks,
+  `(a, b)` destructuring group params, stabby lambdas `->(){}`, numbered params
+  (`_1`) and `it`, `yield`, `super`, **multiple-value `return a, b`**.
 - **Classes/modules/metaprogramming:** `class`/`module`, inheritance, `@ivars`,
-  constants, `def self.`, multiple assignment / destructuring.
+  **`@@class variables`**, constants, singleton method defs
+  (`def self.foo`/`def obj.foo`/`def Const.foo`), **global-variable assignment**
+  (`$g = …`), multiple assignment / destructuring, **adjacent string-literal
+  concatenation** (`"a" "b"`).
 
 ## Known limitations
 
 The following are not yet parsed (they remain on go-embedded-ruby's roadmap;
 contributions welcome):
 
-- multiple-value `return a, b` (returns a single expression only)
-- class variables `@@cvar` and global-variable **assignment** (`$g = …`)
-- operator-method **calls** `1.+(2)`, hash-shorthand `{x:}`
 - paren-less command calls with keyword/splat/block args (`foo a: 1`)
-- adjacent string-literal concatenation (`"a" "b"`)
-- splat/default **block** parameters (`{ |*a| }`, `{ |a = 1| }`) and the
-  positional `Class(a)` find-pattern (`Class[a]` is supported)
+- splat/default **block** parameters (`{ |*a| }`, `{ |a = 1| }`)
+- the positional `Class(a)` find-pattern (`Class[a]` is supported)
 
 ## License
 
