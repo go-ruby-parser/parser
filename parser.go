@@ -1359,7 +1359,7 @@ func (p *Parser) parseLambda() ast.Node {
 	}
 	params = p.finishImplicitParams(bs, params)
 	p.popScope()
-	return &ast.Call{Name: "lambda", Block: &ast.Block{Params: params, Body: body}}
+	return &ast.Call{Name: "lambda", Block: &ast.Block{Params: params, SplatIndex: -1, Body: body}}
 }
 
 // parseBraceBlock parses `{ [|params|] body }`.
@@ -1381,8 +1381,9 @@ func (p *Parser) parseBlockRest(stop map[token.Type]bool, end token.Type) *ast.B
 	p.pushBlockScope()
 	var params []string
 	var prepends []ast.Node
+	splat := -1
 	if p.accept(token.PIPE) {
-		params, prepends = p.parseBlockParams(token.PIPE)
+		params, prepends, splat = p.parseBlockParams(token.PIPE)
 		p.expect(token.PIPE)
 		p.scope().explicitParams = true
 	}
@@ -1396,19 +1397,29 @@ func (p *Parser) parseBlockRest(stop map[token.Type]bool, end token.Type) *ast.B
 	if len(prepends) > 0 {
 		body = append(prepends, body...)
 	}
-	return &ast.Block{Params: params, Body: body}
+	return &ast.Block{Params: params, SplatIndex: splat, Body: body}
 }
 
 // parseBlockParams parses a block's `|...|` parameter list, where each parameter
 // is either a plain name or a destructuring group `(a, b)` / `(a, *b)`. A group
 // yields a synthetic flat parameter and an mlhs prepend that unpacks it.
-func (p *Parser) parseBlockParams(until token.Type) (names []string, prepends []ast.Node) {
+func (p *Parser) parseBlockParams(until token.Type) (names []string, prepends []ast.Node, splat int) {
+	splat = -1
 	if p.is(until) || p.is(token.NEWLINE) {
-		return names, prepends
+		return names, prepends, splat
 	}
 	group := 0
 	for {
-		if p.accept(token.LPAREN) {
+		if p.is(token.STAR) { // top-level rest param: |*rest| / |a, *rest|
+			p.advance()
+			if splat >= 0 {
+				p.fail("two rest parameters are not allowed")
+			}
+			splat = len(names)
+			name := p.expect(token.IDENT).Lit
+			names = append(names, name)
+			p.declareLocal(name)
+		} else if p.accept(token.LPAREN) {
 			var gnames []string
 			gsplat := -1
 			for {
@@ -1437,7 +1448,7 @@ func (p *Parser) parseBlockParams(until token.Type) (names []string, prepends []
 			break
 		}
 	}
-	return names, prepends
+	return names, prepends, splat
 }
 
 // parseYield parses `yield`, `yield(...)`, or `yield args`.

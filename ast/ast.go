@@ -93,8 +93,9 @@ type Call struct {
 // Block is a literal block: parameters and a body. It is a closure over the
 // scope in which it appears.
 type Block struct {
-	Params []string
-	Body   []Node
+	Params     []string
+	SplatIndex int // index of the top-level *splat param in Params, or -1
+	Body       []Node
 }
 
 // Yield invokes the block passed to the enclosing method.
