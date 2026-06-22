@@ -88,7 +88,7 @@ The following are not yet parsed (they remain on go-embedded-ruby's roadmap;
 contributions welcome):
 
 - paren-less command calls with keyword/splat/block args (`foo a: 1`)
-- splat/default **block** parameters (`{ |*a| }`, `{ |a = 1| }`)
+- default **block** parameters (`{ |a = 1| }`) — splat block params (`{ |*a| }`) are supported
 - the positional `Class(a)` find-pattern (`Class[a]` is supported)
 
 ## License
