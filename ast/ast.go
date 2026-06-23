@@ -98,6 +98,7 @@ type Block struct {
 	Params     []string
 	Defaults   []Node // parallel to Params; nil for a required or *splat param
 	SplatIndex int    // index of the top-level *splat param in Params, or -1
+	BlockParam string // name of the &block param, or "" if none (parallels MethodDef.BlockParam)
 	Body       []Node
 }
 

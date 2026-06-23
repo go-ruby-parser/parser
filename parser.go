@@ -1344,11 +1344,12 @@ func (p *Parser) parseLambda() ast.Node {
 	p.pushBlockScope()
 	var params []string
 	var defaults, prepends []ast.Node
+	var blockParam string
 	splat := -1
 	if p.accept(token.LPAREN) {
 		// The stabby-lambda `(...)` list shares the block parameter grammar, so it
-		// supports the same optional, *splat, and destructuring forms.
-		params, defaults, prepends, splat = p.parseBlockParams(token.RPAREN)
+		// supports the same optional, *splat, &block, and destructuring forms.
+		params, defaults, prepends, splat, blockParam = p.parseBlockParams(token.RPAREN)
 		p.expect(token.RPAREN)
 		p.scope().explicitParams = true
 	}
@@ -1367,7 +1368,7 @@ func (p *Parser) parseLambda() ast.Node {
 	if len(prepends) > 0 {
 		body = append(prepends, body...)
 	}
-	return &ast.Call{Name: "lambda", Block: &ast.Block{Params: params, Defaults: defaults, SplatIndex: splat, Body: body}}
+	return &ast.Call{Name: "lambda", Block: &ast.Block{Params: params, Defaults: defaults, SplatIndex: splat, BlockParam: blockParam, Body: body}}
 }
 
 // parseBraceBlock parses `{ [|params|] body }`.
@@ -1389,9 +1390,10 @@ func (p *Parser) parseBlockRest(stop map[token.Type]bool, end token.Type) *ast.B
 	p.pushBlockScope()
 	var params []string
 	var defaults, prepends []ast.Node
+	var blockParam string
 	splat := -1
 	if p.accept(token.PIPE) {
-		params, defaults, prepends, splat = p.parseBlockParams(token.PIPE)
+		params, defaults, prepends, splat, blockParam = p.parseBlockParams(token.PIPE)
 		p.expect(token.PIPE)
 		p.scope().explicitParams = true
 	}
@@ -1405,7 +1407,7 @@ func (p *Parser) parseBlockRest(stop map[token.Type]bool, end token.Type) *ast.B
 	if len(prepends) > 0 {
 		body = append(prepends, body...)
 	}
-	return &ast.Block{Params: params, Defaults: defaults, SplatIndex: splat, Body: body}
+	return &ast.Block{Params: params, Defaults: defaults, SplatIndex: splat, BlockParam: blockParam, Body: body}
 }
 
 // parseBlockParams parses a block's parameter list (the `|...|` form for brace/do
@@ -1415,13 +1417,18 @@ func (p *Parser) parseBlockRest(stop map[token.Type]bool, end token.Type) *ast.B
 // parameter and an mlhs prepend that unpacks it. defaults parallels names: it is
 // nil for a required, splat, or group param and the default expression for an
 // optional one — mirroring how parseDefParams records method-parameter defaults.
-func (p *Parser) parseBlockParams(until token.Type) (names []string, defaults, prepends []ast.Node, splat int) {
+func (p *Parser) parseBlockParams(until token.Type) (names []string, defaults, prepends []ast.Node, splat int, blockParam string) {
 	splat = -1
 	if p.is(until) || p.is(token.NEWLINE) {
-		return names, defaults, prepends, splat
+		return names, defaults, prepends, splat, blockParam
 	}
 	group := 0
 	for {
+		if p.accept(token.AMPER) { // &block param (always last), mirroring def params
+			blockParam = p.expect(token.IDENT).Lit
+			p.declareLocal(blockParam)
+			break
+		}
 		if p.is(token.STAR) { // top-level rest param: |*rest| / |a, *rest| / (*rest)
 			p.advance()
 			if splat >= 0 {
@@ -1473,7 +1480,7 @@ func (p *Parser) parseBlockParams(until token.Type) (names []string, defaults, p
 			break
 		}
 	}
-	return names, defaults, prepends, splat
+	return names, defaults, prepends, splat, blockParam
 }
 
 // parseYield parses `yield`, `yield(...)`, or `yield args`.
