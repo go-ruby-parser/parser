@@ -521,7 +521,11 @@ func (p *Parser) parseUntil() ast.Node {
 
 func (p *Parser) parseReturn() ast.Node {
 	p.expect(token.RETURN)
-	if p.is(token.NEWLINE) || p.is(token.EOF) || p.is(token.END) || p.is(token.ELSE) || p.is(token.ELSIF) {
+	// A value-less `return` ends at a terminator, a body/block close, or a
+	// trailing modifier (`return if c`, `return unless c`) — same rule as
+	// break/next. Without this, `return unless x` would parse `unless x … end`
+	// as the return value and swallow the matching `end`.
+	if p.atStatementEnd() {
 		return &ast.Return{}
 	}
 	first := p.parseExprOrAssign()
@@ -553,7 +557,8 @@ func (p *Parser) parseNext() ast.Node {
 }
 
 // atStatementEnd reports whether the cursor is at a point where a value-less
-// break/next ends: a terminator, a block/body close, or a trailing modifier.
+// return/break/next ends: a terminator, a block/body close (end, else, elsif,
+// `}`), or a trailing modifier (if/unless/while/until).
 func (p *Parser) atStatementEnd() bool {
 	switch p.cur().Type {
 	case token.NEWLINE, token.EOF, token.END, token.ELSE, token.ELSIF, token.RBRACE,

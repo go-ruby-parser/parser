@@ -37,8 +37,11 @@ func TestIfExpression(t *testing.T) {
 			},
 		},
 		{
-			name: "return if",
-			src:  "return if c then 1 else 2 end",
+			// Parenthesized: an if-expression as the return value. Without the
+			// parens, `return if c …` is a bare return with an if MODIFIER (MRI
+			// rejects `return if c then … end`), covered in TestReturnModifier.
+			name: "return paren if",
+			src:  "return (if c then 1 else 2 end)",
 			check: func(t *testing.T, n *ast.If) {
 				if len(n.Then) != 1 {
 					t.Errorf("then=%d, want 1", len(n.Then))
