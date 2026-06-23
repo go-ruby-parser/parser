@@ -40,6 +40,10 @@ type Lexer struct {
 	// source lines those bodies span, to keep l.line correct after the jump.
 	htResume int
 	htLines  int
+	// prevType is the type of the last token next() returned, used to recognise a
+	// trailing-operator line continuation (a line ending in an infix operator
+	// joins the next line, as MRI does).
+	prevType token.Type
 }
 
 func New(src string) *Lexer {
@@ -84,7 +88,33 @@ func (l *Lexer) Tokenize() []token.Token {
 	}
 }
 
+// next returns the next token and records its type, so the lexer can recognise a
+// trailing-operator line continuation. The lexing itself is in lexToken.
 func (l *Lexer) next() token.Token {
+	t := l.lexToken()
+	l.prevType = t.Type
+	return t
+}
+
+// isContinuationOp reports whether a line ending in token type t is incomplete,
+// so the trailing newline continues onto the next line rather than terminating
+// the statement. These are infix operators (plus comma and a trailing dot) that
+// require a right-hand operand. Deliberately excluded as ambiguous: `|` and `&`
+// (block params / block-pass), `^` (pattern pin), `:` (label/symbol/ternary),
+// `<<` (heredoc opener).
+func isContinuationOp(t token.Type) bool {
+	switch t {
+	case token.PLUS, token.MINUS, token.STAR, token.POW, token.SLASH, token.PERCENT,
+		token.EQ, token.EQQ, token.MATCH, token.NEQ, token.LT, token.GT, token.LE,
+		token.GE, token.SPACESHIP, token.ANDAND, token.OROR,
+		token.ASSIGN, token.OPASSIGN, token.COMMA, token.HASHROCKET,
+		token.DOT, token.SAFEDOT, token.QUESTION:
+		return true
+	}
+	return false
+}
+
+func (l *Lexer) lexToken() token.Token {
 	// Drain any tokens produced ahead of the cursor (a spliced heredoc value).
 	if len(l.pending) > 0 {
 		t := l.pending[0]
@@ -127,6 +157,12 @@ func (l *Lexer) next() token.Token {
 		// previous expression (MRI joins such lines in the lexer). `;` is an
 		// explicit terminator and is never suppressed this way.
 		if c == '\n' && l.nextLineStartsWithDot() {
+			return l.next()
+		}
+		// Trailing-operator continuation: a line ending in an infix operator
+		// (`a ||`, `x +`, a trailing comma, …) is incomplete and joins the next
+		// line. `;` is an explicit terminator and is never suppressed this way.
+		if c == '\n' && isContinuationOp(l.prevType) {
 			return l.next()
 		}
 		return mk(token.NEWLINE, "\\n")
