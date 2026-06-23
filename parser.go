@@ -1707,7 +1707,9 @@ func (p *Parser) canStartCommandArg() bool {
 	switch t.Type {
 	case token.INT, token.FLOAT, token.STRING, token.STRBEG, token.SYMBOL, token.IDENT, token.CONST,
 		token.IVAR, token.CVAR, token.GVAR, token.TRUE, token.FALSE, token.NIL, token.SELF, token.BANG, token.TILDE,
-		token.LPAREN, token.LBRACKET, token.ARROW, token.WORDS, token.SYMBOLS, token.REGEXP:
+		token.LPAREN, token.LBRACKET, token.ARROW, token.WORDS, token.SYMBOLS, token.REGEXP,
+		token.BEGIN, token.CASE:
+		// Value-producing keywords: `p begin; 1; end`, `p case x; when 1; 2; end`.
 		return true
 	case token.MINUS, token.PLUS:
 		// Unary-style argument: `foo -1` (operand hugs the sign), not `foo - 1`.
