@@ -1622,6 +1622,10 @@ func (p *Parser) parsePrimary() ast.Node {
 		return p.parseIf()
 	case token.UNLESS:
 		return p.parseUnless()
+	case token.WHILE:
+		return p.parseWhile()
+	case token.UNTIL:
+		return p.parseUntil()
 	case token.STRBEG:
 		return p.parseInterpString()
 	}
