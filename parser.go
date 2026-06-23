@@ -1611,6 +1611,10 @@ func (p *Parser) parsePrimary() ast.Node {
 		return p.parseBegin()
 	case token.CASE:
 		return p.parseCase()
+	case token.IF:
+		return p.parseIf()
+	case token.UNLESS:
+		return p.parseUnless()
 	case token.STRBEG:
 		return p.parseInterpString()
 	}
