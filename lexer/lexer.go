@@ -122,6 +122,13 @@ func (l *Lexer) next() token.Token {
 			l.col = 0
 			l.htResume, l.htLines = 0, 0
 		}
+		// Leading-dot continuation: a newline whose next significant token is `.`
+		// or `&.` does not terminate the statement — the dot line chains onto the
+		// previous expression (MRI joins such lines in the lexer). `;` is an
+		// explicit terminator and is never suppressed this way.
+		if c == '\n' && l.nextLineStartsWithDot() {
+			return l.next()
+		}
 		return mk(token.NEWLINE, "\\n")
 	case isDigit(c):
 		return l.lexNumber(spaceBefore, line, col)
@@ -388,6 +395,32 @@ func (l *Lexer) skipSpaceAndComments() bool {
 			return seen
 		}
 	}
+}
+
+// nextLineStartsWithDot reports whether the first significant character at or
+// after the cursor — skipping spaces, tabs, CR, blank lines, and comments — is a
+// leading `.` (method-chain dot, not a `..`/`...` range) or `&.` safe-nav dot.
+// It does not advance the cursor.
+func (l *Lexer) nextLineStartsWithDot() bool {
+	p := l.pos
+	for p < len(l.src) {
+		switch c := l.src[p]; {
+		case c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' || c == '\v':
+			p++
+		case c == '#': // comment to end of line
+			for p < len(l.src) && l.src[p] != '\n' {
+				p++
+			}
+		case c == '.':
+			// A `.` chains; a `..`/`...` range does not.
+			return p+1 >= len(l.src) || l.src[p+1] != '.'
+		case c == '&':
+			return p+1 < len(l.src) && l.src[p+1] == '.'
+		default:
+			return false
+		}
+	}
+	return false
 }
 
 func (l *Lexer) lexNumber(spaceBefore bool, line, col int) token.Token {
