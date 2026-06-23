@@ -1214,12 +1214,26 @@ func (p *Parser) parsePostfixTail(node ast.Node) ast.Node {
 		switch {
 		case p.is(token.DOT) || p.is(token.SAFEDOT):
 			safe := p.advance().Type == token.SAFEDOT
+			// `.()` shorthand: `recv.(args)` desugars to `recv.call(args)`. The
+			// '(' hugs the dot (no method name token), so read it directly.
+			if p.is(token.LPAREN) && !p.cur().SpaceBefore {
+				p.advance()
+				args := p.parseCallArgs(token.RPAREN)
+				p.expect(token.RPAREN)
+				node = &ast.Call{Recv: node, Name: "call", Args: args, Safe: safe}
+				break
+			}
 			name := p.methodName()
 			var args []ast.Node
 			if p.is(token.LPAREN) && !p.cur().SpaceBefore {
 				p.advance()
 				args = p.parseCallArgs(token.RPAREN)
 				p.expect(token.RPAREN)
+			} else if p.canStartCommandArg() {
+				// Paren-less command call on a receiver: `obj.foo bar`,
+				// `Fiber.yield 1`. The space-separated argument list terminates
+				// this postfix chain (it greedily consumes the rest), so return.
+				return &ast.Call{Recv: node, Name: name, Args: p.parseCommandArgs(), Safe: safe}
 			}
 			node = &ast.Call{Recv: node, Name: name, Args: args, Safe: safe}
 		case p.is(token.SCOPE):
