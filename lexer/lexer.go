@@ -105,11 +105,11 @@ func (l *Lexer) next() token.Token {
 		// At expression-begin position a '/' opens a regexp literal, not division
 		// (the same disambiguation MRI uses via its lexer state).
 		return l.lexRegexp(spaceBefore, line, col)
-	case c == '%' && l.state == exprBegin && l.atPercentArray():
-		// %w[…] / %i[…] word- and symbol-array literals.
+	case c == '%' && l.percentBeginsLiteral(spaceBefore) && l.atPercentArray():
+		// %w[…] / %i[…] / %W[…] / %I[…] word- and symbol-array literals.
 		return l.lexPercentArray(spaceBefore, line, col)
-	case c == '%' && l.state == exprBegin && l.atPercentString():
-		// %q(…) / %Q(…) / %(…) string literals.
+	case c == '%' && l.percentBeginsLiteral(spaceBefore) && l.atPercentString():
+		// %q(…) / %Q(…) / %(…) / %W(…) string literals.
 		return l.lexPercentString(spaceBefore, line, col)
 	case c == '\n' || c == ';':
 		l.advance()
@@ -748,6 +748,20 @@ func percentDelimClose(open byte) byte {
 		return '>'
 	}
 	return open
+}
+
+// percentBeginsLiteral reports whether a '%' at the cursor introduces a
+// percent-literal rather than the binary modulo operator. This mirrors the
+// '/' regexp-vs-division rule: a literal starts whenever a value/operand is
+// expected (exprBegin). It additionally fires in command-argument position —
+// just after a value (exprEnd), when the '%' has a space before it but the
+// percent-kind/delimiter hugs it with no space after — so `p %w[a b]` lexes
+// the argument as a literal while `a % b` and `a %b` stay modulo.
+func (l *Lexer) percentBeginsLiteral(spaceBefore bool) bool {
+	if l.state == exprBegin {
+		return true
+	}
+	return spaceBefore
 }
 
 // atPercentArray reports whether the cursor (positioned at '%') begins a
