@@ -91,10 +91,13 @@ type Call struct {
 }
 
 // Block is a literal block: parameters and a body. It is a closure over the
-// scope in which it appears.
+// scope in which it appears. Defaults parallels Params (nil for a required or
+// *splat param; non-nil for an optional `name = expr` param), exactly as
+// MethodDef records its method-parameter defaults.
 type Block struct {
 	Params     []string
-	SplatIndex int // index of the top-level *splat param in Params, or -1
+	Defaults   []Node // parallel to Params; nil for a required or *splat param
+	SplatIndex int    // index of the top-level *splat param in Params, or -1
 	Body       []Node
 }
 

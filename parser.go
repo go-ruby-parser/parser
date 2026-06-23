@@ -103,6 +103,10 @@ type Parser struct {
 	// patternDepth > 0 while parsing a pattern atom, where a top-level `|` is the
 	// alternation separator rather than the bitwise-or operator.
 	patternDepth int
+	// noPipe suppresses treating `|` as the bitwise-or operator while parsing the
+	// default expression of an optional block parameter inside a `|...|` list, so
+	// the `|` there closes the parameter list rather than continuing the default.
+	noPipe bool
 }
 
 // Parse lexes and parses src into a Program.
@@ -450,20 +454,6 @@ func (p *Parser) parseDefParams(until token.Type) (params []string, defaults []a
 		}
 	}
 	return params, defaults, splat, kwParams, kwRest, blockParam
-}
-
-func (p *Parser) parseParamNames(until token.Type) []string {
-	var params []string
-	if p.is(until) || p.is(token.NEWLINE) {
-		return params
-	}
-	for {
-		params = append(params, p.expect(token.IDENT).Lit)
-		if !p.accept(token.COMMA) {
-			break
-		}
-	}
-	return params
 }
 
 func (p *Parser) parseIf() ast.Node {
@@ -1157,7 +1147,7 @@ func (p *Parser) parseBinary(minBP int) ast.Node {
 		bp := binBP(tt)
 		// Inside a pattern, a top-level `|` separates alternatives rather than
 		// being the bitwise-or operator.
-		if p.patternDepth > 0 && tt == token.PIPE {
+		if (p.patternDepth > 0 || p.noPipe) && tt == token.PIPE {
 			bp = 0
 		}
 		if bp == 0 || bp <= minBP {
@@ -1339,13 +1329,14 @@ func (p *Parser) parseLambda() ast.Node {
 	p.expect(token.ARROW)
 	p.pushBlockScope()
 	var params []string
+	var defaults, prepends []ast.Node
+	splat := -1
 	if p.accept(token.LPAREN) {
-		params = p.parseParamNames(token.RPAREN)
+		// The stabby-lambda `(...)` list shares the block parameter grammar, so it
+		// supports the same optional, *splat, and destructuring forms.
+		params, defaults, prepends, splat = p.parseBlockParams(token.RPAREN)
 		p.expect(token.RPAREN)
 		p.scope().explicitParams = true
-	}
-	for _, prm := range params {
-		p.declareLocal(prm)
 	}
 	bs := p.scope()
 	var body []ast.Node
@@ -1359,7 +1350,10 @@ func (p *Parser) parseLambda() ast.Node {
 	}
 	params = p.finishImplicitParams(bs, params)
 	p.popScope()
-	return &ast.Call{Name: "lambda", Block: &ast.Block{Params: params, SplatIndex: -1, Body: body}}
+	if len(prepends) > 0 {
+		body = append(prepends, body...)
+	}
+	return &ast.Call{Name: "lambda", Block: &ast.Block{Params: params, Defaults: defaults, SplatIndex: splat, Body: body}}
 }
 
 // parseBraceBlock parses `{ [|params|] body }`.
@@ -1380,10 +1374,10 @@ func (p *Parser) parseDoBlock() *ast.Block {
 func (p *Parser) parseBlockRest(stop map[token.Type]bool, end token.Type) *ast.Block {
 	p.pushBlockScope()
 	var params []string
-	var prepends []ast.Node
+	var defaults, prepends []ast.Node
 	splat := -1
 	if p.accept(token.PIPE) {
-		params, prepends, splat = p.parseBlockParams(token.PIPE)
+		params, defaults, prepends, splat = p.parseBlockParams(token.PIPE)
 		p.expect(token.PIPE)
 		p.scope().explicitParams = true
 	}
@@ -1397,20 +1391,24 @@ func (p *Parser) parseBlockRest(stop map[token.Type]bool, end token.Type) *ast.B
 	if len(prepends) > 0 {
 		body = append(prepends, body...)
 	}
-	return &ast.Block{Params: params, SplatIndex: splat, Body: body}
+	return &ast.Block{Params: params, Defaults: defaults, SplatIndex: splat, Body: body}
 }
 
-// parseBlockParams parses a block's `|...|` parameter list, where each parameter
-// is either a plain name or a destructuring group `(a, b)` / `(a, *b)`. A group
-// yields a synthetic flat parameter and an mlhs prepend that unpacks it.
-func (p *Parser) parseBlockParams(until token.Type) (names []string, prepends []ast.Node, splat int) {
+// parseBlockParams parses a block's parameter list (the `|...|` form for brace/do
+// blocks and the `(...)` form for stabby lambdas), where each parameter is either
+// a plain name, an optional `name = default` param, a top-level `*rest` splat, or
+// a destructuring group `(a, b)` / `(a, *b)`. A group yields a synthetic flat
+// parameter and an mlhs prepend that unpacks it. defaults parallels names: it is
+// nil for a required, splat, or group param and the default expression for an
+// optional one — mirroring how parseDefParams records method-parameter defaults.
+func (p *Parser) parseBlockParams(until token.Type) (names []string, defaults, prepends []ast.Node, splat int) {
 	splat = -1
 	if p.is(until) || p.is(token.NEWLINE) {
-		return names, prepends, splat
+		return names, defaults, prepends, splat
 	}
 	group := 0
 	for {
-		if p.is(token.STAR) { // top-level rest param: |*rest| / |a, *rest|
+		if p.is(token.STAR) { // top-level rest param: |*rest| / |a, *rest| / (*rest)
 			p.advance()
 			if splat >= 0 {
 				p.fail("two rest parameters are not allowed")
@@ -1418,6 +1416,7 @@ func (p *Parser) parseBlockParams(until token.Type) (names []string, prepends []
 			splat = len(names)
 			name := p.expect(token.IDENT).Lit
 			names = append(names, name)
+			defaults = append(defaults, nil)
 			p.declareLocal(name)
 		} else if p.accept(token.LPAREN) {
 			var gnames []string
@@ -1437,18 +1436,30 @@ func (p *Parser) parseBlockParams(until token.Type) (names []string, prepends []
 			syn := "(" + strconv.Itoa(group) + ")"
 			group++
 			names = append(names, syn)
+			defaults = append(defaults, nil)
 			p.declareLocal(syn)
 			prepends = append(prepends, &ast.MultiAssign{Names: gnames, SplatIndex: gsplat, Values: []ast.Node{&ast.VarRef{Name: syn}}})
 		} else {
 			name := p.expect(token.IDENT).Lit
 			names = append(names, name)
 			p.declareLocal(name)
+			if p.accept(token.ASSIGN) { // optional param: |a, b = 5| / (a, b = 5)
+				// In the `|...|` form the closing `|` would otherwise be lexed as a
+				// bitwise-or continuing the default, so suppress it; the `(...)` form
+				// (stabby lambda) keeps `|` as the real operator.
+				saved := p.noPipe
+				p.noPipe = until == token.PIPE
+				defaults = append(defaults, p.parseExprOrAssign())
+				p.noPipe = saved
+			} else {
+				defaults = append(defaults, nil)
+			}
 		}
 		if !p.accept(token.COMMA) {
 			break
 		}
 	}
-	return names, prepends, splat
+	return names, defaults, prepends, splat
 }
 
 // parseYield parses `yield`, `yield(...)`, or `yield args`.
