@@ -138,6 +138,9 @@ func (l *Lexer) lexToken() token.Token {
 	case c == '%' && l.percentBeginsLiteral(spaceBefore) && l.atPercentArray():
 		// %w[…] / %i[…] / %W[…] / %I[…] word- and symbol-array literals.
 		return l.lexPercentArray(spaceBefore, line, col)
+	case c == '%' && l.percentBeginsLiteral(spaceBefore) && l.atPercentRXS():
+		// %r{…}flags regexp, %x{…} backtick command, %s{…} symbol literals.
+		return l.lexPercentRXS(spaceBefore, line, col)
 	case c == '%' && l.percentBeginsLiteral(spaceBefore) && l.atPercentString():
 		// %q(…) / %Q(…) / %(…) / %W(…) string literals.
 		return l.lexPercentString(spaceBefore, line, col)
@@ -512,7 +515,7 @@ func (l *Lexer) lexNumber(spaceBefore bool, line, col int) token.Token {
 // Underscores between digits are allowed. With no digits after the prefix it
 // returns ILLEGAL.
 func (l *Lexer) lexRadixInt(spaceBefore bool, line, col int) token.Token {
-	l.advance() // '0'
+	l.advance()                // '0'
 	kind := l.advance() | 0x20 // letter, lower-cased
 	ok := radixDigit(kind)
 	var digits []byte
@@ -898,6 +901,91 @@ func isPercentDelim(b byte) bool {
 	return false
 }
 
+// atPercentRXS reports whether the cursor (at '%') begins a %r (regexp),
+// %x (backtick command), or %s (symbol) literal: the kind letter must be
+// followed by a delimiter.
+func (l *Lexer) atPercentRXS() bool {
+	switch l.peek2() {
+	case 'r', 'x', 's':
+	default:
+		return false
+	}
+	return l.pos+2 < len(l.src) && isPercentDelim(l.src[l.pos+2])
+}
+
+// lexPercentRXS lexes a %r{…}flags regexp, %x{…} backtick command, or %s{…}
+// symbol literal. As with the existing /…/ regexp form, the body is kept as raw
+// source (interpolation markers are not expanded here). Bracket delimiters nest;
+// a backslash keeps its following byte verbatim so an escaped delimiter does not
+// close the literal.
+func (l *Lexer) lexPercentRXS(spaceBefore bool, line, col int) token.Token {
+	l.advance() // %
+	kind := l.advance()
+	open := l.advance()
+	closing := percentDelimClose(open)
+	depth := 1
+	var body []byte
+	for {
+		c := l.peek()
+		if c == 0 {
+			return token.Token{Type: token.ILLEGAL, Lit: "unterminated %-literal", Line: line, Col: col, SpaceBefore: spaceBefore}
+		}
+		if c == '\\' {
+			l.advance()
+			esc := l.peek()
+			if esc == 0 {
+				body = append(body, '\\')
+				break
+			}
+			l.advance()
+			switch {
+			case kind == 'r':
+				// %r keeps the escape pair verbatim for the regexp engine — even an
+				// escaped delimiter (MRI: `%r{a\}b}.source == "a\\}b"`). The escape
+				// only prevents the delimiter from closing the literal.
+				body = append(body, '\\', esc)
+			case esc == open || esc == closing || esc == '\\':
+				// %x/%s are string-like: an escaped delimiter or backslash becomes the
+				// literal character (the backslash is dropped).
+				body = append(body, esc)
+			default:
+				body = append(body, '\\', esc)
+			}
+			continue
+		}
+		if open != closing && c == open {
+			depth++
+		} else if c == closing {
+			depth--
+			if depth == 0 {
+				l.advance() // closing delimiter
+				break
+			}
+		}
+		body = append(body, l.advance())
+	}
+	l.state = exprEnd
+	switch kind {
+	case 'r':
+		var flags []byte
+		for {
+			c := l.peek()
+			if c < 'a' || c > 'z' {
+				break
+			}
+			l.advance()
+			if c == 'i' || c == 'm' || c == 'x' {
+				flags = append(flags, c)
+			}
+		}
+		return token.Token{Type: token.REGEXP, Lit: string(body), Flags: string(flags), Line: line, Col: col, SpaceBefore: spaceBefore}
+	case 'x':
+		return token.Token{Type: token.XSTRING, Lit: string(body), Line: line, Col: col, SpaceBefore: spaceBefore}
+	default: // 's' — a symbol; its name is the (un-interpolated) body
+		return token.Token{Type: token.SYMBOL, Lit: string(body), Line: line, Col: col, SpaceBefore: spaceBefore}
+	}
+}
+
 // atPercentString reports whether the cursor (at '%') begins a %q/%Q/%(…)
 // string literal: %q or %Q followed by a delimiter, or a bare % directly
 // followed by a delimiter (== %Q).
@@ -1232,7 +1320,7 @@ func squiggleDedent(body string) string {
 // a double-quoted string.
 func wrapHeredocDQ(body string) string {
 	var b strings.Builder
-	depth := 0    // brace nesting inside an active #{ … }
+	depth := 0       // brace nesting inside an active #{ … }
 	escaped := false // the previous byte was a backslash escaping this one
 	for i := 0; i < len(body); i++ {
 		c := body[i]

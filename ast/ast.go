@@ -34,6 +34,10 @@ type RegexpLit struct {
 	Flags  string
 }
 
+// XStr is a backtick command literal (`cmd` or %x{cmd}): its (Phase-0,
+// non-interpolated) Command source is run by the shell, yielding its stdout.
+type XStr struct{ Command string }
+
 // ArrayLit is an array literal [a, b, c].
 type ArrayLit struct{ Elems []Node }
 
@@ -129,16 +133,17 @@ type While struct {
 
 // MethodDef defines a method on the current self.
 type MethodDef struct {
-	Name   string
-	Params   []string
-	Defaults   []Node // parallel to Params; nil for a required param
-	SplatIndex int    // index of the *splat param in Params, or -1
+	Name       string
+	Params     []string
+	Defaults   []Node    // parallel to Params; nil for a required param
+	SplatIndex int       // index of the *splat param in Params, or -1
 	KwParams   []KwParam // keyword parameters (a:, b: default), after positionals
 	KwRest     string    // name of the **rest keyword-splat param, or "" if none
 	BlockParam string    // name of the &block param, or "" if none
 	Singleton  bool      // def self.foo — a singleton (class) method
 	Recv       Node      // def recv.foo — explicit non-self receiver (nil otherwise)
-	Body   []Node
+	Forward    bool      // def f(...) / def f(a, ...) — accepts forwarded arguments
+	Body       []Node
 }
 
 // KwParam is a single keyword parameter. Default is nil for a required keyword
@@ -155,10 +160,12 @@ type Return struct{ Value Node } // Value may be nil
 type ConstRef struct{ Name string }
 
 // ScopedConst is a constant looked up through ::, e.g. Math::PI or Foo::BAR.
-// Recv evaluates to the module/class whose constant table is consulted.
+// Recv evaluates to the module/class whose constant table is consulted. A nil
+// Recv with Global true is a leading-`::` top-level lookup (`::Foo`).
 type ScopedConst struct {
-	Recv Node
-	Name string
+	Recv   Node
+	Name   string
+	Global bool // true for a leading `::Name` (top-level constant lookup)
 }
 
 // GVarRef references a global variable by name ("$~", "$1", "$stdout", …).
@@ -172,8 +179,16 @@ type GVarAssign struct {
 
 // MultiAssign is a destructuring assignment to local targets: a, b = 1, 2 or
 // a, *b = list. SplatIndex is the index of the *splat target in Names, or -1.
+//
+// Targets, when non-nil, is parallel to Names and holds the general LHS target
+// node for each position (e.g. a *ConstRef for a constant target `A, B = …`).
+// It is left nil for the all-locals case so consumers that only understand local
+// targets keep working; when any target is not a plain local, Targets is
+// populated for every position and Names mirrors it (the local name, or "" for a
+// non-local target whose splat capture, if any, has no local name).
 type MultiAssign struct {
 	Names      []string
+	Targets    []Node // nil for all-locals; else parallel to Names
 	SplatIndex int
 	Values     []Node
 }
@@ -203,16 +218,27 @@ type CVarAssign struct {
 }
 
 // ClassDef defines or reopens a class. Super is the optional superclass name.
+//
+// Name carries the simple constant name; for a scope-resolution path
+// (`class Foo::Bar`) or a leading-`::` name (`class ::Bar`) NamePath holds the
+// full ScopedConst and Name is the trailing segment. SuperExpr, when non-nil,
+// holds a superclass that is a `::`-path or otherwise not a bare constant; for a
+// bare-constant superclass Super holds its name and SuperExpr is nil.
 type ClassDef struct {
-	Name  string
-	Super string // "" if none
-	Body  []Node
+	Name      string
+	NamePath  Node   // *ScopedConst for `class A::B` / `class ::B`, else nil
+	Super     string // "" if none and SuperExpr is nil
+	SuperExpr Node   // non-nil superclass expression (e.g. a `::`-path), else nil
+	Body      []Node
 }
 
-// ModuleDef defines or reopens a module.
+// ModuleDef defines or reopens a module. NamePath mirrors ClassDef.NamePath: it
+// is non-nil for a scope-resolution or leading-`::` module name, in which case
+// Name is the trailing segment.
 type ModuleDef struct {
-	Name string
-	Body []Node
+	Name     string
+	NamePath Node // *ScopedConst for `module A::B` / `module ::B`, else nil
+	Body     []Node
 }
 
 // Super calls the same-named method in the ancestor chain. Forward is true for a
@@ -360,6 +386,11 @@ type SplatArg struct{ Value Node }
 // and passed as the call's block. It only ever appears last in a Call's args.
 type BlockPass struct{ Value Node }
 
+// ForwardArgs is the `...` forwarding argument inside a call (`g(...)`): it
+// splices the enclosing method's forwarded positional, keyword, and block
+// arguments into this call. It only appears in a method that declared `...`.
+type ForwardArgs struct{}
+
 // Begin is `begin BODY (rescue …)* [else …] [ensure …] end`.
 type Begin struct {
 	Body       []Node
@@ -376,53 +407,55 @@ type RescueClause struct {
 	Body    []Node
 }
 
-func (*Program) node()     {}
-func (*ScopedConst) node() {}
-func (*IntLit) node()     {}
-func (*BignumLit) node()  {}
-func (*FloatLit) node()   {}
-func (*StringLit) node()  {}
-func (*SymbolLit) node()  {}
-func (*RegexpLit) node()  {}
-func (*ArrayLit) node()   {}
-func (*HashLit) node()    {}
-func (*RangeLit) node()   {}
-func (*BoolLit) node()    {}
-func (*NilLit) node()     {}
-func (*SelfLit) node()    {}
-func (*VarRef) node()     {}
-func (*Assign) node()     {}
-func (*BinaryExpr) node() {}
-func (*UnaryExpr) node()  {}
-func (*Call) node()       {}
-func (*If) node()         {}
-func (*While) node()      {}
-func (*MethodDef) node()  {}
-func (*Return) node()     {}
-func (*ConstRef) node()   {}
-func (*ConstAssign) node() {}
-func (*GVarRef) node()    {}
-func (*GVarAssign) node() {}
-func (*CVarRef) node()    {}
-func (*CVarAssign) node() {}
-func (*MultiAssign) node() {}
+func (*Program) node()      {}
+func (*ScopedConst) node()  {}
+func (*IntLit) node()       {}
+func (*BignumLit) node()    {}
+func (*FloatLit) node()     {}
+func (*StringLit) node()    {}
+func (*SymbolLit) node()    {}
+func (*RegexpLit) node()    {}
+func (*XStr) node()         {}
+func (*ArrayLit) node()     {}
+func (*HashLit) node()      {}
+func (*RangeLit) node()     {}
+func (*BoolLit) node()      {}
+func (*NilLit) node()       {}
+func (*SelfLit) node()      {}
+func (*VarRef) node()       {}
+func (*Assign) node()       {}
+func (*BinaryExpr) node()   {}
+func (*UnaryExpr) node()    {}
+func (*Call) node()         {}
+func (*If) node()           {}
+func (*While) node()        {}
+func (*MethodDef) node()    {}
+func (*Return) node()       {}
+func (*ConstRef) node()     {}
+func (*ConstAssign) node()  {}
+func (*GVarRef) node()      {}
+func (*GVarAssign) node()   {}
+func (*CVarRef) node()      {}
+func (*CVarAssign) node()   {}
+func (*MultiAssign) node()  {}
 func (*MatchPattern) node() {}
-func (*IvarRef) node()    {}
-func (*IvarAssign) node() {}
-func (*ClassDef) node()   {}
-func (*ModuleDef) node()  {}
-func (*Super) node()      {}
-func (*Yield) node()      {}
-func (*Break) node()      {}
-func (*Next) node()       {}
-func (*OpAssign) node()   {}
-func (*Begin) node()      {}
-func (*StrInterp) node()  {}
-func (*Case) node()       {}
-func (*Retry) node()      {}
-func (*SplatArg) node()   {}
-func (*BlockPass) node()  {}
-func (*CaseIn) node()     {}
+func (*IvarRef) node()      {}
+func (*IvarAssign) node()   {}
+func (*ClassDef) node()     {}
+func (*ModuleDef) node()    {}
+func (*Super) node()        {}
+func (*Yield) node()        {}
+func (*Break) node()        {}
+func (*Next) node()         {}
+func (*OpAssign) node()     {}
+func (*Begin) node()        {}
+func (*StrInterp) node()    {}
+func (*Case) node()         {}
+func (*Retry) node()        {}
+func (*SplatArg) node()     {}
+func (*BlockPass) node()    {}
+func (*ForwardArgs) node()  {}
+func (*CaseIn) node()       {}
 
 func (*ValuePattern) pattern()   {}
 func (*BindPattern) pattern()    {}

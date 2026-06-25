@@ -16,17 +16,18 @@ const (
 	INT
 	FLOAT
 	STRING
-	STRBEG // "…#{  (start of an interpolated string; Lit = literal prefix)
-	STRMID // }…#{  (literal between two interpolations)
-	STREND // }…"   (literal suffix ending an interpolated string)
-	IDENT  // local variable or method name (lowercase / _ leading)
-	CONST  // Capitalized identifier
-	IVAR   // @instance_variable
-	CVAR   // @@class_variable
-	GVAR   // $global / $~ / $1
+	STRBEG  // "…#{  (start of an interpolated string; Lit = literal prefix)
+	STRMID  // }…#{  (literal between two interpolations)
+	STREND  // }…"   (literal suffix ending an interpolated string)
+	IDENT   // local variable or method name (lowercase / _ leading)
+	CONST   // Capitalized identifier
+	IVAR    // @instance_variable
+	CVAR    // @@class_variable
+	GVAR    // $global / $~ / $1
 	SYMBOL  // :name
 	LABEL   // name: in a hash literal
 	REGEXP  // /pattern/flags (Lit = pattern source, Flags = matched flag letters)
+	XSTRING // `cmd` / %x{cmd} backtick command literal (Lit = raw command source)
 	WORDS   // %w[…] word-array literal (Lit = raw whitespace-separated content)
 	SYMBOLS // %i[…] symbol-array literal (Lit = raw whitespace-separated content)
 
@@ -59,6 +60,9 @@ const (
 	SELF
 	SUPER
 	YIELD
+	AND // `and` low-precedence logical-and keyword
+	OR  // `or` low-precedence logical-or keyword
+	NOT // `not` low-precedence logical-not keyword
 
 	// Operators and delimiters.
 	PLUS
@@ -69,7 +73,7 @@ const (
 	PERCENT
 	ASSIGN
 	EQ
-	EQQ // ===
+	EQQ   // ===
 	MATCH // =~
 	NEQ
 	LT
@@ -107,12 +111,12 @@ const (
 
 var typeNames = map[Type]string{
 	EOF: "EOF", ILLEGAL: "ILLEGAL", NEWLINE: "NEWLINE", INT: "INT", FLOAT: "FLOAT",
-	STRING: "STRING", STRBEG: "STRBEG", STRMID: "STRMID", STREND: "STREND", IDENT: "IDENT", CONST: "CONST", IVAR: "IVAR", CVAR: "CVAR", GVAR: "GVAR", SYMBOL: "SYMBOL", LABEL: "LABEL", REGEXP: "REGEXP", WORDS: "WORDS", SYMBOLS: "SYMBOLS",
+	STRING: "STRING", STRBEG: "STRBEG", STRMID: "STRMID", STREND: "STREND", IDENT: "IDENT", CONST: "CONST", IVAR: "IVAR", CVAR: "CVAR", GVAR: "GVAR", SYMBOL: "SYMBOL", LABEL: "LABEL", REGEXP: "REGEXP", XSTRING: "XSTRING", WORDS: "WORDS", SYMBOLS: "SYMBOLS",
 	DEF: "def", CLASS: "class", MODULE: "module", END: "end",
 	IF: "if", ELSIF: "elsif", ELSE: "else", UNLESS: "unless", WHILE: "while",
 	UNTIL: "until", RETURN: "return", BREAK: "break", NEXT: "next", BEGIN: "begin", RESCUE: "rescue", ENSURE: "ensure", CASE: "case", WHEN: "when", IN: "in", RETRY: "retry",
 	THEN: "then", DO: "do", TRUE: "true", FALSE: "false", NIL: "nil", SELF: "self",
-	SUPER: "super", YIELD: "yield",
+	SUPER: "super", YIELD: "yield", AND: "and", OR: "or", NOT: "not",
 	PLUS: "+", MINUS: "-", STAR: "*", POW: "**", SLASH: "/", PERCENT: "%", ASSIGN: "=",
 	EQ: "==", EQQ: "===", MATCH: "=~", NEQ: "!=", LT: "<", GT: ">", LE: "<=", GE: ">=", BANG: "!",
 	SPACESHIP: "<=>", SHOVEL: "<<", ANDAND: "&&", OROR: "||", OPASSIGN: "op=", QUESTION: "?", COLON: ":", SCOPE: "::",
@@ -138,7 +142,7 @@ var Keywords = map[string]Type{
 	"case": CASE, "when": WHEN, "in": IN, "retry": RETRY,
 	"then": THEN, "do": DO,
 	"true": TRUE, "false": FALSE, "nil": NIL, "self": SELF, "super": SUPER,
-	"yield": YIELD,
+	"yield": YIELD, "and": AND, "or": OR, "not": NOT,
 }
 
 // Token is a single lexed token.
