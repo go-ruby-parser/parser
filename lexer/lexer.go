@@ -189,6 +189,9 @@ func (l *Lexer) lexToken() token.Token {
 	case c == ':' && l.peek2() == '"':
 		// Quoted symbol, possibly interpolated: :"foo bar", :"a#{x}".
 		return l.lexSymbol(spaceBefore, line, col)
+	case c == ':' && l.peek2() == '\'':
+		// Single-quoted symbol: :'foo.bar', :'data-remote' (no interpolation).
+		return l.lexSymbol(spaceBefore, line, col)
 	}
 
 	// Operators and delimiters.
@@ -616,6 +619,15 @@ func (l *Lexer) lexSymbol(spaceBefore bool, line, col int) token.Token {
 	if l.peek() == '"' {
 		return l.lexQuotedSymbol(spaceBefore, line, col)
 	}
+	// Single-quoted symbols: :'foo.bar', :'data-remote' — no interpolation, the
+	// body's only escapes are \' and \\, exactly as a single-quoted string.
+	if l.peek() == '\'' {
+		str := l.lexSingleQuote(spaceBefore, line, col)
+		if str.Type == token.ILLEGAL {
+			return str
+		}
+		return token.Token{Type: token.SYMBOL, Lit: str.Lit, Line: line, Col: col, SpaceBefore: spaceBefore}
+	}
 	// Operator-method symbols: :+, :<=>, :[]=, …
 	if op := symbolOpAt(l.src, l.pos); op != "" {
 		for range op {
@@ -720,7 +732,9 @@ func (l *Lexer) lexGvar(spaceBefore bool, line, col int) token.Token {
 	l.advance() // '$'
 	start := l.pos
 	switch c := l.peek(); {
-	case c == '~' || c == '&' || c == '`' || c == '\'':
+	case isSpecialGvar(c):
+		// Single-character special globals: $~ $& $` $' $! $@ $/ $\ $; $, $.
+		// $< $> $? $* $$ $: $" $0 $+ (and the like). Each is exactly one byte.
 		l.advance()
 	case c >= '1' && c <= '9':
 		for l.peek() >= '0' && l.peek() <= '9' {
@@ -1478,6 +1492,18 @@ func (l *Lexer) scanStringSegment() (string, bool) {
 func isDigit(c byte) bool      { return c >= '0' && c <= '9' }
 func isIdentStart(c byte) bool { return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') }
 func isIdentPart(c byte) bool  { return isIdentStart(c) || isDigit(c) }
+
+// isSpecialGvar reports whether c is one of Ruby's single-character special
+// global-variable names that follow `$` (e.g. $! $@ $/ $\ $; $, $. $< $> $?
+// $* $$ $: $" $+ $~ $& $` $'). The digit case ($1.., $0) is handled separately.
+func isSpecialGvar(c byte) bool {
+	switch c {
+	case '~', '&', '`', '\'', '!', '@', '/', '\\', ';', ',', '.',
+		'<', '>', '?', '*', '$', ':', '"', '+':
+		return true
+	}
+	return false
+}
 
 func stripUnderscores(s string) string {
 	if !hasUnderscore(s) {
