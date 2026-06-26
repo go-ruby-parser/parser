@@ -529,10 +529,23 @@ func (p *Parser) parseDefName() (string, bool) {
 // params, nil for a required parameter.
 func (p *Parser) parseDefParams(until token.Type) (params []string, defaults []ast.Node, splat int, kwParams []ast.KwParam, kwRest, blockParam string, forward bool) {
 	splat = -1
+	// A parenthesised parameter list may span several lines, with newlines after
+	// the open paren and around the separating commas; a paren-less list (until ==
+	// NEWLINE) must not skip newlines, as one terminates it.
+	paren := until == token.RPAREN
+	if paren {
+		p.skipNewlines()
+	}
 	if p.is(until) || p.is(token.NEWLINE) {
 		return params, defaults, splat, kwParams, kwRest, blockParam, forward
 	}
 	for {
+		if paren {
+			p.skipNewlines()
+			if p.is(until) { // a trailing comma before the close paren
+				break
+			}
+		}
 		if p.accept(token.DOTDOTDOT) { // `...` argument-forwarding param (always last)
 			forward = true
 			break
@@ -608,6 +621,9 @@ func (p *Parser) parseDefParams(until token.Type) (params []string, defaults []a
 		if !p.accept(token.COMMA) {
 			break
 		}
+	}
+	if paren {
+		p.skipNewlines() // tolerate a newline before the close paren
 	}
 	return params, defaults, splat, kwParams, kwRest, blockParam, forward
 }
