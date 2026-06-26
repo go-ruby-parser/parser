@@ -2536,13 +2536,16 @@ func (p *Parser) methodName() string {
 		return t.Lit
 	}
 	switch t.Type {
-	// Operator methods called explicitly: 1.+(2), a.<=>(b), obj.&(x), …
+	// Operator methods called explicitly: 1.+(2), a.<=>(b), obj.&(x), … Each
+	// operator token names the method by its own spelling ("+", "<=>", "&", …).
 	case token.SPACESHIP, token.LT, token.GT, token.LE, token.GE, token.EQ, token.EQQ, token.NEQ,
 		token.SHOVEL, token.RSHIFT, token.PLUS, token.MINUS, token.STAR, token.SLASH, token.PERCENT, token.POW,
-		token.AMPER, token.PIPE, token.CARET, token.TILDE, token.MATCH, token.NMATCH, token.BANG,
-		token.XSTRING:
-		// XSTRING here is an empty backtick literal `` produced when `` ` `` names the
-		// backtick method (`def \`(cmd); end`, `obj.\``).
+		token.AMPER, token.PIPE, token.CARET, token.TILDE, token.MATCH, token.NMATCH, token.BANG:
+		p.advance()
+		return t.Type.String()
+	case token.XSTRING:
+		// An empty backtick literal `` produced when `` ` `` names the backtick
+		// method (`def \`(cmd); end`, `obj.\``).
 		p.advance()
 		return "`"
 	}
