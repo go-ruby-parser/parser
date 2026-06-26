@@ -1046,14 +1046,7 @@ func (l *Lexer) atPercentArray() bool {
 	default:
 		return false
 	}
-	if l.pos+2 >= len(l.src) {
-		return false
-	}
-	switch l.src[l.pos+2] {
-	case '[', '(', '{', '<', '|', '!', '/':
-		return true
-	}
-	return false
+	return l.pos+2 < len(l.src) && isPercentDelim(l.src[l.pos+2])
 }
 
 // lexPercentArray lexes a %w/%i/%W/%I array literal. The non-interpolating
@@ -1094,13 +1087,25 @@ func (l *Lexer) lexPercentArray(spaceBefore bool, line, col int) token.Token {
 	return token.Token{Type: tt, Lit: string(content), Line: line, Col: col, SpaceBefore: spaceBefore}
 }
 
-// isPercentDelim reports whether b can open a %-literal.
+// isPercentDelim reports whether b can open a %-literal. MRI accepts any
+// non-alphanumeric character as the delimiter (`%r"..."`, `%q[...]`, `%w'a b'`,
+// `%i<x y>`, `%(...)`, `%!...!`, `%|...|`, `%@...@`, …); a bracket pair nests.
+// Excluded: alphanumerics (they would be the literal's body), whitespace, and
+// `=` so a `%=` compound assignment is never mistaken for a literal opener.
 func isPercentDelim(b byte) bool {
-	switch b {
-	case '(', '[', '{', '<', '|', '!', '/':
-		return true
+	switch {
+	case b == 0 || b == '=':
+		return false
+	case b == ' ' || b == '\t' || b == '\n' || b == '\r' || b == '\f' || b == '\v':
+		return false
+	case b >= '0' && b <= '9':
+		return false
+	case (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z'):
+		return false
+	case b >= 0x80:
+		return false // a multi-byte UTF-8 lead is not used as a %-delimiter here
 	}
-	return false
+	return true
 }
 
 // atPercentRXS reports whether the cursor (at '%') begins a %r (regexp),

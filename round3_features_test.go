@@ -105,3 +105,55 @@ func TestQuestionNotCharLiteralForWord(t *testing.T) {
 		t.Fatalf("p ?ab: expected a parse error (not a char literal)")
 	}
 }
+
+// --- Feature 7: generalized percent-literal delimiters ---
+
+func TestPercentDelimiterVariants(t *testing.T) {
+	// Any non-alphanumeric delimiter opens the literal; the result node is the
+	// same as the bracket-delimited form.
+	for _, src := range []string{
+		`%r"abc"`, `%r|ab|`, `%r#ab#`,
+		`%Q'hi'`, `%Q@hi@`, `%Q!hi!`,
+		`%q[x]`, `%q@x@`, `%q'x'`,
+		`%w'a b'`, `%w*a b*`, `%w|a b|`,
+		`%i<x y>`, `%i!x y!`,
+		`%W{a b}`, `%I<a b>`,
+		`%(hi)`, `%!hi!`, `%@hi@`,
+		`%s"sym"`, `%s|sym|`,
+		`%x"echo hi"`, `%x|ls|`,
+	} {
+		if _, err := parser.Parse(src); err != nil {
+			t.Errorf("Parse(%q): %v", src, err)
+		}
+	}
+}
+
+func TestPercentArrayQuoteDelim(t *testing.T) {
+	arr := mustParseSingle(t, `%w'apple pear'`).(*ast.ArrayLit)
+	if len(arr.Elems) != 2 {
+		t.Fatalf(`%%w'apple pear': got %d elems, want 2`, len(arr.Elems))
+	}
+	if s, ok := arr.Elems[0].(*ast.StringLit); !ok || s.Value != "apple" {
+		t.Fatalf("first elem = %#v, want StringLit \"apple\"", arr.Elems[0])
+	}
+}
+
+func TestPercentRegexpQuoteDelim(t *testing.T) {
+	re := mustParseSingle(t, `%r"a.c"i`).(*ast.RegexpLit)
+	if re.Source != "a.c" || re.Flags != "i" {
+		t.Fatalf(`%%r"a.c"i: source=%q flags=%q, want "a.c"/"i"`, re.Source, re.Flags)
+	}
+}
+
+func TestPercentDoesNotBreakModuloOrOpAssign(t *testing.T) {
+	// `%=` stays a compound assignment; `a % 3` stays modulo.
+	prog := mustParse(t, "a = 10\na %= 3")
+	if _, ok := prog.Body[1].(*ast.OpAssign); !ok {
+		t.Fatalf("a %%= 3: node = %T, want *ast.OpAssign", prog.Body[1])
+	}
+	prog = mustParse(t, "a = 10\np a % 3")
+	call := prog.Body[1].(*ast.Call)
+	if _, ok := call.Args[0].(*ast.BinaryExpr); !ok {
+		t.Fatalf("a %% 3: arg = %T, want *ast.BinaryExpr (modulo)", call.Args[0])
+	}
+}
