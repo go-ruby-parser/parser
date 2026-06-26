@@ -253,6 +253,48 @@ func TestHuggingStringOnReceiverAndConst(t *testing.T) {
 	}
 }
 
+// --- Feature 4: assignment inside a condition / expression ---
+
+func TestInlineAssignmentInCondition(t *testing.T) {
+	for _, src := range []string{
+		`if a && b = c; end`,
+		`if ct && m = RE.match(s); end`,
+		`if a || b = c; end`,
+		`while x && line = gets; end`,
+		`r = a && @b = 1`,
+		`if a && @@c = 2; end`,
+		`if a && $g = 3; end`,
+		`if a && K = 4; end`,
+		`if a && h[k] = 5; end`,
+		`if a && o.attr = 6; end`,
+	} {
+		if _, err := parser.Parse(src); err != nil {
+			t.Errorf("Parse(%q): %v", src, err)
+		}
+	}
+}
+
+func TestInlineAssignmentShape(t *testing.T) {
+	// `if a && b = c` is `if a && (b = c)`.
+	ifn := mustParseSingle(t, "if a && b = c; end").(*ast.If)
+	be := ifn.Cond.(*ast.BinaryExpr)
+	if be.Op != "&&" {
+		t.Fatalf("cond op = %q, want &&", be.Op)
+	}
+	if _, ok := be.Right.(*ast.Assign); !ok {
+		t.Fatalf("RHS of && = %T, want *ast.Assign", be.Right)
+	}
+}
+
+func TestInlineAssignmentDoesNotEatComparisons(t *testing.T) {
+	// `==`, `=>`, `=~` must not be swallowed as assignments.
+	for _, src := range []string{`p(a == b)`, `p(a =~ b)`, `x == y`} {
+		if _, err := parser.Parse(src); err != nil {
+			t.Errorf("Parse(%q): %v", src, err)
+		}
+	}
+}
+
 func TestPercentDoesNotBreakModuloOrOpAssign(t *testing.T) {
 	// `%=` stays a compound assignment; `a % 3` stays modulo.
 	prog := mustParse(t, "a = 10\na %= 3")

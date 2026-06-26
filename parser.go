@@ -1712,9 +1712,64 @@ func (p *Parser) parseBinary(minBP int) ast.Node {
 		if op == "**" { // exponentiation is right-associative
 			rbp = bp - 1
 		}
-		right := p.parseBinary(rbp)
+		right := p.maybeInlineAssign(p.parseBinary(rbp))
 		left = &ast.BinaryExpr{Op: op, Left: left, Right: right}
 	}
+}
+
+// maybeInlineAssign turns a freshly-parsed operand into an assignment when an
+// `=` follows it and it names an assignable target. This lets an assignment sit
+// as a sub-expression inside a condition or larger expression — `if a && b = c`,
+// `while x && line = gets` — which MRI permits even though `=` otherwise binds
+// looser than the binary operators. (A top-level `lhs = rhs` is already handled
+// in parseExprOrAssign; this covers the nested operand case.) `==`/`=>`/`=~` are
+// their own tokens, so only a real assignment `=` is consumed here.
+func (p *Parser) maybeInlineAssign(node ast.Node) ast.Node {
+	if !p.is(token.ASSIGN) {
+		return node
+	}
+	switch n := node.(type) {
+	case *ast.VarRef:
+		p.advance()
+		p.declareLocal(n.Name)
+		return &ast.Assign{Name: n.Name, Value: p.parseAssignRhs()}
+	case *ast.Call:
+		// A receiver-less, argument-less bare call is really a not-yet-seen local:
+		// `b = c` where b was unknown. Receiver attribute/index targets become the
+		// setter-call shape, matching parseExprOrAssign's handling.
+		if n.Recv == nil && len(n.Args) == 0 && n.Block == nil {
+			p.advance()
+			p.declareLocal(n.Name)
+			return &ast.Assign{Name: n.Name, Value: p.parseAssignRhs()}
+		}
+		if n.Recv != nil && n.Block == nil {
+			if n.Name == "[]" {
+				p.advance()
+				n.Name = "[]="
+				n.Args = append(n.Args, p.parseExprOrAssign())
+				return n
+			}
+			if len(n.Args) == 0 {
+				p.advance()
+				n.Name += "="
+				n.Args = []ast.Node{p.parseExprOrAssign()}
+				return n
+			}
+		}
+	case *ast.IvarRef:
+		p.advance()
+		return &ast.IvarAssign{Name: n.Name, Value: p.parseAssignRhs()}
+	case *ast.CVarRef:
+		p.advance()
+		return &ast.CVarAssign{Name: n.Name, Value: p.parseAssignRhs()}
+	case *ast.GVarRef:
+		p.advance()
+		return &ast.GVarAssign{Name: n.Name, Value: p.parseAssignRhs()}
+	case *ast.ConstRef:
+		p.advance()
+		return &ast.ConstAssign{Name: n.Name, Value: p.parseAssignRhs()}
+	}
+	return node
 }
 
 // negateLiteral returns the negation of a numeric literal node. The MINUS path
