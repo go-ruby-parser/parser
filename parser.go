@@ -109,17 +109,32 @@ type Parser struct {
 	noPipe bool
 }
 
-// Parse lexes and parses src into a Program.
+// parseHook, when non-nil, runs at the start of Parse. It exists only so a
+// white-box test can inject a non-parseError panic and exercise the recover's
+// internal-error path; it is nil in normal operation.
+var parseHook func()
+
+// Parse lexes and parses src into a Program. It never panics: a malformed input
+// yields a parse error, and any unexpected internal panic is also surfaced as a
+// parse error rather than propagating to the caller.
 func Parse(src string) (prog *ast.Program, err error) {
 	toks := lexer.New(src).Tokenize()
 	p := &Parser{toks: toks, scopes: []*scope{newScope(true)}}
 	defer func() {
 		if r := recover(); r != nil {
-			// Unchecked: a non-parseError is an internal bug and re-panics as a
-			// conversion error rather than leaving an uncovered re-panic branch.
-			prog, err = nil, r.(parseError)
+			if pe, ok := r.(parseError); ok {
+				prog, err = nil, pe
+				return
+			}
+			// An internal bug (e.g. an unexpected type assertion or index) must not
+			// crash the caller: report it as a parse error so the parser's contract
+			// of never panicking holds for every input.
+			prog, err = nil, parseError{msg: fmt.Sprintf("internal parser error: %v", r)}
 		}
 	}()
+	if parseHook != nil {
+		parseHook()
+	}
 	body := p.parseStatements(map[token.Type]bool{})
 	p.expect(token.EOF)
 	return &ast.Program{Body: body}, nil
@@ -376,10 +391,15 @@ func (p *Parser) parseConstPath() (name string, path ast.Node) {
 
 func (p *Parser) parseClass() ast.Node {
 	p.expect(token.CLASS)
-	// `class << self` (singleton-class body) is out of this front-end's scope; a
-	// SHOVEL here is not a constant path.
-	if p.is(token.SHOVEL) {
-		p.fail("singleton class (class << ...) is not supported")
+	// `class << target` opens target's singleton (metaclass). A SHOVEL here is
+	// the singleton-class form, not a constant path.
+	if p.accept(token.SHOVEL) {
+		target := p.parseTernary()
+		p.pushScope() // the singleton-class body has its own local scope
+		body := p.parseStatements(bodyEnd)
+		p.popScope()
+		p.expect(token.END)
+		return &ast.SingletonClassDef{Target: target, Body: body}
 	}
 	name, path := p.parseConstPath()
 	super := ""
@@ -1296,11 +1316,18 @@ func (p *Parser) parseBinary(minBP int) ast.Node {
 	}
 }
 
-// negateLiteral returns the negation of a numeric literal node. It is only
-// called with an *ast.IntLit or *ast.FloatLit (the two numeric primaries).
+// negateLiteral returns the negation of a numeric literal node. The MINUS path
+// in parseUnary reaches here only after parsePrimary consumed an INT or FLOAT
+// token, which yields exactly one of these three kinds: a FLOAT is always a
+// FloatLit, and an INT is an IntLit or — when it overflows int64, e.g.
+// -9999999999999999999999999999999 — a BignumLit. (An INT with invalid digits
+// fails inside parsePrimary and never returns here.)
 func negateLiteral(n ast.Node) ast.Node {
-	if il, ok := n.(*ast.IntLit); ok {
-		return &ast.IntLit{Value: -il.Value}
+	switch lit := n.(type) {
+	case *ast.IntLit:
+		return &ast.IntLit{Value: -lit.Value}
+	case *ast.BignumLit:
+		return &ast.BignumLit{Val: new(big.Int).Neg(lit.Val)}
 	}
 	fl := n.(*ast.FloatLit)
 	return &ast.FloatLit{Value: -fl.Value}
@@ -1853,22 +1880,44 @@ func (p *Parser) canStartCommandArg() bool {
 		token.BEGIN, token.CASE:
 		// Value-producing keywords: `p begin; 1; end`, `p case x; when 1; 2; end`.
 		return true
+	case token.LABEL:
+		// Keyword/hash argument without parens: `render json: x`, `delegate to: :c`.
+		return true
 	case token.SCOPE:
 		// A leading `::Name` (top-level constant) as a command argument: `puts ::Foo`.
 		// Only when the `::` hugs a following constant, not the postfix `a ::b` form.
 		return p.peekTok().Type == token.CONST
-	case token.MINUS, token.PLUS:
-		// Unary-style argument: `foo -1` (operand hugs the sign), not `foo - 1`.
+	case token.MINUS, token.PLUS, token.STAR, token.POW, token.AMPER:
+		// A sign/splat/double-splat/block-pass operand that hugs the next token is a
+		// unary-style command argument: `foo -1`, `foo *args`, `foo **opts`, `foo &blk`.
+		// With a space on both sides it is a binary operator: `foo - 1`, `foo * 2`.
 		return !p.peekTok().SpaceBefore
 	}
 	return false
 }
 
+// parseCommandArgs parses a paren-less argument list (`foo a, b, key: v`). It
+// reuses parseOneCallArg, so it accepts the same positional/splat/block-pass and
+// keyword/hash-pair forms a parenthesized call does, collapsing trailing
+// `key: value` / `expr => value` pairs into one implicit Hash argument.
 func (p *Parser) parseCommandArgs() []ast.Node {
-	args := []ast.Node{p.parseBinary(0)}
+	// A trailing `do…end` binds to the command call, not to an argument that is
+	// itself a call (`foo bar do…end` → the block is foo's). Suppress block
+	// attachment while parsing the arguments so the enclosing postfix chain picks
+	// the `do` up for the command call. A braced `{…}` block is unaffected: it
+	// binds tighter and always attaches to the nearest call.
+	saved := p.noDo
+	p.noDo = true
+	var args []ast.Node
+	var kw *ast.HashLit
+	p.parseOneCallArg(&args, &kw)
 	for p.accept(token.COMMA) {
 		p.skipNewlines()
-		args = append(args, p.parseBinary(0))
+		p.parseOneCallArg(&args, &kw)
+	}
+	p.noDo = saved
+	if kw != nil {
+		args = append(args, kw)
 	}
 	return args
 }

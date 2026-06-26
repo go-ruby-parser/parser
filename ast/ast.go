@@ -241,6 +241,15 @@ type ModuleDef struct {
 	Body     []Node
 }
 
+// SingletonClassDef opens the singleton (metaclass) of Target: `class << Target;
+// Body; end`. Methods and constants defined in Body attach to Target's singleton
+// class. `class << self` (Target is *SelfLit) is the idiomatic form for defining
+// class methods; `class << obj` opens an arbitrary object's singleton class.
+type SingletonClassDef struct {
+	Target Node
+	Body   []Node
+}
+
 // Super calls the same-named method in the ancestor chain. Forward is true for a
 // bare `super` (passes the enclosing method's own arguments); otherwise Args are
 // the explicit arguments of `super(...)`.
@@ -407,55 +416,56 @@ type RescueClause struct {
 	Body    []Node
 }
 
-func (*Program) node()      {}
-func (*ScopedConst) node()  {}
-func (*IntLit) node()       {}
-func (*BignumLit) node()    {}
-func (*FloatLit) node()     {}
-func (*StringLit) node()    {}
-func (*SymbolLit) node()    {}
-func (*RegexpLit) node()    {}
-func (*XStr) node()         {}
-func (*ArrayLit) node()     {}
-func (*HashLit) node()      {}
-func (*RangeLit) node()     {}
-func (*BoolLit) node()      {}
-func (*NilLit) node()       {}
-func (*SelfLit) node()      {}
-func (*VarRef) node()       {}
-func (*Assign) node()       {}
-func (*BinaryExpr) node()   {}
-func (*UnaryExpr) node()    {}
-func (*Call) node()         {}
-func (*If) node()           {}
-func (*While) node()        {}
-func (*MethodDef) node()    {}
-func (*Return) node()       {}
-func (*ConstRef) node()     {}
-func (*ConstAssign) node()  {}
-func (*GVarRef) node()      {}
-func (*GVarAssign) node()   {}
-func (*CVarRef) node()      {}
-func (*CVarAssign) node()   {}
-func (*MultiAssign) node()  {}
-func (*MatchPattern) node() {}
-func (*IvarRef) node()      {}
-func (*IvarAssign) node()   {}
-func (*ClassDef) node()     {}
-func (*ModuleDef) node()    {}
-func (*Super) node()        {}
-func (*Yield) node()        {}
-func (*Break) node()        {}
-func (*Next) node()         {}
-func (*OpAssign) node()     {}
-func (*Begin) node()        {}
-func (*StrInterp) node()    {}
-func (*Case) node()         {}
-func (*Retry) node()        {}
-func (*SplatArg) node()     {}
-func (*BlockPass) node()    {}
-func (*ForwardArgs) node()  {}
-func (*CaseIn) node()       {}
+func (*Program) node()           {}
+func (*ScopedConst) node()       {}
+func (*IntLit) node()            {}
+func (*BignumLit) node()         {}
+func (*FloatLit) node()          {}
+func (*StringLit) node()         {}
+func (*SymbolLit) node()         {}
+func (*RegexpLit) node()         {}
+func (*XStr) node()              {}
+func (*ArrayLit) node()          {}
+func (*HashLit) node()           {}
+func (*RangeLit) node()          {}
+func (*BoolLit) node()           {}
+func (*NilLit) node()            {}
+func (*SelfLit) node()           {}
+func (*VarRef) node()            {}
+func (*Assign) node()            {}
+func (*BinaryExpr) node()        {}
+func (*UnaryExpr) node()         {}
+func (*Call) node()              {}
+func (*If) node()                {}
+func (*While) node()             {}
+func (*MethodDef) node()         {}
+func (*Return) node()            {}
+func (*ConstRef) node()          {}
+func (*ConstAssign) node()       {}
+func (*GVarRef) node()           {}
+func (*GVarAssign) node()        {}
+func (*CVarRef) node()           {}
+func (*CVarAssign) node()        {}
+func (*MultiAssign) node()       {}
+func (*MatchPattern) node()      {}
+func (*IvarRef) node()           {}
+func (*IvarAssign) node()        {}
+func (*ClassDef) node()          {}
+func (*SingletonClassDef) node() {}
+func (*ModuleDef) node()         {}
+func (*Super) node()             {}
+func (*Yield) node()             {}
+func (*Break) node()             {}
+func (*Next) node()              {}
+func (*OpAssign) node()          {}
+func (*Begin) node()             {}
+func (*StrInterp) node()         {}
+func (*Case) node()              {}
+func (*Retry) node()             {}
+func (*SplatArg) node()          {}
+func (*BlockPass) node()         {}
+func (*ForwardArgs) node()       {}
+func (*CaseIn) node()            {}
 
 func (*ValuePattern) pattern()   {}
 func (*BindPattern) pattern()    {}

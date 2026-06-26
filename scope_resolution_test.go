@@ -167,8 +167,15 @@ func TestScopeResolutionPostfixStillWorks(t *testing.T) {
 	}
 }
 
-func TestScopeResolutionSingletonClassRejected(t *testing.T) {
-	if _, err := parser.Parse("class << self; end"); err == nil {
-		t.Fatal("class << self should be rejected (out of scope), got no error")
+// TestScopeResolutionSingletonClassParsed confirms the singleton-class form
+// `class << self` is now parsed (it was previously rejected). Full coverage of
+// the node lives in singleton_class_test.go.
+func TestScopeResolutionSingletonClassParsed(t *testing.T) {
+	prog, err := parser.Parse("class << self; end")
+	if err != nil {
+		t.Fatalf("class << self: %v", err)
+	}
+	if _, ok := prog.Body[0].(*ast.SingletonClassDef); !ok {
+		t.Fatalf("class << self: top is %T, want *ast.SingletonClassDef", prog.Body[0])
 	}
 }
