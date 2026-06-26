@@ -285,6 +285,10 @@ func (p *Parser) parseStatement() ast.Node {
 	case token.RETRY:
 		p.advance()
 		return p.applyModifiers(&ast.Retry{})
+	case token.ALIAS:
+		return p.applyModifiers(p.parseAlias())
+	case token.UNDEF:
+		return p.applyModifiers(p.parseUndef())
 	default:
 		return p.applyModifiers(p.parseOneLineMatch(p.parseKeywordLogical()))
 	}
@@ -715,6 +719,39 @@ func (p *Parser) parseReturn() ast.Node {
 		elems = append(elems, p.parseExprOrAssign())
 	}
 	return &ast.Return{Value: &ast.ArrayLit{Elems: elems}}
+}
+
+// parseAlias parses `alias NewName OldName`. Each name is a method name (a bare
+// identifier/constant/keyword/operator) or a symbol, or — for global aliasing —
+// a global variable. The two names are separated by whitespace, not a comma.
+func (p *Parser) parseAlias() ast.Node {
+	p.expect(token.ALIAS)
+	return &ast.Alias{NewName: p.parseFitem(), OldName: p.parseFitem()}
+}
+
+// parseUndef parses `undef name [, name…]`, removing the named methods.
+func (p *Parser) parseUndef() ast.Node {
+	p.expect(token.UNDEF)
+	names := []string{p.parseFitem()}
+	for p.accept(token.COMMA) {
+		names = append(names, p.parseFitem())
+	}
+	return &ast.Undef{Names: names}
+}
+
+// parseFitem reads one method-name item for alias/undef: a symbol (`:foo`,
+// `:==`), a global variable (`$x`, alias only), or a bare method name — an
+// identifier, a constant, a reserved word, or an operator (`==`, `<=>`, `[]`).
+func (p *Parser) parseFitem() string {
+	switch p.cur().Type {
+	case token.SYMBOL, token.GVAR:
+		return p.advance().Lit
+	}
+	if name, ok := p.parseDefName(); ok {
+		return name
+	}
+	p.fail("expected a method name")
+	return ""
 }
 
 func (p *Parser) parseBreak() ast.Node {
@@ -1279,12 +1316,13 @@ func (p *Parser) parseSplatOrExpr() ast.Node {
 
 // parseMasgnValue parses one right-hand value of a multiple assignment, which
 // may be a `*splat` whose array is spread across the targets (`a, b = *args`,
-// `x, y = 1, *rest`).
+// `x, y = 1, *rest`) or a further (chained) assignment whose value is then
+// destructured (`a, b = c = [1, 2]`, `_, h, _ = resp = call(x)`).
 func (p *Parser) parseMasgnValue() ast.Node {
 	if p.accept(token.STAR) {
 		return &ast.SplatArg{Value: p.parseTernary()}
 	}
-	return p.parseTernary()
+	return p.parseExprOrAssign()
 }
 
 // parseMlhsTarget parses one masgn target and returns (localName, targetNode,

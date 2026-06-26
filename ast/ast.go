@@ -384,6 +384,18 @@ type FindPattern struct {
 	PostName string
 }
 
+// Alias is `alias NewName OldName` — it makes NewName an alias of an existing
+// method (or global variable). Each name is the bare method/symbol/global text
+// without a leading colon.
+type Alias struct {
+	NewName string
+	OldName string
+}
+
+// Undef is `undef name [, name…]` — it removes the named method(s) from the
+// current class/module. Names hold the bare method names.
+type Undef struct{ Names []string }
+
 // Retry restarts the enclosing begin body from inside a rescue clause.
 type Retry struct{}
 
@@ -462,6 +474,8 @@ func (*Begin) node()             {}
 func (*StrInterp) node()         {}
 func (*Case) node()              {}
 func (*Retry) node()             {}
+func (*Alias) node()             {}
+func (*Undef) node()             {}
 func (*SplatArg) node()          {}
 func (*BlockPass) node()         {}
 func (*ForwardArgs) node()       {}
