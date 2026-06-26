@@ -109,6 +109,7 @@ const (
 	CARET     // ^ (pattern-matching pin operator)
 	RSHIFT    // >>
 	TILDE     // ~ (bitwise complement)
+	NMATCH    // !~ (does-not-match operator)
 )
 
 var typeNames = map[Type]string{
@@ -125,7 +126,7 @@ var typeNames = map[Type]string{
 	SPACESHIP: "<=>", SHOVEL: "<<", ANDAND: "&&", OROR: "||", OPASSIGN: "op=", QUESTION: "?", COLON: ":", SCOPE: "::",
 	LPAREN: "(", RPAREN: ")", LBRACE: "{", RBRACE: "}", LBRACKET: "[", RBRACKET: "]",
 	PIPE: "|", HASHROCKET: "=>", COMMA: ",", DOT: ".", DOTDOT: "..", DOTDOTDOT: "...",
-	AMPER: "&", SAFEDOT: "&.", ARROW: "->", CARET: "^", RSHIFT: ">>", TILDE: "~",
+	AMPER: "&", SAFEDOT: "&.", ARROW: "->", CARET: "^", RSHIFT: ">>", TILDE: "~", NMATCH: "!~",
 }
 
 func (t Type) String() string {
