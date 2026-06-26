@@ -108,7 +108,11 @@ func isContinuationOp(t token.Type) bool {
 		token.EQ, token.EQQ, token.MATCH, token.NEQ, token.LT, token.GT, token.LE,
 		token.GE, token.SPACESHIP, token.ANDAND, token.OROR,
 		token.ASSIGN, token.OPASSIGN, token.COMMA, token.HASHROCKET,
-		token.DOT, token.SAFEDOT, token.QUESTION:
+		token.DOT, token.SAFEDOT, token.QUESTION,
+		// Trailing low-precedence keyword operators and modifiers whose operand /
+		// condition may sit on the next line: `... or\n fail`, `... and\n x`,
+		// `do_it unless\n cond`, `foo if\n bar` (MRI joins these lines too).
+		token.AND, token.OR, token.IF, token.UNLESS, token.WHILE, token.UNTIL:
 		return true
 	}
 	return false
@@ -131,17 +135,19 @@ func (l *Lexer) lexToken() token.Token {
 	switch {
 	case c == 0:
 		return mk(token.EOF, "")
-	case c == '/' && l.state == exprBegin:
+	case c == '/' && l.state == exprBegin && l.prevType != token.DEF:
 		// At expression-begin position a '/' opens a regexp literal, not division
-		// (the same disambiguation MRI uses via its lexer state).
+		// (the same disambiguation MRI uses via its lexer state). The one exception
+		// is right after `def`, where `/` names the division-operator method
+		// (`def /(other)`) rather than opening a pattern.
 		return l.lexRegexp(spaceBefore, line, col)
-	case c == '%' && l.percentBeginsLiteral(spaceBefore) && l.atPercentArray():
+	case c == '%' && l.prevType != token.DEF && l.percentBeginsLiteral(spaceBefore) && l.atPercentArray():
 		// %w[…] / %i[…] / %W[…] / %I[…] word- and symbol-array literals.
 		return l.lexPercentArray(spaceBefore, line, col)
-	case c == '%' && l.percentBeginsLiteral(spaceBefore) && l.atPercentRXS():
+	case c == '%' && l.prevType != token.DEF && l.percentBeginsLiteral(spaceBefore) && l.atPercentRXS():
 		// %r{…}flags regexp, %x{…} backtick command, %s{…} symbol literals.
 		return l.lexPercentRXS(spaceBefore, line, col)
-	case c == '%' && l.percentBeginsLiteral(spaceBefore) && l.atPercentString():
+	case c == '%' && l.prevType != token.DEF && l.percentBeginsLiteral(spaceBefore) && l.atPercentString():
 		// %q(…) / %Q(…) / %(…) / %W(…) string literals.
 		return l.lexPercentString(spaceBefore, line, col)
 	case c == '\n' || c == ';':
@@ -177,6 +183,8 @@ func (l *Lexer) lexToken() token.Token {
 		return l.lexString(spaceBefore, line, col)
 	case c == '\'':
 		return l.lexSingleQuote(spaceBefore, line, col)
+	case c == '`':
+		return l.lexBacktick(spaceBefore, line, col)
 	case c == '@':
 		return l.lexIvar(spaceBefore, line, col)
 	case c == '$':
@@ -286,6 +294,11 @@ func (l *Lexer) lexToken() token.Token {
 			l.state = exprBegin
 			return mk(token.OROR, "||")
 		}
+		if l.peek() == '=' { // |= bitwise-or assignment
+			l.advance()
+			l.state = exprBegin
+			return mk(token.OPASSIGN, "|")
+		}
 		l.state = exprBegin
 		return mk(token.PIPE, "|")
 	case '&':
@@ -303,6 +316,11 @@ func (l *Lexer) lexToken() token.Token {
 			l.advance()
 			l.state = exprBegin
 			return mk(token.SAFEDOT, "&.")
+		}
+		if l.peek() == '=' { // &= bitwise-and assignment
+			l.advance()
+			l.state = exprBegin
+			return mk(token.OPASSIGN, "&")
 		}
 		l.state = exprBegin
 		return mk(token.AMPER, "&")
@@ -385,8 +403,13 @@ func (l *Lexer) lexToken() token.Token {
 			l.state = exprBegin
 			return mk(token.GE, ">=")
 		}
-		if l.peek() == '>' { // >> (right shift)
+		if l.peek() == '>' { // >> (right shift), or >>= shift-assignment
 			l.advance()
+			if l.peek() == '=' {
+				l.advance()
+				l.state = exprBegin
+				return mk(token.OPASSIGN, ">>")
+			}
 			l.state = exprBegin
 			return mk(token.RSHIFT, ">>")
 		}
@@ -404,6 +427,11 @@ func (l *Lexer) lexToken() token.Token {
 		l.state = exprBegin
 		return mk(token.COLON, ":")
 	case '^':
+		if l.peek() == '=' { // ^= bitwise-xor assignment
+			l.advance()
+			l.state = exprBegin
+			return mk(token.OPASSIGN, "^")
+		}
 		l.state = exprBegin
 		return mk(token.CARET, "^")
 	case '~':
@@ -433,8 +461,68 @@ func (l *Lexer) skipSpaceAndComments() bool {
 				l.advance()
 			}
 			seen = true
+		case c == '=' && l.atBlockComment():
+			// `=begin` … `=end` block comment: from a line that begins with `=begin`
+			// (at column 0) through the line that begins with `=end`, inclusive.
+			l.skipBlockComment()
+			seen = true
 		default:
 			return seen
+		}
+	}
+}
+
+// atBlockComment reports whether the cursor (on a `=`) opens an `=begin` block
+// comment: the `=` must be at the start of a line and be followed by `begin` and
+// then a whitespace character or end of line/input.
+func (l *Lexer) atBlockComment() bool {
+	if l.pos != 0 && l.src[l.pos-1] != '\n' {
+		return false
+	}
+	const kw = "=begin"
+	if l.pos+len(kw) > len(l.src) || string(l.src[l.pos:l.pos+len(kw)]) != kw {
+		return false
+	}
+	if l.pos+len(kw) == len(l.src) {
+		return true
+	}
+	switch l.src[l.pos+len(kw)] {
+	case ' ', '\t', '\r', '\n':
+		return true
+	}
+	return false
+}
+
+// skipBlockComment consumes an `=begin` … `=end` block comment, leaving the
+// cursor at the newline that ends the `=end` line (or at EOF). The terminator is
+// a line that begins with `=end` at column 0.
+func (l *Lexer) skipBlockComment() {
+	for {
+		// Consume to (but not past) the end of the current line.
+		for l.peek() != '\n' && l.peek() != 0 {
+			l.advance()
+		}
+		if l.peek() == 0 {
+			return // unterminated; treat the rest of the input as the comment
+		}
+		l.advance() // the newline
+		// A line beginning with `=end` (optionally followed by trailing text) closes
+		// the comment.
+		const end = "=end"
+		if l.pos+len(end) <= len(l.src) && string(l.src[l.pos:l.pos+len(end)]) == end {
+			isEnd := l.pos+len(end) == len(l.src)
+			if !isEnd {
+				switch l.src[l.pos+len(end)] {
+				case ' ', '\t', '\r', '\n':
+					isEnd = true
+				}
+			}
+			if isEnd {
+				for l.peek() != '\n' && l.peek() != 0 {
+					l.advance()
+				}
+				return
+			}
 		}
 	}
 }
@@ -1419,6 +1507,44 @@ func (l *Lexer) lexSingleQuote(spaceBefore bool, line, col int) token.Token {
 	}
 	l.state = exprEnd
 	return token.Token{Type: token.STRING, Lit: string(b), Line: line, Col: col, SpaceBefore: spaceBefore}
+}
+
+// lexBacktick lexes a `cmd` command literal (cursor on the opening backtick),
+// the same node `%x{…}` produces: a single XSTRING whose Lit is the raw command
+// source. As with the %x form the body is kept verbatim (interpolation markers
+// are not expanded here); a backslash keeps its following byte so an escaped
+// backtick does not close the literal.
+func (l *Lexer) lexBacktick(spaceBefore bool, line, col int) token.Token {
+	l.advance() // opening backtick
+	var body []byte
+	for {
+		c := l.peek()
+		if c == 0 {
+			return token.Token{Type: token.ILLEGAL, Lit: "unterminated command literal", Line: line, Col: col, SpaceBefore: spaceBefore}
+		}
+		if c == '`' {
+			l.advance() // closing backtick
+			break
+		}
+		if c == '\\' {
+			l.advance()
+			esc := l.peek()
+			if esc == 0 {
+				// A backslash at end of input leaves the literal unterminated.
+				return token.Token{Type: token.ILLEGAL, Lit: "unterminated command literal", Line: line, Col: col, SpaceBefore: spaceBefore}
+			}
+			l.advance()
+			if esc == '`' || esc == '\\' {
+				body = append(body, esc) // \` and \\ → literal char
+			} else {
+				body = append(body, '\\', esc)
+			}
+			continue
+		}
+		body = append(body, l.advance())
+	}
+	l.state = exprEnd
+	return token.Token{Type: token.XSTRING, Lit: string(body), Line: line, Col: col, SpaceBefore: spaceBefore}
 }
 
 // continueString resumes lexing a string after an interpolation's closing '}',

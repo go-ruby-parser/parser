@@ -60,9 +60,11 @@ const (
 	SELF
 	SUPER
 	YIELD
-	AND // `and` low-precedence logical-and keyword
-	OR  // `or` low-precedence logical-or keyword
-	NOT // `not` low-precedence logical-not keyword
+	AND   // `and` low-precedence logical-and keyword
+	OR    // `or` low-precedence logical-or keyword
+	NOT   // `not` low-precedence logical-not keyword
+	ALIAS // `alias` method-aliasing keyword
+	UNDEF // `undef` method-removal keyword
 
 	// Operators and delimiters.
 	PLUS
@@ -117,6 +119,7 @@ var typeNames = map[Type]string{
 	UNTIL: "until", RETURN: "return", BREAK: "break", NEXT: "next", BEGIN: "begin", RESCUE: "rescue", ENSURE: "ensure", CASE: "case", WHEN: "when", IN: "in", RETRY: "retry",
 	THEN: "then", DO: "do", TRUE: "true", FALSE: "false", NIL: "nil", SELF: "self",
 	SUPER: "super", YIELD: "yield", AND: "and", OR: "or", NOT: "not",
+	ALIAS: "alias", UNDEF: "undef",
 	PLUS: "+", MINUS: "-", STAR: "*", POW: "**", SLASH: "/", PERCENT: "%", ASSIGN: "=",
 	EQ: "==", EQQ: "===", MATCH: "=~", NEQ: "!=", LT: "<", GT: ">", LE: "<=", GE: ">=", BANG: "!",
 	SPACESHIP: "<=>", SHOVEL: "<<", ANDAND: "&&", OROR: "||", OPASSIGN: "op=", QUESTION: "?", COLON: ":", SCOPE: "::",
@@ -143,6 +146,7 @@ var Keywords = map[string]Type{
 	"then": THEN, "do": DO,
 	"true": TRUE, "false": FALSE, "nil": NIL, "self": SELF, "super": SUPER,
 	"yield": YIELD, "and": AND, "or": OR, "not": NOT,
+	"alias": ALIAS, "undef": UNDEF,
 }
 
 // Token is a single lexed token.

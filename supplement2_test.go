@@ -73,21 +73,21 @@ var extraValid2 = []string{
 
 // parseErrorCorpus exercises the parser's and lexer's error paths.
 var parseErrorCorpus = []string{
-	":",                                   // bare colon
-	"\"#{1 2}\"",                          // two expressions in one interpolation
-	"p(/abc",                             // unterminated regexp
-	"p(%w[a b c)",                        // unterminated %w
-	"x = :\"unterminated",                // unterminated quoted symbol
-	"def",                                // def with no name
-	"class",                              // class with no name
-	"if",                                 // if with no condition/body
-	"case 1\nin [a, *b, *c]\nend",        // two splats in array pattern
-	"case 1\nin {**a, **nil}\nend",       // **rest with **nil
-	"1 +",                                // dangling binary operator
-	"foo(",                               // unterminated call args
-	"[1, 2",                              // unterminated array
-	"{a: 1",                              // unterminated hash
-	"begin\n  x",                         // begin without end
+	":",                            // bare colon
+	"\"#{1 2}\"",                   // two expressions in one interpolation
+	"p(/abc",                       // unterminated regexp
+	"p(%w[a b c)",                  // unterminated %w
+	"x = :\"unterminated",          // unterminated quoted symbol
+	"def",                          // def with no name
+	"class",                        // class with no name
+	"if",                           // if with no condition/body
+	"case 1\nin [a, *b, *c]\nend",  // two splats in array pattern
+	"case 1\nin {**a, **nil}\nend", // **rest with **nil
+	"1 +",                          // dangling binary operator
+	"foo(",                         // unterminated call args
+	"[1, 2",                        // unterminated array
+	"{a: 1",                        // unterminated hash
+	"begin\n  x",                   // begin without end
 }
 
 func TestExtraValid2(t *testing.T) {
