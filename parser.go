@@ -433,23 +433,43 @@ func (p *Parser) parseModule() ast.Node {
 	return &ast.ModuleDef{Name: name, NamePath: path, Body: body}
 }
 
+// isDefRecvStart reports whether tt can begin an explicit `def` receiver
+// (`def self.x`, `def obj.x`, `def Const.x`, `def @ivar.x`, `def @@c.x`,
+// `def $g.x`).
+func isDefRecvStart(tt token.Type) bool {
+	switch tt {
+	case token.SELF, token.IDENT, token.CONST, token.IVAR, token.CVAR, token.GVAR:
+		return true
+	}
+	return false
+}
+
 func (p *Parser) parseDef() ast.Node {
 	p.expect(token.DEF)
 	singleton := false
 	var recv ast.Node
-	// A receiver before the method name: def self.foo / def obj.foo / def Const.foo.
-	// The current-token check guards peekTok against running past EOF.
-	if (p.is(token.SELF) || p.is(token.IDENT) || p.is(token.CONST)) && p.peekTok().Type == token.DOT {
-		switch {
-		case p.is(token.SELF):
+	// A receiver before the method name: def self.foo / def obj.foo / def Const.foo
+	// / def @ivar.foo / def $g.foo. The kind guard keeps peekTok in range (the
+	// receiver is always a single name token followed by a dot).
+	if isDefRecvStart(p.cur().Type) && p.peekTok().Type == token.DOT {
+		switch p.cur().Type {
+		case token.SELF:
 			p.advance() // self
 			singleton = true
-		case p.is(token.IDENT): // def obj.foo — singleton method on a local's object
+		case token.IDENT: // def obj.foo — singleton method on a local's object
 			recv = &ast.VarRef{Name: p.advance().Lit}
-		default: // def Const.foo — class/module method
+		case token.CONST: // def Const.foo — class/module method
 			recv = &ast.ConstRef{Name: p.advance().Lit}
+		case token.IVAR: // def @ivar.foo — singleton method on an ivar's object
+			recv = &ast.IvarRef{Name: p.advance().Lit}
+		case token.CVAR:
+			recv = &ast.CVarRef{Name: p.advance().Lit}
+		case token.GVAR:
+			recv = &ast.GVarRef{Name: p.advance().Lit}
 		}
-		p.advance() // .
+		if recv != nil || singleton {
+			p.advance() // .
+		}
 	}
 	name, ok := p.parseDefName()
 	if !ok {
@@ -842,7 +862,7 @@ func (p *Parser) parseBodyWithRescue() []ast.Node {
 func (p *Parser) parseInterpString() ast.Node {
 	parts := []ast.Node{&ast.StringLit{Value: p.advance().Lit}} // STRBEG
 	for {
-		parts = append(parts, p.parseExprOrAssign())
+		parts = append(parts, p.parseInterpBody())
 		t := p.advance()
 		parts = append(parts, &ast.StringLit{Value: t.Lit})
 		if t.Type == token.STREND {
@@ -853,6 +873,25 @@ func (p *Parser) parseInterpString() ast.Node {
 		}
 	}
 	return &ast.StrInterp{Parts: parts}
+}
+
+// interpEnd marks the tokens that close a `#{…}` interpolation body.
+var interpEnd = map[token.Type]bool{token.STRMID: true, token.STREND: true}
+
+// parseInterpBody parses the contents of one `#{…}` interpolation, which is a
+// full statement sequence (so it admits trailing modifiers, `#{'s' if n > 1}`,
+// and several `;`-separated statements). Its value is the last statement; an
+// empty body (`#{}`) is nil.
+func (p *Parser) parseInterpBody() ast.Node {
+	stmts := p.parseStatements(interpEnd)
+	switch len(stmts) {
+	case 0:
+		return &ast.NilLit{}
+	case 1:
+		return stmts[0]
+	default:
+		return &ast.Begin{Body: stmts}
+	}
 }
 
 // parseCase parses either `case [subj] (when …)* [else] end` or the pattern
@@ -2184,6 +2223,10 @@ func (p *Parser) parsePrimary() ast.Node {
 	case token.CVAR:
 		p.advance()
 		return &ast.CVarRef{Name: t.Lit}
+	case token.DEF:
+		// `def` in expression position evaluates to the defined method's name as a
+		// symbol; it appears as a command argument (`private def foo; end`).
+		return p.parseDef()
 	case token.BEGIN:
 		return p.parseBegin()
 	case token.CASE:
@@ -2278,8 +2321,10 @@ func (p *Parser) canStartCommandArg() bool {
 	case token.INT, token.FLOAT, token.STRING, token.STRBEG, token.SYMBOL, token.IDENT, token.CONST,
 		token.IVAR, token.CVAR, token.GVAR, token.TRUE, token.FALSE, token.NIL, token.SELF, token.BANG, token.TILDE,
 		token.LPAREN, token.LBRACKET, token.ARROW, token.WORDS, token.SYMBOLS, token.REGEXP, token.XSTRING,
-		token.BEGIN, token.CASE:
-		// Value-producing keywords: `p begin; 1; end`, `p case x; when 1; 2; end`.
+		token.BEGIN, token.CASE, token.DEF:
+		// Value-producing keywords: `p begin; 1; end`, `p case x; when 1; 2; end`,
+		// and `def` (which evaluates to the method's name symbol), as in
+		// `module_function def foo; end` / `private def bar; end`.
 		return true
 	case token.LABEL:
 		// Keyword/hash argument without parens: `render json: x`, `delegate to: :c`.
