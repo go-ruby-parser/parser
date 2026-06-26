@@ -188,6 +188,45 @@ func TestUnicodeIdentifiers(t *testing.T) {
 	parsesOK(t, "p ?é\n")
 }
 
+// TestOperatorMethodName asserts that an explicitly-called operator method
+// (`recv.OP(arg)`) names the method by the operator's own spelling — not the
+// backtick “ ` “ that only the empty-XSTRING backtick-method case yields.
+func TestOperatorMethodName(t *testing.T) {
+	cases := []struct{ src, name string }{
+		{"1.+(2)", "+"},
+		{"1.-(2)", "-"},
+		{"1.*(2)", "*"},
+		{"1.**(2)", "**"},
+		{"a.<=>(b)", "<=>"},
+		{"a.<(b)", "<"},
+		{"a.>(b)", ">"},
+		{"a.<=(b)", "<="},
+		{"a.>=(b)", ">="},
+		{"a.==(b)", "=="},
+		{"a.===(b)", "==="},
+		{"a.!=(b)", "!="},
+		{"a.<<(b)", "<<"},
+		{"a.>>(b)", ">>"},
+		{"a.&(b)", "&"},
+		{"a.|(b)", "|"},
+		{"a.^(b)", "^"},
+		{"a.=~(b)", "=~"},
+		{"a.!~(b)", "!~"},
+		{"a.~", "~"},
+		{"a.!", "!"},
+		{"a.``(c)", "`"}, // the backtick method (empty XSTRING literal), still "`"
+	}
+	for _, c := range cases {
+		call, ok := parseOne(t, c.src).(*ast.Call)
+		if !ok {
+			t.Fatalf("Parse(%q): top node = %T, want *ast.Call", c.src, parseOne(t, c.src))
+		}
+		if call.Name != c.name {
+			t.Errorf("Parse(%q): method name = %q, want %q", c.src, call.Name, c.name)
+		}
+	}
+}
+
 // --- Feature 8: safe-navigation with an operator method ---
 
 func TestSafeNavOperatorMethod(t *testing.T) {
