@@ -145,6 +145,91 @@ func TestPercentRegexpQuoteDelim(t *testing.T) {
 	}
 }
 
+// --- Feature 3: adjacent string-literal concatenation ---
+
+func TestAdjacentStringConcat(t *testing.T) {
+	s, ok := mustParseSingle(t, `"a" "b" "c"`).(*ast.StringLit)
+	if !ok || s.Value != "abc" {
+		t.Fatalf(`"a" "b" "c" = %#v, want StringLit "abc"`, mustParseSingle(t, `"a" "b" "c"`))
+	}
+}
+
+func TestAdjacentStringConcatSingleQuote(t *testing.T) {
+	s := mustParseSingle(t, `'x' 'y'`).(*ast.StringLit)
+	if s.Value != "xy" {
+		t.Fatalf(`'x' 'y' = %q, want "xy"`, s.Value)
+	}
+}
+
+func TestAdjacentStringConcatBackslashContinued(t *testing.T) {
+	s := mustParseSingle(t, "\"a\" \\\n  \"b\"").(*ast.StringLit)
+	if s.Value != "ab" {
+		t.Fatalf(`backslash-continued concat = %q, want "ab"`, s.Value)
+	}
+}
+
+func TestAdjacentStringConcatWithInterp(t *testing.T) {
+	// A plain piece adjacent to an interpolated one folds into one StrInterp.
+	for _, src := range []string{
+		`"a" "b#{1}"`,
+		`"a#{1}" "b"`,
+		`"a#{1}" "b#{2}"`,
+	} {
+		n := mustParseSingle(t, src)
+		if _, ok := n.(*ast.StrInterp); !ok {
+			t.Errorf("Parse(%q): node = %T, want *ast.StrInterp", src, n)
+		}
+	}
+}
+
+// --- Feature 1: string-adjacent command argument (no space) ---
+
+func TestHuggingStringCommandArg(t *testing.T) {
+	for _, src := range []string{
+		`foo"bar"`,
+		`p"hello"`,
+		`assert"x", y`,
+		`foo"a""b"`,
+		`foo"a#{1}"`,
+	} {
+		call, ok := mustParseSingle(t, src).(*ast.Call)
+		if !ok {
+			t.Errorf("Parse(%q): node = %T, want *ast.Call", src, mustParseSingle(t, src))
+			continue
+		}
+		if len(call.Args) == 0 {
+			t.Errorf("Parse(%q): call has no args", src)
+		}
+	}
+}
+
+func TestHuggingStringCommandArgWithBlock(t *testing.T) {
+	call := mustParseSingle(t, `step"Ensure something" do; end`).(*ast.Call)
+	if call.Name != "step" || call.Block == nil {
+		t.Fatalf("step\"...\" do…end: name=%q block=%v, want step + a block", call.Name, call.Block)
+	}
+	if s, ok := call.Args[0].(*ast.StringLit); !ok || s.Value != "Ensure something" {
+		t.Fatalf("step arg = %#v, want StringLit", call.Args[0])
+	}
+}
+
+func TestHuggingStringOnLocalIsCall(t *testing.T) {
+	// `x"y"` is a command call even though x is a local (MRI: x("y")).
+	prog := mustParse(t, "x = 1\nx\"y\"")
+	call, ok := prog.Body[1].(*ast.Call)
+	if !ok || call.Name != "x" {
+		t.Fatalf("x\"y\" = %#v, want a Call named x", prog.Body[1])
+	}
+}
+
+func TestHuggingStringOnReceiverAndConst(t *testing.T) {
+	for _, src := range []string{`obj.foo"bar"`, `Foo"bar"`} {
+		if _, ok := mustParseSingle(t, src).(*ast.Call); !ok {
+			t.Errorf("Parse(%q): node = %T, want *ast.Call", src, mustParseSingle(t, src))
+		}
+	}
+}
+
 func TestPercentDoesNotBreakModuloOrOpAssign(t *testing.T) {
 	// `%=` stays a compound assignment; `a % 3` stays modulo.
 	prog := mustParse(t, "a = 10\na %= 3")

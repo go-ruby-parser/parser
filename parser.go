@@ -860,6 +860,57 @@ func (p *Parser) parseBodyWithRescue() []ast.Node {
 	return body
 }
 
+// parseStringConcat parses one or more adjacent string literals and folds them
+// into a single node, as MRI concatenates them at parse time: `"a" "b"` == `"ab"`,
+// and a `\`-continued line joins too (the lexer already swallows the backslash +
+// newline as whitespace). Each piece is a plain STRING or an interpolated
+// STRBEG…STREND run. With a single plain piece it returns a StringLit; otherwise
+// the pieces' parts are concatenated into one StrInterp (a run that turns out to
+// be all-plain is collapsed back to a StringLit).
+func (p *Parser) parseStringConcat() ast.Node {
+	var pieces []ast.Node
+	for p.is(token.STRING) || p.is(token.STRBEG) {
+		if p.is(token.STRING) {
+			pieces = append(pieces, &ast.StringLit{Value: p.advance().Lit})
+		} else {
+			pieces = append(pieces, p.parseInterpString())
+		}
+	}
+	if len(pieces) == 1 {
+		return pieces[0]
+	}
+	// Concatenate: flatten every piece's parts into one interpolation, then
+	// collapse to a plain StringLit when no interpolation survives.
+	var parts []ast.Node
+	for _, pc := range pieces {
+		switch n := pc.(type) {
+		case *ast.StringLit:
+			parts = append(parts, n)
+		case *ast.StrInterp:
+			parts = append(parts, n.Parts...)
+		}
+	}
+	if lit, ok := mergeStringParts(parts); ok {
+		return lit
+	}
+	return &ast.StrInterp{Parts: parts}
+}
+
+// mergeStringParts returns a single StringLit when every part is a plain string
+// literal (so an all-plain concatenation like `"a" "b"` yields `"ab"`), else
+// (nil, false).
+func mergeStringParts(parts []ast.Node) (*ast.StringLit, bool) {
+	var b strings.Builder
+	for _, pt := range parts {
+		s, ok := pt.(*ast.StringLit)
+		if !ok {
+			return nil, false
+		}
+		b.WriteString(s.Value)
+	}
+	return &ast.StringLit{Value: b.String()}, true
+}
+
 // parseInterpString assembles an interpolated string from the lexer's
 // STRBEG (literal …#{) / expr / STRMID (}…#{) / … / STREND (}…") sequence.
 func (p *Parser) parseInterpString() ast.Node {
@@ -1739,9 +1790,10 @@ func (p *Parser) parsePostfixTail(node ast.Node) ast.Node {
 				p.advance()
 				args = p.parseCallArgs(token.RPAREN)
 				p.expect(token.RPAREN)
-			} else if p.canStartCommandArg() {
+			} else if p.canStartCommandArg() || p.atHuggingStringArg() {
 				// Paren-less command call on a receiver: `obj.foo bar`,
-				// `Fiber.yield 1`. The space-separated argument list terminates
+				// `Fiber.yield 1`, or a string hugging the method name
+				// (`obj.m"x"`). The space-separated argument list terminates
 				// this postfix chain (it greedily consumes the rest). A trailing
 				// `do…end` then binds to this command call (`obj.foo bar do … end`),
 				// as MRI attaches it to the outermost command rather than to an
@@ -2143,14 +2195,8 @@ func (p *Parser) parsePrimary() ast.Node {
 		p.advance()
 		f, _ := strconv.ParseFloat(t.Lit, 64)
 		return &ast.FloatLit{Value: f}
-	case token.STRING:
-		p.advance()
-		// Adjacent string literals concatenate: `"a" "b"` == `"ab"`.
-		s := t.Lit
-		for p.is(token.STRING) {
-			s += p.advance().Lit
-		}
-		return &ast.StringLit{Value: s}
+	case token.STRING, token.STRBEG:
+		return p.parseStringConcat()
 	case token.SYMBOL:
 		p.advance()
 		return &ast.SymbolLit{Name: t.Lit}
@@ -2217,6 +2263,10 @@ func (p *Parser) parsePrimary() ast.Node {
 			p.expect(token.RPAREN)
 			return &ast.Call{Name: t.Lit, Args: args}
 		}
+		// A string hugging the constant is a paren-less call: `Integer"42"`.
+		if p.atHuggingStringArg() {
+			return &ast.Call{Name: t.Lit, Args: p.parseCommandArgs()}
+		}
 		return &ast.ConstRef{Name: t.Lit}
 	case token.SCOPE:
 		// Leading `::Name` — a top-level constant lookup (`::Foo`, `defined?(::Foo)`).
@@ -2247,8 +2297,6 @@ func (p *Parser) parsePrimary() ast.Node {
 		return p.parseWhile()
 	case token.UNTIL:
 		return p.parseUntil()
-	case token.STRBEG:
-		return p.parseInterpString()
 	}
 	return p.fail("unexpected token %q (%s)", t.Lit, t.Type)
 }
@@ -2284,6 +2332,19 @@ func (p *Parser) parseIdentExpr() ast.Node {
 		return &ast.Call{Name: name, Args: args}
 	}
 
+	// A string literal hugging the name (no space) is a paren-less argument:
+	// `step"Ensure ..." do … end`, `assert"x", y`, `foo"a"`. MRI reads this as a
+	// command call even when the name is otherwise a local — `x"y"` is `x("y")`.
+	// So this is checked before the local-variable resolution below.
+	if p.huggingStringArg() {
+		p.advance() // name
+		call := &ast.Call{Name: name, Args: p.parseCommandArgs()}
+		if p.is(token.DO) && !p.noDo {
+			call.Block = p.parseDoBlock()
+		}
+		return call
+	}
+
 	// Known local variable → read.
 	if p.is(token.IDENT) && p.isLocal(name) {
 		p.advance()
@@ -2315,6 +2376,22 @@ func (p *Parser) parseIdentExpr() ast.Node {
 		}
 	}
 	return &ast.Call{Name: name}
+}
+
+// huggingStringArg reports whether the token after the current name is a string
+// literal that hugs it (no intervening space), making the name a command call
+// with that string as its first argument: `foo"bar"`, `step"x" do…end`. A
+// space-separated string is handled by the ordinary canStartCommandArg path.
+func (p *Parser) huggingStringArg() bool { return isHuggingString(p.peekTok()) }
+
+// atHuggingStringArg is huggingStringArg for a name already consumed: the cursor
+// itself is the would-be string argument (used after a `.method` in a postfix
+// chain, `obj.m"x"`).
+func (p *Parser) atHuggingStringArg() bool { return isHuggingString(p.cur()) }
+
+// isHuggingString reports whether t is a string literal with no preceding space.
+func isHuggingString(t token.Token) bool {
+	return !t.SpaceBefore && (t.Type == token.STRING || t.Type == token.STRBEG)
 }
 
 // canStartCommandArg decides whether the current token begins a paren-less
