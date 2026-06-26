@@ -795,10 +795,13 @@ func (p *Parser) parseNext() ast.Node {
 
 // atStatementEnd reports whether the cursor is at a point where a value-less
 // return/break/next ends: a terminator, a block/body close (end, else, elsif,
-// `}`), or a trailing modifier (if/unless/while/until).
+// `}`, `)`, `]`), or a trailing modifier (if/unless/while/until). The closing
+// `)`/`]` let a bare jump end a parenthesised/bracketed group — `( x or next )`,
+// `[a or break]` — rather than swallowing the delimiter as its value.
 func (p *Parser) atStatementEnd() bool {
 	switch p.cur().Type {
 	case token.NEWLINE, token.EOF, token.END, token.ELSE, token.ELSIF, token.RBRACE,
+		token.RPAREN, token.RBRACKET,
 		token.IF, token.UNLESS, token.WHILE, token.UNTIL:
 		return true
 	}

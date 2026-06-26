@@ -253,6 +253,23 @@ func TestHuggingStringOnReceiverAndConst(t *testing.T) {
 	}
 }
 
+// --- Feature 5: control-flow + modifier inside parens ---
+
+func TestControlFlowInsideParens(t *testing.T) {
+	for _, src := range []string{
+		`(set_param(p) and return) unless cur`,
+		`[1].each { ( x or next )[1] }`,
+		`(expr if cond)`,
+		`(x if y) || z`,
+		`[1].each { (m.match(s) or next)[1] }`,
+		`begin; (x or retry); rescue; end`,
+	} {
+		if _, err := parser.Parse(src); err != nil {
+			t.Errorf("Parse(%q): %v", src, err)
+		}
+	}
+}
+
 // --- Feature 8: control-flow keyword as expression operand ---
 
 func TestControlFlowKeywordAsOperand(t *testing.T) {
