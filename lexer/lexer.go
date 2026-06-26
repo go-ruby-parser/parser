@@ -1530,8 +1530,8 @@ func (l *Lexer) lexBacktick(spaceBefore bool, line, col int) token.Token {
 			l.advance()
 			esc := l.peek()
 			if esc == 0 {
-				body = append(body, '\\')
-				break
+				// A backslash at end of input leaves the literal unterminated.
+				return token.Token{Type: token.ILLEGAL, Lit: "unterminated command literal", Line: line, Col: col, SpaceBefore: spaceBefore}
 			}
 			l.advance()
 			if esc == '`' || esc == '\\' {
