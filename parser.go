@@ -1571,8 +1571,19 @@ func (p *Parser) parsePostfixTail(node ast.Node) ast.Node {
 			} else if p.canStartCommandArg() {
 				// Paren-less command call on a receiver: `obj.foo bar`,
 				// `Fiber.yield 1`. The space-separated argument list terminates
-				// this postfix chain (it greedily consumes the rest), so return.
-				return &ast.Call{Recv: node, Name: name, Args: p.parseCommandArgs(), Safe: safe}
+				// this postfix chain (it greedily consumes the rest). A trailing
+				// `do…end` then binds to this command call (`obj.foo bar do … end`),
+				// as MRI attaches it to the outermost command rather than to an
+				// argument call.
+				call := &ast.Call{Recv: node, Name: name, Args: p.parseCommandArgs(), Safe: safe}
+				if p.is(token.DO) && !p.noDo {
+					call.Block = p.parseDoBlock()
+					// The block-bearing command call may itself be chained
+					// (`obj.foo bar do … end.baz`), so continue the postfix loop.
+					node = call
+					break
+				}
+				return call
 			}
 			node = &ast.Call{Recv: node, Name: name, Args: args, Safe: safe}
 		case p.is(token.SCOPE):
