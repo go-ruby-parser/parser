@@ -60,6 +60,23 @@ func TestCharLiteralBasic(t *testing.T) {
 	}
 }
 
+func TestCharLiteralAllEscapes(t *testing.T) {
+	// Exercises every backslash-escape branch of the char literal.
+	cases := map[string]string{
+		"p ?\\r": "\r",
+		"p ?\\a": "\x07",
+		"p ?\\b": "\x08",
+		"p ?\\v": "\x0b",
+		"p ?\\f": "\x0c",
+		"p ?\\0": "\x00",
+	}
+	for src, want := range cases {
+		if got := charLitArg(t, src); got != want {
+			t.Errorf("%q: char value = %q, want %q", src, got, want)
+		}
+	}
+}
+
 func TestCharLiteralAtExprBegin(t *testing.T) {
 	asn := mustParseSingle(t, `x = ?a`).(*ast.Assign)
 	s, ok := asn.Value.(*ast.StringLit)
@@ -287,6 +304,15 @@ func TestBlockWithoutParamsStillWorks(t *testing.T) {
 	}
 }
 
+// TestBlockOpenerNewlinesToEOF exercises firstSignificantIs's run-to-EOF path: an
+// opener followed only by newlines (an unterminated block) still scans for a `|`,
+// finds none, and surfaces a clean parse error rather than crashing.
+func TestBlockOpenerNewlinesToEOF(t *testing.T) {
+	if _, err := parser.Parse("foo {\n\n"); err == nil {
+		t.Fatalf("unterminated block: expected a parse error")
+	}
+}
+
 // --- Feature 5: control-flow + modifier inside parens ---
 
 func TestControlFlowInsideParens(t *testing.T) {
@@ -366,6 +392,31 @@ func TestInlineAssignmentShape(t *testing.T) {
 	}
 	if _, ok := be.Right.(*ast.Assign); !ok {
 		t.Fatalf("RHS of && = %T, want *ast.Assign", be.Right)
+	}
+}
+
+func TestInlineAssignmentToExistingLocal(t *testing.T) {
+	// When the target is already a known local it parses as a VarRef before the
+	// `=`, exercising maybeInlineAssign's VarRef branch: `x` is a local, then
+	// `a && x = 1` assigns to it.
+	prog := mustParse(t, "x = 0\nif a && x = 1\nend")
+	ifn := prog.Body[1].(*ast.If)
+	if _, ok := ifn.Cond.(*ast.BinaryExpr).Right.(*ast.Assign); !ok {
+		t.Fatalf("a && x = 1 (x local): RHS not an *ast.Assign")
+	}
+}
+
+func TestInlineAssignmentLeavesNonTargetAlone(t *testing.T) {
+	// An `=` after a non-assignable operand (a literal, or a call with args) is
+	// not an inline assignment; the parser surfaces an ordinary error instead of
+	// silently consuming it (maybeInlineAssign's final return-node path).
+	for _, src := range []string{
+		`if a && 1 = 2; end`,
+		`if a && foo(x) = 2; end`,
+	} {
+		if _, err := parser.Parse(src); err == nil {
+			t.Errorf("Parse(%q): expected a parse error", src)
+		}
 	}
 }
 

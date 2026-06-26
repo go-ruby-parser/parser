@@ -197,14 +197,14 @@ func (p *Parser) skipNewlines() {
 }
 
 // firstSignificantIs reports whether the first non-NEWLINE token at or after the
-// cursor is of type tt, without consuming anything.
+// cursor is of type tt, without consuming anything. The token stream always ends
+// in a (non-NEWLINE) EOF, so the scan always finds a significant token.
 func (p *Parser) firstSignificantIs(tt token.Type) bool {
-	for i := p.pos; i < len(p.toks); i++ {
-		if p.toks[i].Type != token.NEWLINE {
-			return p.toks[i].Type == tt
-		}
+	i := p.pos
+	for i < len(p.toks) && p.toks[i].Type == token.NEWLINE {
+		i++
 	}
-	return false
+	return i < len(p.toks) && p.toks[i].Type == tt
 }
 
 // --- scope ---
