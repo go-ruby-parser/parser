@@ -290,6 +290,11 @@ func (l *Lexer) lexToken() token.Token {
 			l.state = exprBegin
 			return mk(token.OROR, "||")
 		}
+		if l.peek() == '=' { // |= bitwise-or assignment
+			l.advance()
+			l.state = exprBegin
+			return mk(token.OPASSIGN, "|")
+		}
 		l.state = exprBegin
 		return mk(token.PIPE, "|")
 	case '&':
@@ -307,6 +312,11 @@ func (l *Lexer) lexToken() token.Token {
 			l.advance()
 			l.state = exprBegin
 			return mk(token.SAFEDOT, "&.")
+		}
+		if l.peek() == '=' { // &= bitwise-and assignment
+			l.advance()
+			l.state = exprBegin
+			return mk(token.OPASSIGN, "&")
 		}
 		l.state = exprBegin
 		return mk(token.AMPER, "&")
@@ -389,8 +399,13 @@ func (l *Lexer) lexToken() token.Token {
 			l.state = exprBegin
 			return mk(token.GE, ">=")
 		}
-		if l.peek() == '>' { // >> (right shift)
+		if l.peek() == '>' { // >> (right shift), or >>= shift-assignment
 			l.advance()
+			if l.peek() == '=' {
+				l.advance()
+				l.state = exprBegin
+				return mk(token.OPASSIGN, ">>")
+			}
 			l.state = exprBegin
 			return mk(token.RSHIFT, ">>")
 		}
@@ -408,6 +423,11 @@ func (l *Lexer) lexToken() token.Token {
 		l.state = exprBegin
 		return mk(token.COLON, ":")
 	case '^':
+		if l.peek() == '=' { // ^= bitwise-xor assignment
+			l.advance()
+			l.state = exprBegin
+			return mk(token.OPASSIGN, "^")
+		}
 		l.state = exprBegin
 		return mk(token.CARET, "^")
 	case '~':
@@ -437,8 +457,68 @@ func (l *Lexer) skipSpaceAndComments() bool {
 				l.advance()
 			}
 			seen = true
+		case c == '=' && l.atBlockComment():
+			// `=begin` … `=end` block comment: from a line that begins with `=begin`
+			// (at column 0) through the line that begins with `=end`, inclusive.
+			l.skipBlockComment()
+			seen = true
 		default:
 			return seen
+		}
+	}
+}
+
+// atBlockComment reports whether the cursor (on a `=`) opens an `=begin` block
+// comment: the `=` must be at the start of a line and be followed by `begin` and
+// then a whitespace character or end of line/input.
+func (l *Lexer) atBlockComment() bool {
+	if l.pos != 0 && l.src[l.pos-1] != '\n' {
+		return false
+	}
+	const kw = "=begin"
+	if l.pos+len(kw) > len(l.src) || string(l.src[l.pos:l.pos+len(kw)]) != kw {
+		return false
+	}
+	if l.pos+len(kw) == len(l.src) {
+		return true
+	}
+	switch l.src[l.pos+len(kw)] {
+	case ' ', '\t', '\r', '\n':
+		return true
+	}
+	return false
+}
+
+// skipBlockComment consumes an `=begin` … `=end` block comment, leaving the
+// cursor at the newline that ends the `=end` line (or at EOF). The terminator is
+// a line that begins with `=end` at column 0.
+func (l *Lexer) skipBlockComment() {
+	for {
+		// Consume to (but not past) the end of the current line.
+		for l.peek() != '\n' && l.peek() != 0 {
+			l.advance()
+		}
+		if l.peek() == 0 {
+			return // unterminated; treat the rest of the input as the comment
+		}
+		l.advance() // the newline
+		// A line beginning with `=end` (optionally followed by trailing text) closes
+		// the comment.
+		const end = "=end"
+		if l.pos+len(end) <= len(l.src) && string(l.src[l.pos:l.pos+len(end)]) == end {
+			isEnd := l.pos+len(end) == len(l.src)
+			if !isEnd {
+				switch l.src[l.pos+len(end)] {
+				case ' ', '\t', '\r', '\n':
+					isEnd = true
+				}
+			}
+			if isEnd {
+				for l.peek() != '\n' && l.peek() != 0 {
+					l.advance()
+				}
+				return
+			}
 		}
 	}
 }
