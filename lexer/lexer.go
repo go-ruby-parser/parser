@@ -56,6 +56,20 @@ type Lexer struct {
 	// a trailing operator names a method (`alias eql? ==`⏎`def …`) rather than
 	// continuing the line, so operator line-continuation is suppressed.
 	inFitemList bool
+	// defNamePending is set after `def` (and re-armed after the `.` of a `def
+	// recv.name` form) until the method name is read, so a `=` that hugs that name
+	// is recognised as a setter-method terminator (`def x=`) rather than an
+	// assignment operator. A setter `=` does not continue the line, so a body that
+	// begins on the next line (`def x=`⏎`  foo do … end`) is not mis-read as a
+	// paren-less parameter list.
+	defNamePending bool
+	// defNameJustRead is set for exactly the one token following the def method
+	// name, so a `=` hugging that name (and only there) is the setter terminator.
+	defNameJustRead bool
+	// setterAssign marks the just-emitted `=` as such a setter terminator; next()
+	// latches it so the newline after it is not suppressed as a continuation.
+	setterAssign        bool
+	pendingSetterAssign bool
 }
 
 func New(src string) *Lexer {
@@ -104,10 +118,33 @@ func (l *Lexer) Tokenize() []token.Token {
 // trailing-operator line continuation. The lexing itself is in lexToken.
 func (l *Lexer) next() token.Token {
 	l.pendingBinary = false
+	l.pendingSetterAssign = false
 	t := l.lexToken()
 	l.prevType = t.Type
 	l.prevBinary = l.pendingBinary
+	l.setterAssign = l.pendingSetterAssign
+	// Track def-name context across tokens. `def` arms defNamePending; the next
+	// IDENT (the method name) consumes it and arms defNameJustRead for exactly the
+	// following token, so a `=` hugging that name — and only there — is recognised
+	// as the setter terminator (`def x=`). Every other token clears both flags.
+	wasPending := l.defNamePending
+	l.defNameJustRead = false
+	l.defNamePending = false
+	switch {
+	case t.Type == token.DEF:
+		l.defNamePending = true
+	case t.Type == token.IDENT && wasPending:
+		l.defNameJustRead = true
+	}
 	return t
+}
+
+// regexAmbiguousAfterValueKeyword reports whether the previous token is one of
+// the keywords (`super`, `yield`) that may stand as a bare value, so a following
+// `/` is ambiguous between a division operator and a regexp-literal argument.
+// The caller resolves it with the surrounding-space heuristic.
+func (l *Lexer) regexAmbiguousAfterValueKeyword() bool {
+	return l.prevType == token.SUPER || l.prevType == token.YIELD
 }
 
 // isContinuationOp reports whether a line ending in token type t is incomplete,
@@ -150,11 +187,17 @@ func (l *Lexer) lexToken() token.Token {
 	switch {
 	case c == 0:
 		return mk(token.EOF, "")
-	case c == '/' && l.state == exprBegin && l.prevType != token.DEF:
+	case c == '/' && l.state == exprBegin && l.prevType != token.DEF &&
+		!(l.regexAmbiguousAfterValueKeyword() && spaceBefore && l.peek2() == ' '):
 		// At expression-begin position a '/' opens a regexp literal, not division
 		// (the same disambiguation MRI uses via its lexer state). The one exception
 		// is right after `def`, where `/` names the division-operator method
 		// (`def /(other)`) rather than opening a pattern.
+		//
+		// `super`/`yield` may be used as bare values (`super / x`, `yield / 2`),
+		// where a `/` spaced on both sides is division, not a regexp argument. The
+		// `spaceBefore && spaceAfter` heuristic keeps `super /re/` (arg, no space
+		// after) a regexp while making `super / x` division — matching MRI.
 		return l.lexRegexp(spaceBefore, line, col)
 	case c == '%' && l.prevType != token.DEF && l.percentBeginsLiteral(spaceBefore) && l.atPercentArray():
 		// %w[…] / %i[…] / %W[…] / %I[…] word- and symbol-array literals.
@@ -198,7 +241,7 @@ func (l *Lexer) lexToken() token.Token {
 		// Trailing-operator continuation: a line ending in an infix operator
 		// (`a ||`, `x +`, a trailing comma, …) is incomplete and joins the next
 		// line. `;` is an explicit terminator and is never suppressed this way.
-		if c == '\n' && isContinuationOp(l.prevType) {
+		if c == '\n' && isContinuationOp(l.prevType) && !l.setterAssign {
 			return l.next()
 		}
 		// The ambiguous bitwise/shift operators `|`/`&`/`^`/`<<` continue a line
@@ -413,6 +456,11 @@ func (l *Lexer) lexToken() token.Token {
 			return mk(token.MATCH, "=~")
 		}
 		l.state = exprBegin
+		// A `=` hugging the def method name is the setter terminator (`def x=`); flag
+		// it so its trailing newline is not suppressed as a line continuation.
+		if l.defNameJustRead {
+			l.pendingSetterAssign = true
+		}
 		return mk(token.ASSIGN, "=")
 	case '!':
 		if l.peek() == '=' {
@@ -962,6 +1010,14 @@ func (l *Lexer) lexRegexp(spaceBefore bool, line, col int) token.Token {
 			l.advance() // closing '/'
 			break
 		}
+		if c == '#' && l.peek2() == '{' {
+			// An interpolation `#{…}` is copied verbatim into the source; a `/` (or a
+			// nested regexp `/…/`) inside it must not be mistaken for the closing
+			// delimiter, so consume the whole brace-balanced interpolation as-is.
+			src = append(src, l.advance(), l.advance()) // '#' '{'
+			src = l.copyInterpolation(src)
+			continue
+		}
 		if c == '\\' {
 			l.advance()
 			esc := l.peek()
@@ -992,6 +1048,67 @@ func (l *Lexer) lexRegexp(spaceBefore bool, line, col int) token.Token {
 	}
 	l.state = exprEnd
 	return token.Token{Type: token.REGEXP, Lit: string(src), Flags: string(flags), Line: line, Col: col, SpaceBefore: spaceBefore}
+}
+
+// copyInterpolation copies a brace-balanced `#{…}` interpolation body verbatim
+// onto dst, having already consumed the opening `#{`. It stops after the
+// matching `}`. Strings (`"…"`, `'…'`) inside the body are copied whole so a `}`
+// or `/` in them does not affect balancing; an unterminated body stops at EOF.
+// Used by regexp lexing so a nested regexp `/…/` inside `#{…}` is not mistaken
+// for the regexp's closing delimiter.
+func (l *Lexer) copyInterpolation(dst []byte) []byte {
+	depth := 1
+	for {
+		c := l.peek()
+		if c == 0 {
+			return dst
+		}
+		switch c {
+		case '{':
+			depth++
+			dst = append(dst, l.advance())
+		case '}':
+			depth--
+			dst = append(dst, l.advance())
+			if depth == 0 {
+				return dst
+			}
+		case '"', '\'':
+			dst = l.copyQuoted(dst, c)
+		case '\\':
+			dst = append(dst, l.advance())
+			if l.peek() != 0 {
+				dst = append(dst, l.advance())
+			}
+		default:
+			dst = append(dst, l.advance())
+		}
+	}
+}
+
+// copyQuoted copies a quoted string starting at the opening quote `q` (`"` or
+// `'`) verbatim onto dst, including the closing quote, honouring backslash
+// escapes. It is used inside copyInterpolation so braces inside a string do not
+// affect interpolation brace-balancing.
+func (l *Lexer) copyQuoted(dst []byte, q byte) []byte {
+	dst = append(dst, l.advance()) // opening quote
+	for {
+		c := l.peek()
+		if c == 0 {
+			return dst
+		}
+		if c == '\\' {
+			dst = append(dst, l.advance())
+			if l.peek() != 0 {
+				dst = append(dst, l.advance())
+			}
+			continue
+		}
+		dst = append(dst, l.advance())
+		if c == q {
+			return dst
+		}
+	}
 }
 
 // charLiteralBegins reports whether a `?` may open a character literal here,
@@ -1073,8 +1190,30 @@ func (l *Lexer) lexCharLiteral(spaceBefore bool, line, col int) token.Token {
 			val = "\x0c"
 		case 'e':
 			val = "\x1b"
-		case '0':
+		case 'x':
+			// `?\xHH` — a hex byte (one or two hex digits). Consume the digits so
+			// they are not lexed as a trailing integer.
 			val = "\x00"
+			l.consumeHexEscape(2)
+		case 'u':
+			// `?\uHHHH` or `?\u{H…}` — a Unicode escape. Consume the payload.
+			val = "u"
+			l.consumeUnicodeEscape()
+		case 'C', 'M':
+			// Control/meta escapes: `?\C-a`, `?\M-x`, and combined `?\M-\C-a`.
+			// Consume the `-` and the (possibly itself-escaped) target character.
+			val = string(esc)
+			l.consumeControlMetaEscape()
+		case '0', '1', '2', '3', '4', '5', '6', '7':
+			// Octal escape `?\0`, `?\012` — consume up to two further octal digits.
+			val = "\x00"
+			for i := 0; i < 2; i++ {
+				if c := l.peek(); c >= '0' && c <= '7' {
+					l.advance()
+				} else {
+					break
+				}
+			}
 		default:
 			val = string(esc)
 		}
@@ -1089,6 +1228,60 @@ func (l *Lexer) lexCharLiteral(spaceBefore bool, line, col int) token.Token {
 	}
 	l.state = exprEnd
 	return token.Token{Type: token.STRING, Lit: val, Line: line, Col: col, SpaceBefore: spaceBefore}
+}
+
+// consumeHexEscape consumes up to max hexadecimal digits at the cursor, used to
+// swallow the digits of a `\xHH` escape so they are not re-lexed as an integer.
+func (l *Lexer) consumeHexEscape(max int) {
+	for i := 0; i < max; i++ {
+		if isHexDigit(l.peek()) {
+			l.advance()
+		} else {
+			break
+		}
+	}
+}
+
+// consumeUnicodeEscape consumes a `\u` payload at the cursor: either `{H… H…}`
+// (one or more space-separated code points) or exactly four hex digits.
+func (l *Lexer) consumeUnicodeEscape() {
+	if l.peek() == '{' {
+		l.advance()
+		for l.peek() != '}' && l.peek() != 0 {
+			l.advance()
+		}
+		if l.peek() == '}' {
+			l.advance()
+		}
+		return
+	}
+	l.consumeHexEscape(4)
+}
+
+// consumeControlMetaEscape consumes the remainder of a `\C-x` / `\M-x` control or
+// meta escape at the cursor (the leading `\C`/`\M` is already consumed): an
+// optional `-`, then the target — itself possibly a `\`-escape (`\M-\C-a`).
+func (l *Lexer) consumeControlMetaEscape() {
+	if l.peek() == '-' {
+		l.advance()
+	}
+	if l.peek() == '\\' {
+		l.advance()
+		// A nested control/meta escape (`\M-\C-a`): consume its letter then recurse
+		// onto the final target character.
+		if c := l.peek(); c == 'C' || c == 'M' {
+			l.advance()
+			l.consumeControlMetaEscape()
+			return
+		}
+	}
+	if l.peek() != 0 {
+		l.advance()
+	}
+}
+
+func isHexDigit(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
 }
 
 // percentDelimClose returns the closing delimiter for a %-literal opener: the
@@ -1241,6 +1434,14 @@ func (l *Lexer) lexPercentRXS(spaceBefore bool, line, col int) token.Token {
 			default:
 				body = append(body, '\\', esc)
 			}
+			continue
+		}
+		if c == '#' && l.peek2() == '{' {
+			// An interpolation `#{…}` is copied verbatim; a string or nested literal
+			// inside it (which may contain the delimiter character) must not close the
+			// %-literal, so consume the whole brace-balanced interpolation as-is.
+			body = append(body, l.advance(), l.advance()) // '#' '{'
+			body = l.copyInterpolation(body)
 			continue
 		}
 		if open != closing && c == open {
