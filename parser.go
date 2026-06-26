@@ -1795,6 +1795,12 @@ func (p *Parser) parseLambda() ast.Node {
 		params, defaults, prepends, splat, blockParam = p.parseBlockParams(token.RPAREN)
 		p.expect(token.RPAREN)
 		p.scope().explicitParams = true
+	} else if p.is(token.IDENT) || p.is(token.STAR) || p.is(token.POW) || p.is(token.AMPER) {
+		// Unparenthesized parameters: `->x { }`, `-> ctx { }`, `->a, b { }`,
+		// `-> message do … end`. The list runs up to the block opener (`{`/`do`);
+		// parseBlockParams stops at the first token that is not a parameter.
+		params, defaults, prepends, splat, blockParam = p.parseBlockParams(token.LBRACE)
+		p.scope().explicitParams = true
 	}
 	bs := p.scope()
 	var body []ast.Node
@@ -1894,6 +1900,27 @@ func (p *Parser) parseBlockParams(until token.Type) (names []string, defaults, p
 				names = append(names, "**")
 			}
 			defaults = append(defaults, nil)
+			if !p.accept(token.COMMA) {
+				break
+			}
+			continue
+		}
+		if p.is(token.LABEL) { // keyword block param: |a, b:| / |c: nil, d: 5|
+			// Block keyword parameters are recorded with a trailing-colon sentinel
+			// name ("b:") so the shape round-trips distinctly from a positional one;
+			// the local is declared under its bare name. A value after the label is
+			// the keyword default, else the keyword is required.
+			name := p.advance().Lit
+			p.declareLocal(name)
+			names = append(names, name+":")
+			if p.is(token.COMMA) || p.is(until) || p.is(token.NEWLINE) {
+				defaults = append(defaults, nil)
+			} else {
+				saved := p.noPipe
+				p.noPipe = until == token.PIPE
+				defaults = append(defaults, p.parseExprOrAssign())
+				p.noPipe = saved
+			}
 			if !p.accept(token.COMMA) {
 				break
 			}
@@ -2067,13 +2094,18 @@ func (p *Parser) parsePrimary() ast.Node {
 		return p.parseYield()
 	case token.LPAREN:
 		p.advance()
-		p.skipNewlines()
-		// A parenthesised group permits the low-precedence keyword operators
-		// (`(a and b)`, `(not x)`) just like a statement does.
-		e := p.parseOneLineMatch(p.parseKeywordLogical())
-		p.skipNewlines()
+		// A parenthesised group is a full statement sequence: it permits the
+		// low-precedence keyword operators (`(a and b)`, `(not x)`), trailing
+		// modifiers (`(expr if cond)`, `(x if y) || z`), and several
+		// semicolon/newline-separated statements (`(a; b)`), evaluating to the
+		// last. A single statement returns directly; a sequence is wrapped in a
+		// Begin (whose value is its last expression).
+		stmts := p.parseStatements(map[token.Type]bool{token.RPAREN: true})
 		p.expect(token.RPAREN)
-		return e
+		if len(stmts) == 1 {
+			return stmts[0]
+		}
+		return &ast.Begin{Body: stmts}
 	case token.IDENT:
 		return p.parseIdentExpr()
 	case token.CONST:
