@@ -409,11 +409,14 @@ func (p *Parser) parseClass() ast.Node {
 	super := ""
 	var superExpr ast.Node
 	if p.accept(token.LT) {
-		sname, spath := p.parseConstPath()
-		if spath != nil {
-			superExpr = spath
+		// The superclass is any expression (`class A < Base`, `class A < self`,
+		// `class A < Struct.new(:x)`, `class A < ns::Base`). A bare constant keeps
+		// the plain-name Super form; anything else is recorded as SuperExpr.
+		sup := p.parseTernary()
+		if c, ok := sup.(*ast.ConstRef); ok {
+			super = c.Name
 		} else {
-			super = sname
+			superExpr = sup
 		}
 	}
 	p.pushScope() // a class body has its own local scope
@@ -1519,6 +1522,11 @@ func (p *Parser) parseExprOrAssign() ast.Node {
 				call.Args = []ast.Node{p.parseExprOrAssign()}
 				return call
 			}
+		}
+		// Scope-resolved constant assignment: `A::B = v`, `::Top = v`.
+		if sc, ok := left.(*ast.ScopedConst); ok {
+			p.advance()
+			return &ast.ScopedConstAssign{Target: sc, Value: p.parseAssignRhs()}
 		}
 	}
 	return p.withRescueModifier(left)

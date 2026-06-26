@@ -199,6 +199,13 @@ type ConstAssign struct {
 	Value Node
 }
 
+// ScopedConstAssign assigns to a scope-resolved constant: `A::B = value` or the
+// top-level `::A = value`. Target is the *ScopedConst that names the constant.
+type ScopedConstAssign struct {
+	Target Node
+	Value  Node
+}
+
 // IvarRef reads an instance variable (@name) of self.
 type IvarRef struct{ Name string }
 
@@ -454,6 +461,7 @@ func (*MethodDef) node()         {}
 func (*Return) node()            {}
 func (*ConstRef) node()          {}
 func (*ConstAssign) node()       {}
+func (*ScopedConstAssign) node() {}
 func (*GVarRef) node()           {}
 func (*GVarAssign) node()        {}
 func (*CVarRef) node()           {}
