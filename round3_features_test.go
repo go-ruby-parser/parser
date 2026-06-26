@@ -253,6 +253,40 @@ func TestHuggingStringOnReceiverAndConst(t *testing.T) {
 	}
 }
 
+// --- Feature 8: control-flow keyword as expression operand ---
+
+func TestControlFlowKeywordAsOperand(t *testing.T) {
+	for _, src := range []string{
+		`def f; x || return; end`,
+		`[1].each { |x| x || next }`,
+		`[1].each { |x| x || break }`,
+		`while true; x || break; end`,
+		`a = b || return`,
+		`def f; x or return; end`,
+		`def f; x && return; end`,
+		`begin; x || retry; rescue; end`,
+	} {
+		if _, err := parser.Parse(src); err != nil {
+			t.Errorf("Parse(%q): %v", src, err)
+		}
+	}
+}
+
+func TestControlFlowOperandRejectsValue(t *testing.T) {
+	// MRI: a value after the jump in operand position is a syntax error.
+	if _, err := parser.Parse(`def f; x || return 5; end`); err == nil {
+		t.Fatalf("x || return 5: expected a parse error")
+	}
+}
+
+func TestControlFlowOperandShape(t *testing.T) {
+	ifn := mustParseSingle(t, "def f; x || return; end").(*ast.MethodDef)
+	be := ifn.Body[0].(*ast.BinaryExpr)
+	if _, ok := be.Right.(*ast.Return); !ok {
+		t.Fatalf("RHS of || = %T, want *ast.Return", be.Right)
+	}
+}
+
 // --- Feature 4: assignment inside a condition / expression ---
 
 func TestInlineAssignmentInCondition(t *testing.T) {

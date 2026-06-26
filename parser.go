@@ -1712,9 +1712,39 @@ func (p *Parser) parseBinary(minBP int) ast.Node {
 		if op == "**" { // exponentiation is right-associative
 			rbp = bp - 1
 		}
+		// A value-less control-flow jump may be the right operand of `&&`/`||`:
+		// `x || return`, `expr && next`, `y || break` (MRI accepts the jump only
+		// without a value here — `x || return 5` is a syntax error).
+		if jump, ok := p.valuelessJumpOperand(); ok {
+			left = &ast.BinaryExpr{Op: op, Left: left, Right: jump}
+			return left
+		}
 		right := p.maybeInlineAssign(p.parseBinary(rbp))
 		left = &ast.BinaryExpr{Op: op, Left: left, Right: right}
 	}
+}
+
+// valuelessJumpOperand parses a value-less control-flow jump (`return`, `break`,
+// `next`, `retry`) sitting in operand position, returning its node and true. MRI
+// accepts a bare jump as the right operand of `&&`/`||` (`x || return`, `expr &&
+// next`) but not one carrying a value (`x || return 5` is a syntax error), so
+// only the argument-less forms are recognised here.
+func (p *Parser) valuelessJumpOperand() (ast.Node, bool) {
+	switch p.cur().Type {
+	case token.RETURN:
+		p.advance()
+		return &ast.Return{}, true
+	case token.BREAK:
+		p.advance()
+		return &ast.Break{}, true
+	case token.NEXT:
+		p.advance()
+		return &ast.Next{}, true
+	case token.RETRY:
+		p.advance()
+		return &ast.Retry{}, true
+	}
+	return nil, false
 }
 
 // maybeInlineAssign turns a freshly-parsed operand into an assignment when an
