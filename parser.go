@@ -1296,7 +1296,7 @@ func (p *Parser) parseExprOrAssign() ast.Node {
 	if p.is(token.IDENT) && p.peekTok().Type == token.ASSIGN {
 		name := p.advance().Lit
 		p.expect(token.ASSIGN)
-		val := p.parseExprOrAssign()
+		val := p.parseAssignRhs()
 		p.declareLocal(name)
 		return &ast.Assign{Name: name, Value: val}
 	}
@@ -1304,25 +1304,25 @@ func (p *Parser) parseExprOrAssign() ast.Node {
 	if p.is(token.CONST) && p.peekTok().Type == token.ASSIGN {
 		name := p.advance().Lit
 		p.expect(token.ASSIGN)
-		return &ast.ConstAssign{Name: name, Value: p.parseExprOrAssign()}
+		return &ast.ConstAssign{Name: name, Value: p.parseAssignRhs()}
 	}
 	// Instance-variable assignment: @name '=' expr.
 	if p.is(token.IVAR) && p.peekTok().Type == token.ASSIGN {
 		name := p.advance().Lit
 		p.expect(token.ASSIGN)
-		return &ast.IvarAssign{Name: name, Value: p.parseExprOrAssign()}
+		return &ast.IvarAssign{Name: name, Value: p.parseAssignRhs()}
 	}
 	// Class-variable assignment: @@name '=' expr.
 	if p.is(token.CVAR) && p.peekTok().Type == token.ASSIGN {
 		name := p.advance().Lit
 		p.expect(token.ASSIGN)
-		return &ast.CVarAssign{Name: name, Value: p.parseExprOrAssign()}
+		return &ast.CVarAssign{Name: name, Value: p.parseAssignRhs()}
 	}
 	// Global-variable assignment: $name '=' expr.
 	if p.is(token.GVAR) && p.peekTok().Type == token.ASSIGN {
 		name := p.advance().Lit
 		p.expect(token.ASSIGN)
-		return &ast.GVarAssign{Name: name, Value: p.parseExprOrAssign()}
+		return &ast.GVarAssign{Name: name, Value: p.parseAssignRhs()}
 	}
 	// Compound assignment to a local / ivar: LHS OP= expr → LHS = LHS OP expr.
 	if p.is(token.IDENT) && p.peekTok().Type == token.OPASSIGN {
@@ -1393,6 +1393,40 @@ func (p *Parser) parseExprOrAssign() ast.Node {
 		}
 	}
 	return p.withRescueModifier(left)
+}
+
+// parseAssignRhs parses the right-hand side of a single-target assignment. It is
+// usually one expression (chainable: `a = b = 1`), but a top-level comma — or a
+// leading `*splat` — makes the RHS an implicit array: `x = 1, 2, 3` ≡ `x = [1,
+// 2, 3]` and `a = *list, y` ≡ `a = [*list, y]`, matching MRI.
+func (p *Parser) parseAssignRhs() ast.Node {
+	first := p.parseRhsElem()
+	if !p.is(token.COMMA) {
+		// A bare leading `*splat` with no comma still yields a one-element array
+		// (`a = *list` ≡ `a = [*list]`), as MRI does.
+		if sp, ok := first.(*ast.SplatArg); ok {
+			return &ast.ArrayLit{Elems: []ast.Node{sp}}
+		}
+		return first
+	}
+	elems := []ast.Node{first}
+	for p.accept(token.COMMA) {
+		// `x = 1, 2,` — a trailing comma before the terminator is allowed.
+		if p.atStatementEnd() {
+			break
+		}
+		elems = append(elems, p.parseRhsElem())
+	}
+	return &ast.ArrayLit{Elems: elems}
+}
+
+// parseRhsElem parses one element of an assignment right-hand side, which may be
+// a `*splat`.
+func (p *Parser) parseRhsElem() ast.Node {
+	if p.accept(token.STAR) {
+		return &ast.SplatArg{Value: p.parseTernary()}
+	}
+	return p.parseExprOrAssign()
 }
 
 // withRescueModifier consumes a trailing `rescue FALLBACK` on the same line (the
