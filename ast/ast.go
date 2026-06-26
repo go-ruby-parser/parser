@@ -140,6 +140,15 @@ type While struct {
 	Body []Node
 }
 
+// For is a `for VARS in ITER ... end` loop. Vars names the one or more loop
+// variables (`for a, b in pairs`); unlike a block, a `for` does not introduce a
+// new scope, so the variables remain visible after the loop.
+type For struct {
+	Vars []string
+	Iter Node
+	Body []Node
+}
+
 // MethodDef defines a method on the current self.
 type MethodDef struct {
 	Name       string
@@ -474,6 +483,7 @@ func (*UnaryExpr) node()         {}
 func (*Call) node()              {}
 func (*If) node()                {}
 func (*While) node()             {}
+func (*For) node()               {}
 func (*MethodDef) node()         {}
 func (*Return) node()            {}
 func (*ConstRef) node()          {}

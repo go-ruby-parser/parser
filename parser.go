@@ -111,6 +111,11 @@ type Parser struct {
 	// default (`def f(a = c(1), b = nil)`), so the comma separating parameters is
 	// not mistaken for a masgn target separator (`c(1), b = nil`).
 	noMasgn bool
+	// bracketDepth > 0 while parsing a parenthesised call-argument list or a hash
+	// literal, where newlines are insignificant. A `key:` whose value sits on the
+	// next line (`f(`⏎`  k:`⏎`    v)`) is then a continued pair, not a value-omitted
+	// shorthand; at top level (depth 0) a newline after `key:` ends the command.
+	bracketDepth int
 }
 
 // parseHook, when non-nil, runs at the start of Parse. It exists only so a
@@ -259,6 +264,13 @@ var (
 )
 
 func (p *Parser) parseStatements(stop map[token.Type]bool) []ast.Node {
+	// A statement body is a fresh expression context: the masgn-suppression set
+	// while parsing an enclosing command-argument / parameter-default does not
+	// reach into a nested body (`p begin; a, b = z; end` is a real masgn). Clear it
+	// for the duration and restore on exit.
+	savedMasgn := p.noMasgn
+	p.noMasgn = false
+	defer func() { p.noMasgn = savedMasgn }()
 	var body []ast.Node
 	for {
 		p.skipNewlines()
@@ -503,24 +515,36 @@ func (p *Parser) parseDef() ast.Node {
 	var params []string
 	var defaults []ast.Node
 	var kwParams []ast.KwParam
+	var prepends []ast.Node
 	var kwRest, blockParam string
 	forward := false
 	splat := -1
 	if p.accept(token.LPAREN) {
-		params, defaults, splat, kwParams, kwRest, blockParam, forward = p.parseDefParams(token.RPAREN)
+		params, defaults, prepends, splat, kwParams, kwRest, blockParam, forward = p.parseDefParams(token.RPAREN)
 		p.expect(token.RPAREN)
-	} else if (p.is(token.IDENT) || p.is(token.LABEL) || p.is(token.AMPER) || p.is(token.DOTDOTDOT)) && !p.is(token.NEWLINE) {
-		// paren-less params: def foo a, b  /  def foo a:, b: 2  /  def foo &blk
-		params, defaults, splat, kwParams, kwRest, blockParam, forward = p.parseDefParams(token.NEWLINE)
+	} else if (p.is(token.IDENT) || p.is(token.LABEL) || p.is(token.AMPER) || p.is(token.DOTDOTDOT) ||
+		p.is(token.STAR) || p.is(token.POW) || p.is(token.LPAREN)) && !p.is(token.NEWLINE) {
+		// paren-less params: def foo a, b  /  def foo a:, b: 2  /  def foo &blk  /
+		// def foo *rest  /  def foo **opts  /  def foo (a, b), c
+		params, defaults, prepends, splat, kwParams, kwRest, blockParam, forward = p.parseDefParams(token.NEWLINE)
 	}
 	// Endless method definition: def name(params) = expr (no body/end).
 	if p.accept(token.ASSIGN) {
 		body := []ast.Node{p.parseExprOrAssign()}
+		if len(prepends) > 0 {
+			body = append(prepends, body...)
+		}
 		p.popScope()
 		return &ast.MethodDef{Name: name, Params: params, Defaults: defaults, SplatIndex: splat, KwParams: kwParams, KwRest: kwRest, BlockParam: blockParam, Singleton: singleton, Recv: recv, Forward: forward, Body: body}
 	}
 	// A method body may carry rescue/else/ensure clauses without an explicit begin.
 	body := p.parseBodyWithRescue()
+	// A destructuring parameter `(a, b)` expands to a multiple-assignment from a
+	// synthetic positional, prepended to the body (the same shape parseBlockParams
+	// uses for block destructuring).
+	if len(prepends) > 0 {
+		body = append(prepends, body...)
+	}
 	p.popScope()
 	p.expect(token.END)
 	return &ast.MethodDef{Name: name, Params: params, Defaults: defaults, SplatIndex: splat, KwParams: kwParams, KwRest: kwRest, BlockParam: blockParam, Singleton: singleton, Recv: recv, Forward: forward, Body: body}
@@ -568,9 +592,15 @@ func (p *Parser) parseDefName() (string, bool) {
 		return "`", true
 	}
 	// A keyword used as a method name: def do / def then / def in / def class …
-	// Ruby permits any reserved word in def-name position.
+	// Ruby permits any reserved word in def-name position, including the setter
+	// form `def ensure=(v)` where a `=` hugs the keyword name.
 	if _, isKeyword := token.Keywords[p.cur().Lit]; isKeyword {
-		return p.advance().Lit, true
+		name := p.advance().Lit
+		if p.is(token.ASSIGN) && !p.cur().SpaceBefore {
+			p.advance()
+			name += "="
+		}
+		return name, true
 	}
 	return "", false
 }
@@ -579,8 +609,9 @@ func (p *Parser) parseDefName() (string, bool) {
 // default`. Each parameter is declared before its (and later) defaults are
 // parsed, so a default may reference earlier parameters. defaults is parallel to
 // params, nil for a required parameter.
-func (p *Parser) parseDefParams(until token.Type) (params []string, defaults []ast.Node, splat int, kwParams []ast.KwParam, kwRest, blockParam string, forward bool) {
+func (p *Parser) parseDefParams(until token.Type) (params []string, defaults, prepends []ast.Node, splat int, kwParams []ast.KwParam, kwRest, blockParam string, forward bool) {
 	splat = -1
+	group := 0
 	// A parenthesised parameter list may span several lines, with newlines after
 	// the open paren and around the separating commas; a paren-less list (until ==
 	// NEWLINE) must not skip newlines, as one terminates it.
@@ -589,7 +620,7 @@ func (p *Parser) parseDefParams(until token.Type) (params []string, defaults []a
 		p.skipNewlines()
 	}
 	if p.is(until) || p.is(token.NEWLINE) {
-		return params, defaults, splat, kwParams, kwRest, blockParam, forward
+		return params, defaults, prepends, splat, kwParams, kwRest, blockParam, forward
 	}
 	for {
 		if paren {
@@ -597,6 +628,25 @@ func (p *Parser) parseDefParams(until token.Type) (params []string, defaults []a
 			if p.is(until) { // a trailing comma before the close paren
 				break
 			}
+		}
+		if p.is(token.LPAREN) { // destructuring positional param: `((a, b), c)`
+			outer, chained := p.parseDestructureParam(&group)
+			// The synthetic positional carrying the destructured value is recorded as
+			// the parameter (so arity is correct); the unpacking MultiAssigns run at
+			// the top of the body. Inner (nested) unpacks come first so each
+			// synthetic is bound before the outer unpack reads it.
+			params = append(params, outer.Values[0].(*ast.VarRef).Name)
+			defaults = append(defaults, nil)
+			// The outer unpack binds the inner synthetics first, then the chained
+			// inner unpacks read them.
+			prepends = append(prepends, outer)
+			for _, c := range chained {
+				prepends = append(prepends, c)
+			}
+			if !p.accept(token.COMMA) {
+				break
+			}
+			continue
 		}
 		if p.accept(token.DOTDOTDOT) { // `...` argument-forwarding param (always last)
 			forward = true
@@ -682,7 +732,50 @@ func (p *Parser) parseDefParams(until token.Type) (params []string, defaults []a
 	if paren {
 		p.skipNewlines() // tolerate a newline before the close paren
 	}
-	return params, defaults, splat, kwParams, kwRest, blockParam, forward
+	return params, defaults, prepends, splat, kwParams, kwRest, blockParam, forward
+}
+
+// parseDestructureParam parses a parenthesised destructuring positional
+// parameter — `(a, b)`, `((a, b), c)`, `(a, *b, c)` — returning a MultiAssign
+// that unpacks a synthetic positional ("(0)", "(1)", …) into the named locals,
+// to be prepended to the method body. It mirrors the block-destructuring shape
+// in parseBlockParams and supports one level of further nesting.
+func (p *Parser) parseDestructureParam(group *int) (outer *ast.MultiAssign, chained []*ast.MultiAssign) {
+	p.expect(token.LPAREN)
+	var names []string
+	gsplat := -1
+	for {
+		switch {
+		case p.accept(token.STAR):
+			gsplat = len(names)
+			if p.is(token.IDENT) {
+				n := p.advance().Lit
+				names = append(names, n)
+				p.declareLocal(n)
+			} else {
+				names = append(names, "*")
+			}
+		case p.is(token.LPAREN):
+			// A further-nested destructure: this outer unpack binds it into its own
+			// synthetic local; a chained MultiAssign then unpacks that synthetic.
+			inner, innerChained := p.parseDestructureParam(group)
+			names = append(names, inner.Values[0].(*ast.VarRef).Name)
+			chained = append(chained, inner)
+			chained = append(chained, innerChained...)
+		default:
+			n := p.expect(token.IDENT).Lit
+			names = append(names, n)
+			p.declareLocal(n)
+		}
+		if !p.accept(token.COMMA) {
+			break
+		}
+	}
+	p.expect(token.RPAREN)
+	syn := "(" + strconv.Itoa(*group) + ")"
+	*group++
+	p.declareLocal(syn)
+	return &ast.MultiAssign{Names: names, SplatIndex: gsplat, Values: []ast.Node{&ast.VarRef{Name: syn}}}, chained
 }
 
 // parseParamDefault parses a parameter's default-value expression with masgn
@@ -696,10 +789,27 @@ func (p *Parser) parseParamDefault() ast.Node {
 	return def
 }
 
+// parseKwArgValue parses the value of a `key: value` keyword argument with masgn
+// detection suppressed, so an assignment value does not swallow the comma before
+// the next argument (`f(a: x = 1, b: y = 2)` is two pairs, not one masgn value).
+func (p *Parser) parseKwArgValue() ast.Node {
+	saved := p.noMasgn
+	p.noMasgn = true
+	v := p.parseExprOrAssign()
+	p.noMasgn = saved
+	return v
+}
+
 // parseCond parses an if/unless/while/until condition, where the low-precedence
 // keyword operators `and`/`or`/`not` are permitted (`if a and b`, `while x or
 // y`, `unless not done`).
-func (p *Parser) parseCond() ast.Node { return p.parseKeywordLogical() }
+func (p *Parser) parseCond() ast.Node {
+	// A condition may itself be a one-line pattern match: `if node in Foo[...]`,
+	// `while x => p`. Wrap the logical expression so a trailing `in`/`=>` pattern
+	// is consumed here too, not only at statement level. (A `case`'s `in` uses a
+	// separate path and never reaches parseCond.)
+	return p.parseOneLineMatch(p.parseKeywordLogical())
+}
 
 func (p *Parser) parseIf() ast.Node {
 	p.expect(token.IF)
@@ -762,6 +872,30 @@ func (p *Parser) parseUntil() ast.Node {
 	body := p.parseStatements(bodyEnd)
 	p.expect(token.END)
 	return &ast.While{Cond: not(cond), Body: body}
+}
+
+// parseFor parses `for VAR[, VAR…] in ITER [do] ... end`. The loop variables are
+// plain names (one or more, comma-separated) that — unlike block parameters —
+// are declared in the enclosing scope and outlive the loop, so they are recorded
+// as locals here. The iterator expression is parsed with `do…end` attachment
+// suppressed so a trailing `do` belongs to the loop, not to a call within it.
+func (p *Parser) parseFor() ast.Node {
+	p.expect(token.FOR)
+	var vars []string
+	for {
+		name := p.expect(token.IDENT).Lit
+		vars = append(vars, name)
+		p.declareLocal(name)
+		if !p.accept(token.COMMA) {
+			break
+		}
+	}
+	p.expect(token.IN)
+	iter := p.parseLoopCond()
+	p.accept(token.DO)
+	body := p.parseStatements(bodyEnd)
+	p.expect(token.END)
+	return &ast.For{Vars: vars, Iter: iter, Body: body}
 }
 
 func (p *Parser) parseReturn() ast.Node {
@@ -1198,19 +1332,26 @@ func (p *Parser) parsePatternValue() ast.Node {
 // with bracket delimiters (`Const[key:]`, deconstruct_keys), which MRI accepts.
 func (p *Parser) parseArrayPattern(constName ast.Node) ast.Pattern {
 	p.expect(token.LBRACKET)
+	// A bracket pattern body may span several lines (`Const[`⏎`  a: 1,`⏎`]`), so
+	// newlines after the `[` and around the separating commas are insignificant.
+	p.skipNewlines()
 	if p.is(token.LABEL) || p.is(token.POW) {
 		hp := p.parseHashPatternBody(constName, token.RBRACKET)
+		p.skipNewlines()
 		p.expect(token.RBRACKET)
 		return hp
 	}
 	var elems []arrayElem
 	if !p.accept(token.RBRACKET) {
 		elems = append(elems, p.parseArrayPatternElem())
+		p.skipNewlines()
 		for p.accept(token.COMMA) {
+			p.skipNewlines()
 			if p.is(token.RBRACKET) { // trailing comma
 				break
 			}
 			elems = append(elems, p.parseArrayPatternElem())
+			p.skipNewlines()
 		}
 		p.expect(token.RBRACKET)
 	}
@@ -1758,6 +1899,12 @@ func (p *Parser) parseExprOrAssign() ast.Node {
 // 2, 3]` and `a = *list, y` ≡ `a = [*list, y]`, matching MRI.
 func (p *Parser) parseAssignRhs() ast.Node {
 	first := p.parseRhsElem()
+	// While masgn is suppressed (a parameter default or a keyword-argument value),
+	// a comma ends this value rather than gathering an implicit array RHS, so
+	// `f(a: x = 1, b: 2)` keeps `b: 2` as the next argument.
+	if p.noMasgn {
+		return first
+	}
 	if !p.is(token.COMMA) {
 		// A bare leading `*splat` with no comma still yields a one-element array
 		// (`a = *list` ≡ `a = [*list]`), as MRI does.
@@ -1832,7 +1979,10 @@ func (p *Parser) parseRange() ast.Node {
 		p.advance()
 		var hi ast.Node // endless when nothing can follow the dots
 		if !rangeHiEnds[p.cur().Type] {
-			hi = p.parseBinary(0)
+			// The endpoint may be an assignment (`a..b = c`) or op-assignment
+			// (`@i...@i += n`), which MRI parses as the range's high bound, so feed
+			// the parsed expression through the inline-assignment handler.
+			hi = p.maybeInlineAssign(p.parseBinary(0))
 		}
 		return &ast.RangeLit{Lo: left, Hi: hi, Exclusive: excl}
 	}
@@ -2242,6 +2392,11 @@ func (p *Parser) parseHashLiteral() ast.Node {
 			// `name: value` — the label is sugar for a symbol key.
 			name := p.advance().Lit
 			k = &ast.SymbolLit{Name: name}
+			// A value on the next line (`{`⏎`  k:`⏎`    v }`) is a continued pair:
+			// skip the newline unless a separator/closing token follows (shorthand).
+			if p.is(token.NEWLINE) && !p.firstSignificantIs(token.COMMA) && !p.firstSignificantIs(token.RBRACE) {
+				p.skipNewlines()
+			}
 			if p.is(token.COMMA) || p.is(token.RBRACE) || p.is(token.NEWLINE) {
 				v = p.barewordValue(name) // `{x:}` shorthand == `{x: x}`
 			} else {
@@ -2360,11 +2515,22 @@ func (p *Parser) parseBlockRest(stop map[token.Type]bool, end token.Type, withRe
 	// `foo {`<nl>`|x| … }`, `do`<nl>`|a, b| … end`. Skip the intervening newlines
 	// before the leading `|` (a body statement can never begin with a bare `|`, so
 	// this is unambiguous). The newlines are no-ops for the body either way.
-	if p.is(token.NEWLINE) && p.firstSignificantIs(token.PIPE) {
+	if p.is(token.NEWLINE) && (p.firstSignificantIs(token.PIPE) || p.firstSignificantIs(token.OROR)) {
 		p.skipNewlines()
 	}
-	if p.accept(token.PIPE) {
+	// An empty parameter list `||` is lexed as a single OROR token (`{ || body }`).
+	if p.accept(token.OROR) {
+		p.scope().explicitParams = true
+	} else if p.accept(token.PIPE) {
 		params, defaults, prepends, splat, blockParam = p.parseBlockParams(token.PIPE)
+		// Block-local variables follow a `;`: `|a, b; x, y|`. The lexer maps `;` to a
+		// NEWLINE token, so a NEWLINE here (before the closing `|`) opens the
+		// block-local list. They are ordinary locals of the block scope — declared so
+		// the body sees them, but carried no further than the parameter list.
+		if p.is(token.NEWLINE) {
+			p.advance()
+			p.parseBlockLocals()
+		}
 		p.expect(token.PIPE)
 		p.scope().explicitParams = true
 	}
@@ -2389,6 +2555,20 @@ func (p *Parser) parseBlockRest(stop map[token.Type]bool, end token.Type, withRe
 		body = append(prepends, body...)
 	}
 	return &ast.Block{Params: params, Defaults: defaults, SplatIndex: splat, BlockParam: blockParam, Body: body}
+}
+
+// parseBlockLocals parses the block-local variable list after the `;` in a block
+// parameter list (`|a, b; x, y|`). Each name is declared in the current block
+// scope so the body resolves it as a local; the list is otherwise discarded
+// since block-locals carry no arity or default.
+func (p *Parser) parseBlockLocals() {
+	for {
+		name := p.expect(token.IDENT).Lit
+		p.declareLocal(name)
+		if !p.accept(token.COMMA) {
+			break
+		}
+	}
 }
 
 // parseBlockParams parses a block's parameter list (the `|...|` form for brace/do
@@ -2720,6 +2900,8 @@ func (p *Parser) parsePrimary() ast.Node {
 		return p.parseWhile()
 	case token.UNTIL:
 		return p.parseUntil()
+	case token.FOR:
+		return p.parseFor()
 	}
 	return p.fail("unexpected token %q (%s)", t.Lit, t.Type)
 }
@@ -2768,9 +2950,23 @@ func (p *Parser) parseIdentExpr() ast.Node {
 		return call
 	}
 
-	// Known local variable → read.
+	// Known local variable → read. But a bareword in scope is still a method call
+	// when it is immediately followed by a construct a local variable cannot take:
+	// a `do` block (`fork = false; pid = fork do … end`) or an unambiguous
+	// command argument (`type = 1; type 'X = Y'` is `type('X = Y')`). A brace block
+	// binds tighter and is handled by the postfix chain.
 	if p.is(token.IDENT) && p.isLocal(name) {
 		p.advance()
+		if p.is(token.DO) && !p.noDo {
+			return &ast.Call{Name: name, Block: p.parseDoBlock()}
+		}
+		if p.localCommandArgFollows() {
+			call := &ast.Call{Name: name, Args: p.parseCommandArgs()}
+			if p.is(token.DO) && !p.noDo {
+				call.Block = p.parseDoBlock()
+			}
+			return call
+		}
 		return &ast.VarRef{Name: name}
 	}
 
@@ -2791,8 +2987,10 @@ func (p *Parser) parseIdentExpr() ast.Node {
 		return &ast.Call{Name: name, Args: p.parseCommandArgs()}
 	}
 	// Bare `it` (no receiver, no args) inside a param-less block is the implicit
-	// single parameter (Ruby 3.4). With args/parens it stays a method call.
-	if name == "it" {
+	// single parameter (Ruby 3.4). With args/parens — or a block, as in RSpec's
+	// `it { … }` / `it do … end` — it stays a method call taking that block, not
+	// the implicit parameter followed by a stray block.
+	if name == "it" && !p.is(token.LBRACE) && !(p.is(token.DO) && !p.noDo) {
 		if s := p.implicitParamScope(); s != nil {
 			s.usedIt = true
 			return &ast.VarRef{Name: name}
@@ -2818,18 +3016,44 @@ func isHuggingString(t token.Token) bool {
 }
 
 // constCommandArgFollows reports whether a constant is immediately followed by a
-// space-separated literal value, making it a conversion-style command call
-// (`BigDecimal "0.01"`, `Integer "42"`, `Float 1`). It is deliberately narrow —
-// only a literal string/number/symbol argument — so an ordinary `Foo` reference
-// next to other tokens (a binary operator, `.method`, `[`, a newline) is not
-// mistaken for a call.
+// space-separated value, making it a conversion-/command-style call: a literal
+// (`BigDecimal "0.01"`, `Integer "42"`, `Float 1`) or another value-starting
+// token (`raise ArgumentError urn.inspect`, `X y`). It stays deliberately narrow
+// — only unambiguous argument starts — so an ordinary `Foo` reference next to an
+// operator, `.method`, `::`, `[`, or a newline is not mistaken for a call.
 func (p *Parser) constCommandArgFollows() bool {
 	t := p.cur()
 	if !t.SpaceBefore {
 		return false
 	}
 	switch t.Type {
-	case token.STRING, token.STRBEG, token.INT, token.FLOAT, token.SYMBOL:
+	case token.STRING, token.STRBEG, token.INT, token.FLOAT, token.SYMBOL,
+		token.IDENT, token.CONST, token.IVAR, token.CVAR, token.GVAR,
+		token.TRUE, token.FALSE, token.NIL, token.SELF,
+		token.WORDS, token.SYMBOLS, token.REGEXP, token.XSTRING:
+		return true
+	}
+	return false
+}
+
+// localCommandArgFollows decides whether a bareword that is a known local should
+// nonetheless be read as a command call because an unambiguous argument follows
+// (`type = 1; type 'X'` is `type('X')`). It is deliberately narrower than
+// canStartCommandArg: for an in-scope name the sign/splat/block-pass operators
+// stay binary (`x = 5; x -1` is `x - 1`, not `x(-1)`), and a bare `(`/`[` is an
+// index/group on the value, so only space-separated literal/value-starting
+// arguments — a string, number, symbol, another bareword, a constant, an ivar,
+// etc. — promote the local back to a call.
+func (p *Parser) localCommandArgFollows() bool {
+	t := p.cur()
+	if !t.SpaceBefore {
+		return false
+	}
+	switch t.Type {
+	case token.STRING, token.STRBEG, token.INT, token.FLOAT, token.SYMBOL,
+		token.IDENT, token.CONST, token.IVAR, token.CVAR, token.GVAR,
+		token.TRUE, token.FALSE, token.NIL, token.SELF,
+		token.WORDS, token.SYMBOLS, token.REGEXP, token.XSTRING, token.LABEL:
 		return true
 	}
 	return false
@@ -2847,11 +3071,12 @@ func (p *Parser) canStartCommandArg() bool {
 	case token.INT, token.FLOAT, token.STRING, token.STRBEG, token.SYMBOL, token.IDENT, token.CONST,
 		token.IVAR, token.CVAR, token.GVAR, token.TRUE, token.FALSE, token.NIL, token.SELF, token.BANG, token.TILDE,
 		token.LPAREN, token.LBRACKET, token.ARROW, token.WORDS, token.SYMBOLS, token.REGEXP, token.XSTRING,
-		token.BEGIN, token.CASE, token.DEF, token.SUPER:
+		token.BEGIN, token.CASE, token.DEF, token.SUPER, token.YIELD:
 		// Value-producing keywords: `p begin; 1; end`, `p case x; when 1; 2; end`,
 		// `def` (which evaluates to the method's name symbol, as in
-		// `module_function def foo; end` / `private def bar; end`), and `super`
-		// (`number_to_currency super`, `Request.new super, url_helpers`).
+		// `module_function def foo; end` / `private def bar; end`), `super`
+		// (`number_to_currency super`, `Request.new super, url_helpers`), and `yield`
+		// (`raise yield('x')`, `foo yield(1)` — the block's value as an argument).
 		return true
 	case token.LABEL:
 		// Keyword/hash argument without parens: `render json: x`, `delegate to: :c`.
@@ -2881,6 +3106,13 @@ func (p *Parser) parseCommandArgs() []ast.Node {
 	// binds tighter and always attaches to the nearest call.
 	saved := p.noDo
 	p.noDo = true
+	// In a paren-less argument list the comma separates arguments, so multiple-
+	// assignment detection must be off: `assert_equal a(1), tag = b(2)` is two
+	// arguments (the second an assignment), not an mlhs `a(1), tag = …`. A single
+	// argument that is itself an assignment (`f tag = y`) still parses, and an
+	// assignment value stops at the comma. Mirrors parameter-default handling.
+	savedMasgn := p.noMasgn
+	p.noMasgn = true
 	var args []ast.Node
 	var kw *ast.HashLit
 	p.parseOneCallArg(&args, &kw)
@@ -2888,6 +3120,7 @@ func (p *Parser) parseCommandArgs() []ast.Node {
 		p.skipNewlines()
 		p.parseOneCallArg(&args, &kw)
 	}
+	p.noMasgn = savedMasgn
 	p.noDo = saved
 	if kw != nil {
 		args = append(args, kw)
@@ -2896,6 +3129,8 @@ func (p *Parser) parseCommandArgs() []ast.Node {
 }
 
 func (p *Parser) parseCallArgs(until token.Type) []ast.Node {
+	p.bracketDepth++
+	defer func() { p.bracketDepth-- }()
 	var args []ast.Node
 	var kw *ast.HashLit
 	p.skipNewlines()
@@ -2954,6 +3189,16 @@ func (p *Parser) parseOneCallArg(args *[]ast.Node, kw **ast.HashLit) {
 	if p.is(token.LABEL) {
 		name := p.advance().Lit
 		key := &ast.SymbolLit{Name: name}
+		// Inside a parenthesised argument list or hash, a `key:` whose value is on
+		// the next line is a continued pair: skip the intervening newline(s) so the
+		// value is parsed, unless what follows is itself a separator/closing token
+		// (then it is a value-omitted shorthand). At top level a newline ends the
+		// command, so this skipping is gated on bracketDepth.
+		if p.bracketDepth > 0 && p.is(token.NEWLINE) && !p.firstSignificantIs(token.COMMA) &&
+			!p.firstSignificantIs(token.RPAREN) && !p.firstSignificantIs(token.RBRACKET) &&
+			!p.firstSignificantIs(token.RBRACE) {
+			p.skipNewlines()
+		}
 		// Value-omitted shorthand (Ruby 3.4): `foo(format:, name:)` means
 		// `foo(format: format, name: name)` — when the label is not followed by a
 		// value, the value is the same-named local or method call.
@@ -2961,7 +3206,11 @@ func (p *Parser) parseOneCallArg(args *[]ast.Node, kw **ast.HashLit) {
 			p.addKwPair(kw, key, p.barewordValue(name))
 			return
 		}
-		p.addKwPair(kw, key, p.parseExprOrAssign())
+		// A keyword value that is itself an assignment must not swallow the comma
+		// separating the next argument: `f(a: x = 1, b: y = 2)` is two keyword
+		// pairs, not `a: (x = (1, b: y = 2))`. Suppress masgn detection (as a def
+		// parameter default does) so the `,` ends this value.
+		p.addKwPair(kw, key, p.parseKwArgValue())
 		return
 	}
 	if p.accept(token.STAR) {
