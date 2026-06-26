@@ -1712,8 +1712,15 @@ func (p *Parser) parseHashLiteral() ast.Node {
 			}
 		} else {
 			k = p.parseExprOrAssign()
-			p.expect(token.HASHROCKET)
-			v = p.parseExprOrAssign()
+			// A quoted string key followed by `:` is a symbol key (`{'a': 1}`,
+			// `{"d-a-s-h": 2}`, `{"a#{x}": 3}`), the quoted form of a `name:` label.
+			if sym, ok := p.stringKeyColon(k); ok {
+				k = sym
+				v = p.parseExprOrAssign()
+			} else {
+				p.expect(token.HASHROCKET)
+				v = p.parseExprOrAssign()
+			}
 		}
 		h.Keys = append(h.Keys, k)
 		h.Values = append(h.Values, v)
@@ -1725,6 +1732,28 @@ func (p *Parser) parseHashLiteral() ast.Node {
 	}
 	p.expect(token.RBRACE)
 	return h
+}
+
+// stringKeyColon recognises the quoted-symbol-key shorthand: a string-literal
+// key immediately followed by `:` denotes a symbol key, the quoted analogue of a
+// `name:` label (`{'a': 1}`, `{"d-a-s-h": 2}`, `tag("@click": "f")`). It returns
+// the symbol-key node and true when key is a string literal and the cursor is on
+// the separating `:` (consuming it); otherwise it returns (nil, false), leaving
+// the cursor untouched so the caller falls back to the `=>` form. A plain string
+// becomes a SymbolLit; an interpolated string becomes a dynamic `"…".to_sym`.
+func (p *Parser) stringKeyColon(key ast.Node) (ast.Node, bool) {
+	if !p.is(token.COLON) {
+		return nil, false
+	}
+	switch s := key.(type) {
+	case *ast.StringLit:
+		p.advance() // ':'
+		return &ast.SymbolLit{Name: s.Value}, true
+	case *ast.StrInterp:
+		p.advance() // ':'
+		return &ast.Call{Recv: s, Name: "to_sym"}, true
+	}
+	return nil, false
 }
 
 // parseLambda parses a stabby lambda `->(params) { body }` / `-> { body }` /
@@ -2245,6 +2274,12 @@ func (p *Parser) parseOneCallArg(args *[]ast.Node, kw **ast.HashLit) {
 	node := p.parseExprOrAssign()
 	if p.accept(token.HASHROCKET) {
 		p.addKwPair(kw, node, p.parseExprOrAssign())
+		return
+	}
+	// A quoted string key followed by `:` is a symbol-keyed pair (the quoted form
+	// of a `key:` keyword argument): `tag(:div, "@click": "f()")`.
+	if sym, ok := p.stringKeyColon(node); ok {
+		p.addKwPair(kw, sym, p.parseExprOrAssign())
 		return
 	}
 	*args = append(*args, node)
