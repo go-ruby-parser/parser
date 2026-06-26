@@ -108,7 +108,11 @@ func isContinuationOp(t token.Type) bool {
 		token.EQ, token.EQQ, token.MATCH, token.NEQ, token.LT, token.GT, token.LE,
 		token.GE, token.SPACESHIP, token.ANDAND, token.OROR,
 		token.ASSIGN, token.OPASSIGN, token.COMMA, token.HASHROCKET,
-		token.DOT, token.SAFEDOT, token.QUESTION:
+		token.DOT, token.SAFEDOT, token.QUESTION,
+		// Trailing low-precedence keyword operators and modifiers whose operand /
+		// condition may sit on the next line: `... or\n fail`, `... and\n x`,
+		// `do_it unless\n cond`, `foo if\n bar` (MRI joins these lines too).
+		token.AND, token.OR, token.IF, token.UNLESS, token.WHILE, token.UNTIL:
 		return true
 	}
 	return false

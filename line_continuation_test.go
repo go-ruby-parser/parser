@@ -36,6 +36,15 @@ func TestLineContinuationTrailingOperator(t *testing.T) {
 		"foo.\nbar",
 		"foo&.\nbar",
 		"c ?\na : b",
+		// Trailing low-precedence keyword operators and modifiers continue too.
+		"a and\nb",
+		"a or\nb",
+		"foo if\nbar",
+		"foo unless\nbar",
+		"foo while\nbar",
+		"foo until\nbar",
+		"x = 1 or\nfail",
+		"y =~ /re/ or\nraise",
 	}
 	for _, src := range oneStmt {
 		t.Run(src, func(t *testing.T) {
