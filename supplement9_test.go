@@ -27,12 +27,12 @@ func TestGlobalVarAssign(t *testing.T) {
 
 // extraValidCVar covers class-variable reads and assignment (plain and compound).
 var extraValidCVar = []string{
-	"class C; @@n = 0; end",       // class-variable assignment in a class body
+	"class C; @@n = 0; end",                  // class-variable assignment in a class body
 	"class C; @@n = 0; def m; @@n; end; end", // read inside a method
-	"class C; def inc; @@n += 1; end; end",    // compound class-variable assignment
-	"@@top = 1",                  // class variable at the top level (Object)
-	"p @@n",                      // bare class-variable read
-	"@@n ||= 5",                  // compound (logical) class-variable assignment
+	"class C; def inc; @@n += 1; end; end",   // compound class-variable assignment
+	"@@top = 1",                              // class variable at the top level (Object)
+	"p @@n",                                  // bare class-variable read
+	"@@n ||= 5",                              // compound (logical) class-variable assignment
 }
 
 func TestClassVarAssign(t *testing.T) {
@@ -55,10 +55,10 @@ func TestClassVarErrors(t *testing.T) {
 // extraValidDefRecv covers singleton-method definitions with an explicit
 // receiver: a local object or a constant (def self.foo was already supported).
 var extraValidDefRecv = []string{
-	"o = Object.new; def o.greet; 1; end",   // def on a local's object
-	"class C; end; def C.make; 1; end",       // def on a constant (class method)
-	"def Foo.bar(a, b) = a + b",              // endless def with a receiver
-	"o = []; def o.size2; 99; end",           // receiver that is also a method name elsewhere
+	"o = Object.new; def o.greet; 1; end", // def on a local's object
+	"class C; end; def C.make; 1; end",    // def on a constant (class method)
+	"def Foo.bar(a, b) = a + b",           // endless def with a receiver
+	"o = []; def o.size2; 99; end",        // receiver that is also a method name elsewhere
 }
 
 func TestDefWithReceiver(t *testing.T) {

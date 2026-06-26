@@ -490,10 +490,22 @@ func (p *Parser) parseDefName() (string, bool) {
 			name += "="
 		}
 		return name, true
+	case token.PLUS, token.MINUS, token.TILDE, token.BANG:
+		// Binary `+`/`-` and the unary methods `~`/`!`, plus the unary-operator
+		// methods `+@`/`-@`/`~@`/`!@` whose `@` hugs the operator.
+		name := p.advance().Lit
+		// `+@`/`-@`/`~@`/`!@`: a bare `@` (no following name) hugs the operator. The
+		// lexer yields it as an ILLEGAL "@" token (bare `@` is not a valid ivar).
+		if p.cur().Lit == "@" && !p.cur().SpaceBefore {
+			p.advance()
+			name += "@"
+		}
+		return name, true
 	case token.CONST,
 		token.SPACESHIP, token.LT, token.GT, token.LE, token.GE,
-		token.EQ, token.NEQ, token.SHOVEL, token.PLUS, token.MINUS,
-		token.STAR, token.SLASH, token.PERCENT:
+		token.EQ, token.EQQ, token.NEQ, token.MATCH, token.SHOVEL, token.RSHIFT,
+		token.STAR, token.POW, token.SLASH, token.PERCENT,
+		token.AMPER, token.PIPE, token.CARET:
 		return p.advance().Lit, true
 	case token.LBRACKET:
 		p.advance()

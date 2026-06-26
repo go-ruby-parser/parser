@@ -135,17 +135,19 @@ func (l *Lexer) lexToken() token.Token {
 	switch {
 	case c == 0:
 		return mk(token.EOF, "")
-	case c == '/' && l.state == exprBegin:
+	case c == '/' && l.state == exprBegin && l.prevType != token.DEF:
 		// At expression-begin position a '/' opens a regexp literal, not division
-		// (the same disambiguation MRI uses via its lexer state).
+		// (the same disambiguation MRI uses via its lexer state). The one exception
+		// is right after `def`, where `/` names the division-operator method
+		// (`def /(other)`) rather than opening a pattern.
 		return l.lexRegexp(spaceBefore, line, col)
-	case c == '%' && l.percentBeginsLiteral(spaceBefore) && l.atPercentArray():
+	case c == '%' && l.prevType != token.DEF && l.percentBeginsLiteral(spaceBefore) && l.atPercentArray():
 		// %w[…] / %i[…] / %W[…] / %I[…] word- and symbol-array literals.
 		return l.lexPercentArray(spaceBefore, line, col)
-	case c == '%' && l.percentBeginsLiteral(spaceBefore) && l.atPercentRXS():
+	case c == '%' && l.prevType != token.DEF && l.percentBeginsLiteral(spaceBefore) && l.atPercentRXS():
 		// %r{…}flags regexp, %x{…} backtick command, %s{…} symbol literals.
 		return l.lexPercentRXS(spaceBefore, line, col)
-	case c == '%' && l.percentBeginsLiteral(spaceBefore) && l.atPercentString():
+	case c == '%' && l.prevType != token.DEF && l.percentBeginsLiteral(spaceBefore) && l.atPercentString():
 		// %q(…) / %Q(…) / %(…) / %W(…) string literals.
 		return l.lexPercentString(spaceBefore, line, col)
 	case c == '\n' || c == ';':
@@ -181,6 +183,8 @@ func (l *Lexer) lexToken() token.Token {
 		return l.lexString(spaceBefore, line, col)
 	case c == '\'':
 		return l.lexSingleQuote(spaceBefore, line, col)
+	case c == '`':
+		return l.lexBacktick(spaceBefore, line, col)
 	case c == '@':
 		return l.lexIvar(spaceBefore, line, col)
 	case c == '$':
@@ -1503,6 +1507,44 @@ func (l *Lexer) lexSingleQuote(spaceBefore bool, line, col int) token.Token {
 	}
 	l.state = exprEnd
 	return token.Token{Type: token.STRING, Lit: string(b), Line: line, Col: col, SpaceBefore: spaceBefore}
+}
+
+// lexBacktick lexes a `cmd` command literal (cursor on the opening backtick),
+// the same node `%x{…}` produces: a single XSTRING whose Lit is the raw command
+// source. As with the %x form the body is kept verbatim (interpolation markers
+// are not expanded here); a backslash keeps its following byte so an escaped
+// backtick does not close the literal.
+func (l *Lexer) lexBacktick(spaceBefore bool, line, col int) token.Token {
+	l.advance() // opening backtick
+	var body []byte
+	for {
+		c := l.peek()
+		if c == 0 {
+			return token.Token{Type: token.ILLEGAL, Lit: "unterminated command literal", Line: line, Col: col, SpaceBefore: spaceBefore}
+		}
+		if c == '`' {
+			l.advance() // closing backtick
+			break
+		}
+		if c == '\\' {
+			l.advance()
+			esc := l.peek()
+			if esc == 0 {
+				body = append(body, '\\')
+				break
+			}
+			l.advance()
+			if esc == '`' || esc == '\\' {
+				body = append(body, esc) // \` and \\ → literal char
+			} else {
+				body = append(body, '\\', esc)
+			}
+			continue
+		}
+		body = append(body, l.advance())
+	}
+	l.state = exprEnd
+	return token.Token{Type: token.XSTRING, Lit: string(body), Line: line, Col: col, SpaceBefore: spaceBefore}
 }
 
 // continueString resumes lexing a string after an interpolation's closing '}',
