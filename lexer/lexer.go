@@ -99,16 +99,17 @@ func (l *Lexer) next() token.Token {
 // isContinuationOp reports whether a line ending in token type t is incomplete,
 // so the trailing newline continues onto the next line rather than terminating
 // the statement. These are infix operators (plus comma and a trailing dot) that
-// require a right-hand operand. Deliberately excluded as ambiguous: `|` and `&`
-// (block params / block-pass), `^` (pattern pin), `:` (label/symbol/ternary),
-// `<<` (heredoc opener).
+// require a right-hand operand. A bare `:` is included: it is only ever the
+// ternary separator here (a symbol `:x` and a label `x:` are their own tokens),
+// so `expr ? x :`<newline>`y` joins. Deliberately excluded as ambiguous: `|` and
+// `&` (block params / block-pass), `^` (pattern pin), `<<` (heredoc opener).
 func isContinuationOp(t token.Type) bool {
 	switch t {
 	case token.PLUS, token.MINUS, token.STAR, token.POW, token.SLASH, token.PERCENT,
 		token.EQ, token.EQQ, token.MATCH, token.NEQ, token.LT, token.GT, token.LE,
 		token.GE, token.SPACESHIP, token.ANDAND, token.OROR,
 		token.ASSIGN, token.OPASSIGN, token.COMMA, token.HASHROCKET,
-		token.DOT, token.SAFEDOT, token.QUESTION,
+		token.DOT, token.SAFEDOT, token.QUESTION, token.COLON,
 		// Trailing low-precedence keyword operators and modifiers whose operand /
 		// condition may sit on the next line: `... or\n fail`, `... and\n x`,
 		// `do_it unless\n cond`, `foo if\n bar` (MRI joins these lines too).

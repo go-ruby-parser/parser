@@ -145,6 +145,29 @@ func TestPercentRegexpQuoteDelim(t *testing.T) {
 	}
 }
 
+// --- Feature 2: multi-line ternary ---
+
+func TestMultiLineTernary(t *testing.T) {
+	for _, src := range []string{
+		"a=1\nb=2\nc=3\nx = a ?\n  b :\n  c",
+		"a=1\nb=2\nc=3\nx = a ? b :\n  c",
+		"a=1\nb=2\nc=3\nx = a ?\n  b : c",
+		"x=1\ny=2\nz=3\np x ?\ny :\nz",
+	} {
+		if _, err := parser.Parse(src); err != nil {
+			t.Errorf("Parse(%q): %v", src, err)
+		}
+	}
+}
+
+func TestMultiLineTernaryShape(t *testing.T) {
+	prog := mustParse(t, "a=1\nb=2\nc=3\nx = a ?\n  b :\n  c")
+	asn := prog.Body[3].(*ast.Assign)
+	if _, ok := asn.Value.(*ast.If); !ok {
+		t.Fatalf("multi-line ternary RHS = %T, want *ast.If", asn.Value)
+	}
+}
+
 // --- Feature 3: adjacent string-literal concatenation ---
 
 func TestAdjacentStringConcat(t *testing.T) {
