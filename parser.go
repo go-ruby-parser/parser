@@ -127,11 +127,29 @@ func Parse(src string) (prog *ast.Program, err error) {
 
 // --- token cursor ---
 
-func (p *Parser) cur() token.Token  { return p.toks[p.pos] }
-// peekTok returns the token after the cursor. It is only ever called with the
-// cursor on an IDENT (which is never the trailing EOF), so pos+1 is in range.
+// The cursor clamps at the trailing EOF: once exhausted, cur/peekTok keep
+// returning EOF and advance is a no-op, so a parser that over-reads on malformed
+// input (e.g. an unterminated string interpolation) fails cleanly via expect
+// instead of indexing past the slice and panicking.
+func (p *Parser) cur() token.Token {
+	if p.pos >= len(p.toks) {
+		return p.toks[len(p.toks)-1] // the EOF token
+	}
+	return p.toks[p.pos]
+}
+
+// peekTok returns the token after the cursor. Every caller first checks the
+// cursor is a specific non-EOF token, and the trailing EOF is always present, so
+// the cursor is at most the second-to-last token and pos+1 stays in range.
 func (p *Parser) peekTok() token.Token { return p.toks[p.pos+1] }
-func (p *Parser) advance() token.Token { t := p.toks[p.pos]; p.pos++; return t }
+
+func (p *Parser) advance() token.Token {
+	t := p.cur()
+	if p.pos < len(p.toks) {
+		p.pos++
+	}
+	return t
+}
 
 func (p *Parser) is(tt token.Type) bool { return p.cur().Type == tt }
 
@@ -199,12 +217,12 @@ func (p *Parser) barewordValue(name string) ast.Node {
 // --- statements ---
 
 var (
-	bodyEnd      = map[token.Type]bool{token.END: true}
+	bodyEnd       = map[token.Type]bool{token.END: true}
 	braceBlockEnd = map[token.Type]bool{token.RBRACE: true}
-	beginBodyEnd = map[token.Type]bool{token.RESCUE: true, token.ELSE: true, token.ENSURE: true, token.END: true}
-	caseBodyEnd  = map[token.Type]bool{token.WHEN: true, token.ELSE: true, token.END: true}
-	inBodyEnd    = map[token.Type]bool{token.IN: true, token.ELSE: true, token.END: true}
-	ifBodyEnd    = map[token.Type]bool{token.END: true, token.ELSE: true, token.ELSIF: true}
+	beginBodyEnd  = map[token.Type]bool{token.RESCUE: true, token.ELSE: true, token.ENSURE: true, token.END: true}
+	caseBodyEnd   = map[token.Type]bool{token.WHEN: true, token.ELSE: true, token.END: true}
+	inBodyEnd     = map[token.Type]bool{token.IN: true, token.ELSE: true, token.END: true}
+	ifBodyEnd     = map[token.Type]bool{token.END: true, token.ELSE: true, token.ELSIF: true}
 	// rangeHiEnds marks tokens that cannot begin a range's high endpoint, making
 	// the range endless (`1..`, `arr[2..]`).
 	rangeHiEnds = map[token.Type]bool{token.RBRACKET: true, token.RPAREN: true, token.RBRACE: true, token.NEWLINE: true, token.EOF: true, token.COMMA: true, token.END: true, token.THEN: true, token.DO: true}
@@ -253,8 +271,44 @@ func (p *Parser) parseStatement() ast.Node {
 		p.advance()
 		return p.applyModifiers(&ast.Retry{})
 	default:
-		return p.applyModifiers(p.parseOneLineMatch(p.parseExprOrAssign()))
+		return p.applyModifiers(p.parseOneLineMatch(p.parseKeywordLogical()))
 	}
+}
+
+// parseKeywordLogical parses the low-precedence keyword operators `and`, `or`,
+// and the prefix `not`. They bind looser than `=` (and everything else except
+// the trailing if/unless/while/until modifiers), so they sit between an
+// assignment and a statement. `and`/`or` are left-associative and desugar to the
+// `&&`/`||` BinaryExpr nodes; `not` desugars to a `!` UnaryExpr. (`p(1 and 2)`
+// is itself invalid Ruby, so this layer only appears in statement/assignment
+// positions, never inside a paren-less argument.)
+func (p *Parser) parseKeywordLogical() ast.Node {
+	left := p.parseExprOrAssign()
+	for p.is(token.AND) || p.is(token.OR) {
+		op := "&&"
+		if p.is(token.OR) {
+			op = "||"
+		}
+		p.advance()
+		left = &ast.BinaryExpr{Op: op, Left: left, Right: p.parseKeywordOperand()}
+	}
+	return left
+}
+
+// parseKeywordOperand parses an operand of `and`/`or`. Besides an ordinary
+// expression (a leading `not` is handled by parseExprOrAssign) it accepts the
+// jump keywords `return`/`break`/`next` (`a or return`, `x = 1 and break`),
+// which are valid in this position in MRI.
+func (p *Parser) parseKeywordOperand() ast.Node {
+	switch p.cur().Type {
+	case token.RETURN:
+		return p.parseReturn()
+	case token.BREAK:
+		return p.parseBreak()
+	case token.NEXT:
+		return p.parseNext()
+	}
+	return p.parseExprOrAssign()
 }
 
 // parseOneLineMatch wraps a statement-level expression in a one-line pattern
@@ -277,16 +331,16 @@ func (p *Parser) applyModifiers(node ast.Node) ast.Node {
 		switch p.cur().Type {
 		case token.IF:
 			p.advance()
-			node = &ast.If{Cond: p.parseExprOrAssign(), Then: []ast.Node{node}}
+			node = &ast.If{Cond: p.parseCond(), Then: []ast.Node{node}}
 		case token.UNLESS:
 			p.advance()
-			node = &ast.If{Cond: not(p.parseExprOrAssign()), Then: []ast.Node{node}}
+			node = &ast.If{Cond: not(p.parseCond()), Then: []ast.Node{node}}
 		case token.WHILE:
 			p.advance()
-			node = &ast.While{Cond: p.parseExprOrAssign(), Body: []ast.Node{node}}
+			node = &ast.While{Cond: p.parseCond(), Body: []ast.Node{node}}
 		case token.UNTIL:
 			p.advance()
-			node = &ast.While{Cond: not(p.parseExprOrAssign()), Body: []ast.Node{node}}
+			node = &ast.While{Cond: not(p.parseCond()), Body: []ast.Node{node}}
 		default:
 			return node
 		}
@@ -295,28 +349,64 @@ func (p *Parser) applyModifiers(node ast.Node) ast.Node {
 
 func not(n ast.Node) ast.Node { return &ast.UnaryExpr{Op: "!", Operand: n} }
 
+// parseConstPath parses a constant path in a name/superclass position: a bare
+// constant (`Foo`), a scope-resolution path (`Foo::Bar::Baz`), or a leading-`::`
+// path (`::Foo`, `::Foo::Bar`). It returns the trailing segment name and, when
+// the path is more than a bare constant, the full *ScopedConst node (else nil).
+func (p *Parser) parseConstPath() (name string, path ast.Node) {
+	var node ast.Node
+	if p.accept(token.SCOPE) { // leading `::Name`
+		name = p.expect(token.CONST).Lit
+		node = &ast.ScopedConst{Name: name, Global: true}
+	} else {
+		name = p.expect(token.CONST).Lit
+		node = &ast.ConstRef{Name: name}
+	}
+	scoped := node // becomes the *ScopedConst once a `::CONST` segment is seen
+	for p.is(token.SCOPE) && p.peekTok().Type == token.CONST {
+		p.advance() // ::
+		name = p.advance().Lit
+		scoped = &ast.ScopedConst{Recv: scoped, Name: name}
+	}
+	if _, ok := scoped.(*ast.ConstRef); ok {
+		return name, nil // a bare constant: no path node
+	}
+	return name, scoped
+}
+
 func (p *Parser) parseClass() ast.Node {
 	p.expect(token.CLASS)
-	name := p.expect(token.CONST).Lit
+	// `class << self` (singleton-class body) is out of this front-end's scope; a
+	// SHOVEL here is not a constant path.
+	if p.is(token.SHOVEL) {
+		p.fail("singleton class (class << ...) is not supported")
+	}
+	name, path := p.parseConstPath()
 	super := ""
+	var superExpr ast.Node
 	if p.accept(token.LT) {
-		super = p.expect(token.CONST).Lit
+		sname, spath := p.parseConstPath()
+		if spath != nil {
+			superExpr = spath
+		} else {
+			super = sname
+		}
 	}
 	p.pushScope() // a class body has its own local scope
 	body := p.parseStatements(bodyEnd)
 	p.popScope()
 	p.expect(token.END)
-	return &ast.ClassDef{Name: name, Super: super, Body: body}
+	return &ast.ClassDef{Name: name, NamePath: path, Super: super, SuperExpr: superExpr, Body: body}
 }
 
 func (p *Parser) parseModule() ast.Node {
 	p.expect(token.MODULE)
-	name := p.expect(token.CONST).Lit
+	name, path := p.parseConstPath()
 	p.pushScope() // a module body has its own local scope
 	body := p.parseStatements(bodyEnd)
 	p.popScope()
 	p.expect(token.END)
-	return &ast.ModuleDef{Name: name, Body: body}
+	return &ast.ModuleDef{Name: name, NamePath: path, Body: body}
 }
 
 func (p *Parser) parseDef() ast.Node {
@@ -346,19 +436,20 @@ func (p *Parser) parseDef() ast.Node {
 	var defaults []ast.Node
 	var kwParams []ast.KwParam
 	var kwRest, blockParam string
+	forward := false
 	splat := -1
 	if p.accept(token.LPAREN) {
-		params, defaults, splat, kwParams, kwRest, blockParam = p.parseDefParams(token.RPAREN)
+		params, defaults, splat, kwParams, kwRest, blockParam, forward = p.parseDefParams(token.RPAREN)
 		p.expect(token.RPAREN)
-	} else if (p.is(token.IDENT) || p.is(token.LABEL) || p.is(token.AMPER)) && !p.is(token.NEWLINE) {
+	} else if (p.is(token.IDENT) || p.is(token.LABEL) || p.is(token.AMPER) || p.is(token.DOTDOTDOT)) && !p.is(token.NEWLINE) {
 		// paren-less params: def foo a, b  /  def foo a:, b: 2  /  def foo &blk
-		params, defaults, splat, kwParams, kwRest, blockParam = p.parseDefParams(token.NEWLINE)
+		params, defaults, splat, kwParams, kwRest, blockParam, forward = p.parseDefParams(token.NEWLINE)
 	}
 	// Endless method definition: def name(params) = expr (no body/end).
 	if p.accept(token.ASSIGN) {
 		body := []ast.Node{p.parseExprOrAssign()}
 		p.popScope()
-		return &ast.MethodDef{Name: name, Params: params, Defaults: defaults, SplatIndex: splat, KwParams: kwParams, KwRest: kwRest, BlockParam: blockParam, Singleton: singleton, Recv: recv, Body: body}
+		return &ast.MethodDef{Name: name, Params: params, Defaults: defaults, SplatIndex: splat, KwParams: kwParams, KwRest: kwRest, BlockParam: blockParam, Singleton: singleton, Recv: recv, Forward: forward, Body: body}
 	}
 	body := p.parseStatements(beginBodyEnd)
 	// A method body may carry rescue/ensure clauses without an explicit begin.
@@ -367,7 +458,7 @@ func (p *Parser) parseDef() ast.Node {
 	}
 	p.popScope()
 	p.expect(token.END)
-	return &ast.MethodDef{Name: name, Params: params, Defaults: defaults, SplatIndex: splat, KwParams: kwParams, KwRest: kwRest, BlockParam: blockParam, Singleton: singleton, Recv: recv, Body: body}
+	return &ast.MethodDef{Name: name, Params: params, Defaults: defaults, SplatIndex: splat, KwParams: kwParams, KwRest: kwRest, BlockParam: blockParam, Singleton: singleton, Recv: recv, Forward: forward, Body: body}
 }
 
 // parseDefName reads the name in a `def`: an identifier/constant, an operator
@@ -395,6 +486,11 @@ func (p *Parser) parseDefName() (string, bool) {
 		}
 		return "[]", true
 	}
+	// A keyword used as a method name: def do / def then / def in / def class …
+	// Ruby permits any reserved word in def-name position.
+	if _, isKeyword := token.Keywords[p.cur().Lit]; isKeyword {
+		return p.advance().Lit, true
+	}
 	return "", false
 }
 
@@ -402,12 +498,16 @@ func (p *Parser) parseDefName() (string, bool) {
 // default`. Each parameter is declared before its (and later) defaults are
 // parsed, so a default may reference earlier parameters. defaults is parallel to
 // params, nil for a required parameter.
-func (p *Parser) parseDefParams(until token.Type) (params []string, defaults []ast.Node, splat int, kwParams []ast.KwParam, kwRest, blockParam string) {
+func (p *Parser) parseDefParams(until token.Type) (params []string, defaults []ast.Node, splat int, kwParams []ast.KwParam, kwRest, blockParam string, forward bool) {
 	splat = -1
 	if p.is(until) || p.is(token.NEWLINE) {
-		return params, defaults, splat, kwParams, kwRest, blockParam
+		return params, defaults, splat, kwParams, kwRest, blockParam, forward
 	}
 	for {
+		if p.accept(token.DOTDOTDOT) { // `...` argument-forwarding param (always last)
+			forward = true
+			break
+		}
 		if p.accept(token.AMPER) { // &block param (always last)
 			blockParam = p.expect(token.IDENT).Lit
 			p.declareLocal(blockParam)
@@ -453,18 +553,23 @@ func (p *Parser) parseDefParams(until token.Type) (params []string, defaults []a
 			break
 		}
 	}
-	return params, defaults, splat, kwParams, kwRest, blockParam
+	return params, defaults, splat, kwParams, kwRest, blockParam, forward
 }
+
+// parseCond parses an if/unless/while/until condition, where the low-precedence
+// keyword operators `and`/`or`/`not` are permitted (`if a and b`, `while x or
+// y`, `unless not done`).
+func (p *Parser) parseCond() ast.Node { return p.parseKeywordLogical() }
 
 func (p *Parser) parseIf() ast.Node {
 	p.expect(token.IF)
-	cond := p.parseExprOrAssign()
+	cond := p.parseCond()
 	p.accept(token.THEN)
 	then := p.parseStatements(ifBodyEnd)
 	node := &ast.If{Cond: cond, Then: then}
 	for p.is(token.ELSIF) {
 		p.advance()
-		c := p.parseExprOrAssign()
+		c := p.parseCond()
 		p.accept(token.THEN)
 		b := p.parseStatements(ifBodyEnd)
 		node.Elsifs = append(node.Elsifs, ast.Elsif{Cond: c, Body: b})
@@ -479,7 +584,7 @@ func (p *Parser) parseIf() ast.Node {
 // parseUnless desugars `unless c ... else ... end` to `if !c ... else ... end`.
 func (p *Parser) parseUnless() ast.Node {
 	p.expect(token.UNLESS)
-	cond := p.parseExprOrAssign()
+	cond := p.parseCond()
 	p.accept(token.THEN)
 	then := p.parseStatements(ifBodyEnd)
 	node := &ast.If{Cond: not(cond), Then: then}
@@ -504,7 +609,7 @@ func (p *Parser) parseWhile() ast.Node {
 func (p *Parser) parseLoopCond() ast.Node {
 	saved := p.noDo
 	p.noDo = true
-	cond := p.parseExprOrAssign()
+	cond := p.parseCond()
 	p.noDo = saved
 	return cond
 }
@@ -911,8 +1016,9 @@ func (p *Parser) buildArrayOrFind(constName ast.Node, elems []arrayElem) ast.Pat
 // --- expressions ---
 
 // looksLikeMlhs scans ahead (without consuming) for a multiple-assignment left
-// side: `[*]IDENT (, [*]IDENT)+ =` — at least one comma, every target a local
-// name. It deliberately does not handle ivar/const/attribute targets.
+// side: `[*]TARGET (, [*]TARGET)+ =` — at least one comma, every target a local
+// name (IDENT) or a constant (CONST). It deliberately does not handle
+// ivar/attribute targets.
 func (p *Parser) looksLikeMlhs() bool {
 	i := p.pos
 	sawComma := false
@@ -920,7 +1026,7 @@ func (p *Parser) looksLikeMlhs() bool {
 		if p.toks[i].Type == token.STAR {
 			i++
 		}
-		if p.toks[i].Type != token.IDENT {
+		if p.toks[i].Type != token.IDENT && p.toks[i].Type != token.CONST {
 			return false
 		}
 		i++
@@ -936,31 +1042,53 @@ func (p *Parser) looksLikeMlhs() bool {
 	}
 }
 
-// parseMlhs parses a multiple assignment whose targets are local names, with at
-// most one *splat target.
+// parseMlhs parses a multiple assignment whose targets are local names and/or
+// constants, with at most one *splat target. When every target is a local the
+// result uses only Names (and Targets stays nil); when any target is a constant
+// it additionally fills Targets (parallel to Names) with the per-position LHS
+// node so a consumer can store into a constant.
 func (p *Parser) parseMlhs() ast.Node {
 	var names []string
+	var targets []ast.Node
+	hasConst := false
 	splat := -1
 	for {
 		if p.accept(token.STAR) {
 			splat = len(names)
 		}
-		name := p.expect(token.IDENT).Lit
-		names = append(names, name)
-		p.declareLocal(name)
+		if p.is(token.CONST) {
+			name := p.advance().Lit
+			names = append(names, "")
+			targets = append(targets, &ast.ConstRef{Name: name})
+			hasConst = true
+		} else {
+			name := p.expect(token.IDENT).Lit
+			names = append(names, name)
+			targets = append(targets, &ast.VarRef{Name: name})
+			p.declareLocal(name)
+		}
 		if !p.accept(token.COMMA) {
 			break
 		}
+	}
+	if !hasConst {
+		targets = nil // all-locals fast path: Names alone suffices
 	}
 	p.expect(token.ASSIGN)
 	values := []ast.Node{p.parseTernary()}
 	for p.accept(token.COMMA) {
 		values = append(values, p.parseTernary())
 	}
-	return &ast.MultiAssign{Names: names, SplatIndex: splat, Values: values}
+	return &ast.MultiAssign{Names: names, Targets: targets, SplatIndex: splat, Values: values}
 }
 
 func (p *Parser) parseExprOrAssign() ast.Node {
+	// A `not EXPR` prefix in value position (assignment RHS, call argument, array
+	// element): `x = not true`, `foo(not flag)`. `not` binds looser than the
+	// binary operators, so it wraps the whole following expression.
+	if p.accept(token.NOT) {
+		return not(p.parseExprOrAssign())
+	}
 	// Multiple assignment to local targets: a, b = … / a, *b = … .
 	if p.looksLikeMlhs() {
 		return p.parseMlhs()
@@ -1559,6 +1687,9 @@ func (p *Parser) parsePrimary() ast.Node {
 	case token.REGEXP:
 		p.advance()
 		return &ast.RegexpLit{Source: t.Lit, Flags: t.Flags}
+	case token.XSTRING:
+		p.advance()
+		return &ast.XStr{Command: t.Lit}
 	case token.WORDS, token.SYMBOLS:
 		p.advance()
 		elems := []ast.Node{}
@@ -1595,7 +1726,9 @@ func (p *Parser) parsePrimary() ast.Node {
 	case token.LPAREN:
 		p.advance()
 		p.skipNewlines()
-		e := p.parseOneLineMatch(p.parseExprOrAssign())
+		// A parenthesised group permits the low-precedence keyword operators
+		// (`(a and b)`, `(not x)`) just like a statement does.
+		e := p.parseOneLineMatch(p.parseKeywordLogical())
 		p.skipNewlines()
 		p.expect(token.RPAREN)
 		return e
@@ -1610,6 +1743,10 @@ func (p *Parser) parsePrimary() ast.Node {
 			return &ast.Call{Name: t.Lit, Args: args}
 		}
 		return &ast.ConstRef{Name: t.Lit}
+	case token.SCOPE:
+		// Leading `::Name` — a top-level constant lookup (`::Foo`, `defined?(::Foo)`).
+		p.advance()
+		return &ast.ScopedConst{Name: p.expect(token.CONST).Lit, Global: true}
 	case token.IVAR:
 		p.advance()
 		return &ast.IvarRef{Name: t.Lit}
@@ -1712,10 +1849,14 @@ func (p *Parser) canStartCommandArg() bool {
 	switch t.Type {
 	case token.INT, token.FLOAT, token.STRING, token.STRBEG, token.SYMBOL, token.IDENT, token.CONST,
 		token.IVAR, token.CVAR, token.GVAR, token.TRUE, token.FALSE, token.NIL, token.SELF, token.BANG, token.TILDE,
-		token.LPAREN, token.LBRACKET, token.ARROW, token.WORDS, token.SYMBOLS, token.REGEXP,
+		token.LPAREN, token.LBRACKET, token.ARROW, token.WORDS, token.SYMBOLS, token.REGEXP, token.XSTRING,
 		token.BEGIN, token.CASE:
 		// Value-producing keywords: `p begin; 1; end`, `p case x; when 1; 2; end`.
 		return true
+	case token.SCOPE:
+		// A leading `::Name` (top-level constant) as a command argument: `puts ::Foo`.
+		// Only when the `::` hugs a following constant, not the postfix `a ::b` form.
+		return p.peekTok().Type == token.CONST
 	case token.MINUS, token.PLUS:
 		// Unary-style argument: `foo -1` (operand hugs the sign), not `foo - 1`.
 		return !p.peekTok().SpaceBefore
@@ -1764,6 +1905,11 @@ func (p *Parser) parseCallArgs(until token.Type) []ast.Node {
 // parseOneCallArg parses a single call argument, routing `*splat` and positional
 // expressions into args, and `label: value` / `expr => value` pairs into kw.
 func (p *Parser) parseOneCallArg(args *[]ast.Node, kw **ast.HashLit) {
+	if p.is(token.DOTDOTDOT) { // `...` — forward the enclosing method's arguments
+		p.advance()
+		*args = append(*args, &ast.ForwardArgs{})
+		return
+	}
 	if p.accept(token.AMPER) { // &expr — block-pass (coerced to a Proc)
 		*args = append(*args, &ast.BlockPass{Value: p.parseExprOrAssign()})
 		return
