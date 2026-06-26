@@ -99,16 +99,17 @@ func (l *Lexer) next() token.Token {
 // isContinuationOp reports whether a line ending in token type t is incomplete,
 // so the trailing newline continues onto the next line rather than terminating
 // the statement. These are infix operators (plus comma and a trailing dot) that
-// require a right-hand operand. Deliberately excluded as ambiguous: `|` and `&`
-// (block params / block-pass), `^` (pattern pin), `:` (label/symbol/ternary),
-// `<<` (heredoc opener).
+// require a right-hand operand. A bare `:` is included: it is only ever the
+// ternary separator here (a symbol `:x` and a label `x:` are their own tokens),
+// so `expr ? x :`<newline>`y` joins. Deliberately excluded as ambiguous: `|` and
+// `&` (block params / block-pass), `^` (pattern pin), `<<` (heredoc opener).
 func isContinuationOp(t token.Type) bool {
 	switch t {
 	case token.PLUS, token.MINUS, token.STAR, token.POW, token.SLASH, token.PERCENT,
 		token.EQ, token.EQQ, token.MATCH, token.NEQ, token.LT, token.GT, token.LE,
 		token.GE, token.SPACESHIP, token.ANDAND, token.OROR,
 		token.ASSIGN, token.OPASSIGN, token.COMMA, token.HASHROCKET,
-		token.DOT, token.SAFEDOT, token.QUESTION,
+		token.DOT, token.SAFEDOT, token.QUESTION, token.COLON,
 		// Trailing low-precedence keyword operators and modifiers whose operand /
 		// condition may sit on the next line: `... or\n fail`, `... and\n x`,
 		// `do_it unless\n cond`, `foo if\n bar` (MRI joins these lines too).
@@ -150,6 +151,12 @@ func (l *Lexer) lexToken() token.Token {
 	case c == '%' && l.prevType != token.DEF && l.percentBeginsLiteral(spaceBefore) && l.atPercentString():
 		// %q(…) / %Q(…) / %(…) / %W(…) string literals.
 		return l.lexPercentString(spaceBefore, line, col)
+	case c == '?' && l.charLiteralBegins(spaceBefore) && l.atCharLiteral():
+		// A `?x` character literal: a `?` in value position followed by a single
+		// character (or backslash escape) that does not run into an identifier. It
+		// denotes the one-character String "x" (MRI: `?a == "a"`). The ternary `?`
+		// only arises after a value (exprEnd) where it is not a command argument.
+		return l.lexCharLiteral(spaceBefore, line, col)
 	case c == '\n' || c == ';':
 		l.advance()
 		l.state = exprBegin
@@ -908,6 +915,100 @@ func (l *Lexer) lexRegexp(spaceBefore bool, line, col int) token.Token {
 	return token.Token{Type: token.REGEXP, Lit: string(src), Flags: string(flags), Line: line, Col: col, SpaceBefore: spaceBefore}
 }
 
+// charLiteralBegins reports whether a `?` may open a character literal here,
+// mirroring the regexp/percent rule: at expression-begin a value is expected, and
+// in command-argument position (just after a value, but with a space before the
+// `?` and the payload hugging it) the `?x` is the argument — `p ?a` is `p("a")`
+// while `x ? y : z` (spaces around `?`) stays ternary.
+func (l *Lexer) charLiteralBegins(spaceBefore bool) bool {
+	if l.state == exprBegin {
+		return true
+	}
+	// Command-argument position: just after a bareword that may be a method name
+	// (an IDENT/CONST), with a space before the `?` and the payload hugging it.
+	// This mirrors MRI's EXPR_CMDARG: `p ?a` is `p("a")`, while after a literal /
+	// `)` / `]` (a finished value) `?` is ternary even with surrounding spaces.
+	return spaceBefore && (l.prevType == token.IDENT || l.prevType == token.CONST)
+}
+
+// atCharLiteral reports whether a `?` at the cursor (known to be in value
+// position) opens a `?x` character literal rather than the ternary operator. A
+// char literal needs a single character payload: either a `\`-escape (`?\n`,
+// `?\s`, `?\101`), or one character (possibly a multi-byte UTF-8 rune) that is
+// not whitespace and is not the start of a longer word — i.e. an alphanumeric
+// payload must not be followed by another identifier byte (`?ab` is not a char
+// literal; `?a.upcase` is `?a` then `.upcase`).
+func (l *Lexer) atCharLiteral() bool {
+	n := l.peek2()
+	if n == 0 || n == ' ' || n == '\t' || n == '\n' || n == '\r' || n == '\f' || n == '\v' {
+		return false
+	}
+	if n == '\\' { // an escape always forms a char literal (?\n, ?\s, ?\\)
+		return true
+	}
+	// A plain single byte that begins an identifier must stand alone: the byte
+	// after it must not continue an identifier word (so `?a` is a char but `?ab`
+	// is not). A non-identifier payload (`?|`, `?/`, `?.`) is always a char.
+	if isIdentPart(n) {
+		third := byte(0)
+		if l.pos+2 < len(l.src) {
+			third = l.src[l.pos+2]
+		}
+		return !isIdentPart(third)
+	}
+	// A multi-byte UTF-8 lead byte (>= 0x80) starts a single rune payload (`?é`).
+	if n >= 0x80 {
+		return true
+	}
+	return true
+}
+
+// lexCharLiteral lexes a `?x` character literal (cursor on the `?`), producing a
+// STRING token holding the single character. It resolves the same backslash
+// escapes a double-quoted string does; a multi-byte UTF-8 rune is taken whole.
+func (l *Lexer) lexCharLiteral(spaceBefore bool, line, col int) token.Token {
+	l.advance() // '?'
+	var val string
+	if l.peek() == '\\' {
+		l.advance() // backslash
+		esc := l.advance()
+		switch esc {
+		case 'n':
+			val = "\n"
+		case 't':
+			val = "\t"
+		case 'r':
+			val = "\r"
+		case 's':
+			val = " "
+		case 'a':
+			val = "\x07"
+		case 'b':
+			val = "\x08"
+		case 'v':
+			val = "\x0b"
+		case 'f':
+			val = "\x0c"
+		case 'e':
+			val = "\x1b"
+		case '0':
+			val = "\x00"
+		default:
+			val = string(esc)
+		}
+	} else {
+		// One character: a full UTF-8 rune (its continuation bytes are >= 0x80).
+		var b []byte
+		b = append(b, l.advance())
+		for l.peek() >= 0x80 {
+			b = append(b, l.advance())
+		}
+		val = string(b)
+	}
+	l.state = exprEnd
+	return token.Token{Type: token.STRING, Lit: val, Line: line, Col: col, SpaceBefore: spaceBefore}
+}
+
 // percentDelimClose returns the closing delimiter for a %-literal opener: the
 // mate of a bracket pair, or the same character for a symmetric delimiter.
 func percentDelimClose(open byte) byte {
@@ -946,14 +1047,7 @@ func (l *Lexer) atPercentArray() bool {
 	default:
 		return false
 	}
-	if l.pos+2 >= len(l.src) {
-		return false
-	}
-	switch l.src[l.pos+2] {
-	case '[', '(', '{', '<', '|', '!', '/':
-		return true
-	}
-	return false
+	return l.pos+2 < len(l.src) && isPercentDelim(l.src[l.pos+2])
 }
 
 // lexPercentArray lexes a %w/%i/%W/%I array literal. The non-interpolating
@@ -994,13 +1088,25 @@ func (l *Lexer) lexPercentArray(spaceBefore bool, line, col int) token.Token {
 	return token.Token{Type: tt, Lit: string(content), Line: line, Col: col, SpaceBefore: spaceBefore}
 }
 
-// isPercentDelim reports whether b can open a %-literal.
+// isPercentDelim reports whether b can open a %-literal. MRI accepts any
+// non-alphanumeric character as the delimiter (`%r"..."`, `%q[...]`, `%w'a b'`,
+// `%i<x y>`, `%(...)`, `%!...!`, `%|...|`, `%@...@`, …); a bracket pair nests.
+// Excluded: alphanumerics (they would be the literal's body), whitespace, and
+// `=` so a `%=` compound assignment is never mistaken for a literal opener.
 func isPercentDelim(b byte) bool {
-	switch b {
-	case '(', '[', '{', '<', '|', '!', '/':
-		return true
+	switch {
+	case b == 0 || b == '=':
+		return false
+	case b == ' ' || b == '\t' || b == '\n' || b == '\r' || b == '\f' || b == '\v':
+		return false
+	case b >= '0' && b <= '9':
+		return false
+	case (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z'):
+		return false
+	case b >= 0x80:
+		return false // a multi-byte UTF-8 lead is not used as a %-delimiter here
 	}
-	return false
+	return true
 }
 
 // atPercentRXS reports whether the cursor (at '%') begins a %r (regexp),

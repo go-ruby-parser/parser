@@ -196,6 +196,17 @@ func (p *Parser) skipNewlines() {
 	}
 }
 
+// firstSignificantIs reports whether the first non-NEWLINE token at or after the
+// cursor is of type tt, without consuming anything. The token stream always ends
+// in a (non-NEWLINE) EOF, so the scan always finds a significant token.
+func (p *Parser) firstSignificantIs(tt token.Type) bool {
+	i := p.pos
+	for i < len(p.toks) && p.toks[i].Type == token.NEWLINE {
+		i++
+	}
+	return i < len(p.toks) && p.toks[i].Type == tt
+}
+
 // --- scope ---
 
 func (p *Parser) scope() *scope         { return p.scopes[len(p.scopes)-1] }
@@ -795,10 +806,13 @@ func (p *Parser) parseNext() ast.Node {
 
 // atStatementEnd reports whether the cursor is at a point where a value-less
 // return/break/next ends: a terminator, a block/body close (end, else, elsif,
-// `}`), or a trailing modifier (if/unless/while/until).
+// `}`, `)`, `]`), or a trailing modifier (if/unless/while/until). The closing
+// `)`/`]` let a bare jump end a parenthesised/bracketed group — `( x or next )`,
+// `[a or break]` — rather than swallowing the delimiter as its value.
 func (p *Parser) atStatementEnd() bool {
 	switch p.cur().Type {
 	case token.NEWLINE, token.EOF, token.END, token.ELSE, token.ELSIF, token.RBRACE,
+		token.RPAREN, token.RBRACKET,
 		token.IF, token.UNLESS, token.WHILE, token.UNTIL:
 		return true
 	}
@@ -858,6 +872,57 @@ func (p *Parser) parseBodyWithRescue() []ast.Node {
 		return []ast.Node{p.parseRescueTail(body)}
 	}
 	return body
+}
+
+// parseStringConcat parses one or more adjacent string literals and folds them
+// into a single node, as MRI concatenates them at parse time: `"a" "b"` == `"ab"`,
+// and a `\`-continued line joins too (the lexer already swallows the backslash +
+// newline as whitespace). Each piece is a plain STRING or an interpolated
+// STRBEG…STREND run. With a single plain piece it returns a StringLit; otherwise
+// the pieces' parts are concatenated into one StrInterp (a run that turns out to
+// be all-plain is collapsed back to a StringLit).
+func (p *Parser) parseStringConcat() ast.Node {
+	var pieces []ast.Node
+	for p.is(token.STRING) || p.is(token.STRBEG) {
+		if p.is(token.STRING) {
+			pieces = append(pieces, &ast.StringLit{Value: p.advance().Lit})
+		} else {
+			pieces = append(pieces, p.parseInterpString())
+		}
+	}
+	if len(pieces) == 1 {
+		return pieces[0]
+	}
+	// Concatenate: flatten every piece's parts into one interpolation, then
+	// collapse to a plain StringLit when no interpolation survives.
+	var parts []ast.Node
+	for _, pc := range pieces {
+		switch n := pc.(type) {
+		case *ast.StringLit:
+			parts = append(parts, n)
+		case *ast.StrInterp:
+			parts = append(parts, n.Parts...)
+		}
+	}
+	if lit, ok := mergeStringParts(parts); ok {
+		return lit
+	}
+	return &ast.StrInterp{Parts: parts}
+}
+
+// mergeStringParts returns a single StringLit when every part is a plain string
+// literal (so an all-plain concatenation like `"a" "b"` yields `"ab"`), else
+// (nil, false).
+func mergeStringParts(parts []ast.Node) (*ast.StringLit, bool) {
+	var b strings.Builder
+	for _, pt := range parts {
+		s, ok := pt.(*ast.StringLit)
+		if !ok {
+			return nil, false
+		}
+		b.WriteString(s.Value)
+	}
+	return &ast.StringLit{Value: b.String()}, true
 }
 
 // parseInterpString assembles an interpolated string from the lexer's
@@ -1661,9 +1726,91 @@ func (p *Parser) parseBinary(minBP int) ast.Node {
 		if op == "**" { // exponentiation is right-associative
 			rbp = bp - 1
 		}
-		right := p.parseBinary(rbp)
+		// A value-less control-flow jump may be the right operand of `&&`/`||`:
+		// `x || return`, `expr && next`, `y || break` (MRI accepts the jump only
+		// without a value here — `x || return 5` is a syntax error).
+		if jump, ok := p.valuelessJumpOperand(); ok {
+			left = &ast.BinaryExpr{Op: op, Left: left, Right: jump}
+			return left
+		}
+		right := p.maybeInlineAssign(p.parseBinary(rbp))
 		left = &ast.BinaryExpr{Op: op, Left: left, Right: right}
 	}
+}
+
+// valuelessJumpOperand parses a value-less control-flow jump (`return`, `break`,
+// `next`) sitting in operand position, returning its node and true. MRI accepts a
+// bare jump as the right operand of `&&`/`||` (`x || return`, `expr && next`) but
+// not one carrying a value (`x || return 5` is a syntax error), nor a `retry`
+// (`x || retry` is a syntax error), so only these argument-less forms qualify.
+func (p *Parser) valuelessJumpOperand() (ast.Node, bool) {
+	switch p.cur().Type {
+	case token.RETURN:
+		p.advance()
+		return &ast.Return{}, true
+	case token.BREAK:
+		p.advance()
+		return &ast.Break{}, true
+	case token.NEXT:
+		p.advance()
+		return &ast.Next{}, true
+	}
+	return nil, false
+}
+
+// maybeInlineAssign turns a freshly-parsed operand into an assignment when an
+// `=` follows it and it names an assignable target. This lets an assignment sit
+// as a sub-expression inside a condition or larger expression — `if a && b = c`,
+// `while x && line = gets` — which MRI permits even though `=` otherwise binds
+// looser than the binary operators. (A top-level `lhs = rhs` is already handled
+// in parseExprOrAssign; this covers the nested operand case.) `==`/`=>`/`=~` are
+// their own tokens, so only a real assignment `=` is consumed here.
+func (p *Parser) maybeInlineAssign(node ast.Node) ast.Node {
+	if !p.is(token.ASSIGN) {
+		return node
+	}
+	switch n := node.(type) {
+	case *ast.VarRef:
+		p.advance()
+		p.declareLocal(n.Name)
+		return &ast.Assign{Name: n.Name, Value: p.parseAssignRhs()}
+	case *ast.Call:
+		// A receiver-less, argument-less bare call is really a not-yet-seen local:
+		// `b = c` where b was unknown. Receiver attribute/index targets become the
+		// setter-call shape, matching parseExprOrAssign's handling.
+		if n.Recv == nil && len(n.Args) == 0 && n.Block == nil {
+			p.advance()
+			p.declareLocal(n.Name)
+			return &ast.Assign{Name: n.Name, Value: p.parseAssignRhs()}
+		}
+		if n.Recv != nil && n.Block == nil {
+			if n.Name == "[]" {
+				p.advance()
+				n.Name = "[]="
+				n.Args = append(n.Args, p.parseExprOrAssign())
+				return n
+			}
+			if len(n.Args) == 0 {
+				p.advance()
+				n.Name += "="
+				n.Args = []ast.Node{p.parseExprOrAssign()}
+				return n
+			}
+		}
+	case *ast.IvarRef:
+		p.advance()
+		return &ast.IvarAssign{Name: n.Name, Value: p.parseAssignRhs()}
+	case *ast.CVarRef:
+		p.advance()
+		return &ast.CVarAssign{Name: n.Name, Value: p.parseAssignRhs()}
+	case *ast.GVarRef:
+		p.advance()
+		return &ast.GVarAssign{Name: n.Name, Value: p.parseAssignRhs()}
+	case *ast.ConstRef:
+		p.advance()
+		return &ast.ConstAssign{Name: n.Name, Value: p.parseAssignRhs()}
+	}
+	return node
 }
 
 // negateLiteral returns the negation of a numeric literal node. The MINUS path
@@ -1739,9 +1886,10 @@ func (p *Parser) parsePostfixTail(node ast.Node) ast.Node {
 				p.advance()
 				args = p.parseCallArgs(token.RPAREN)
 				p.expect(token.RPAREN)
-			} else if p.canStartCommandArg() {
+			} else if p.canStartCommandArg() || p.atHuggingStringArg() {
 				// Paren-less command call on a receiver: `obj.foo bar`,
-				// `Fiber.yield 1`. The space-separated argument list terminates
+				// `Fiber.yield 1`, or a string hugging the method name
+				// (`obj.m"x"`). The space-separated argument list terminates
 				// this postfix chain (it greedily consumes the rest). A trailing
 				// `do…end` then binds to this command call (`obj.foo bar do … end`),
 				// as MRI attaches it to the outermost command rather than to an
@@ -1944,6 +2092,13 @@ func (p *Parser) parseBlockRest(stop map[token.Type]bool, end token.Type, withRe
 	var defaults, prepends []ast.Node
 	var blockParam string
 	splat := -1
+	// The `|params|` list may start on the line(s) after the block opener:
+	// `foo {`<nl>`|x| … }`, `do`<nl>`|a, b| … end`. Skip the intervening newlines
+	// before the leading `|` (a body statement can never begin with a bare `|`, so
+	// this is unambiguous). The newlines are no-ops for the body either way.
+	if p.is(token.NEWLINE) && p.firstSignificantIs(token.PIPE) {
+		p.skipNewlines()
+	}
 	if p.accept(token.PIPE) {
 		params, defaults, prepends, splat, blockParam = p.parseBlockParams(token.PIPE)
 		p.expect(token.PIPE)
@@ -2143,14 +2298,8 @@ func (p *Parser) parsePrimary() ast.Node {
 		p.advance()
 		f, _ := strconv.ParseFloat(t.Lit, 64)
 		return &ast.FloatLit{Value: f}
-	case token.STRING:
-		p.advance()
-		// Adjacent string literals concatenate: `"a" "b"` == `"ab"`.
-		s := t.Lit
-		for p.is(token.STRING) {
-			s += p.advance().Lit
-		}
-		return &ast.StringLit{Value: s}
+	case token.STRING, token.STRBEG:
+		return p.parseStringConcat()
 	case token.SYMBOL:
 		p.advance()
 		return &ast.SymbolLit{Name: t.Lit}
@@ -2217,6 +2366,10 @@ func (p *Parser) parsePrimary() ast.Node {
 			p.expect(token.RPAREN)
 			return &ast.Call{Name: t.Lit, Args: args}
 		}
+		// A string hugging the constant is a paren-less call: `Integer"42"`.
+		if p.atHuggingStringArg() {
+			return &ast.Call{Name: t.Lit, Args: p.parseCommandArgs()}
+		}
 		return &ast.ConstRef{Name: t.Lit}
 	case token.SCOPE:
 		// Leading `::Name` — a top-level constant lookup (`::Foo`, `defined?(::Foo)`).
@@ -2247,8 +2400,6 @@ func (p *Parser) parsePrimary() ast.Node {
 		return p.parseWhile()
 	case token.UNTIL:
 		return p.parseUntil()
-	case token.STRBEG:
-		return p.parseInterpString()
 	}
 	return p.fail("unexpected token %q (%s)", t.Lit, t.Type)
 }
@@ -2284,6 +2435,19 @@ func (p *Parser) parseIdentExpr() ast.Node {
 		return &ast.Call{Name: name, Args: args}
 	}
 
+	// A string literal hugging the name (no space) is a paren-less argument:
+	// `step"Ensure ..." do … end`, `assert"x", y`, `foo"a"`. MRI reads this as a
+	// command call even when the name is otherwise a local — `x"y"` is `x("y")`.
+	// So this is checked before the local-variable resolution below.
+	if p.huggingStringArg() {
+		p.advance() // name
+		call := &ast.Call{Name: name, Args: p.parseCommandArgs()}
+		if p.is(token.DO) && !p.noDo {
+			call.Block = p.parseDoBlock()
+		}
+		return call
+	}
+
 	// Known local variable → read.
 	if p.is(token.IDENT) && p.isLocal(name) {
 		p.advance()
@@ -2315,6 +2479,22 @@ func (p *Parser) parseIdentExpr() ast.Node {
 		}
 	}
 	return &ast.Call{Name: name}
+}
+
+// huggingStringArg reports whether the token after the current name is a string
+// literal that hugs it (no intervening space), making the name a command call
+// with that string as its first argument: `foo"bar"`, `step"x" do…end`. A
+// space-separated string is handled by the ordinary canStartCommandArg path.
+func (p *Parser) huggingStringArg() bool { return isHuggingString(p.peekTok()) }
+
+// atHuggingStringArg is huggingStringArg for a name already consumed: the cursor
+// itself is the would-be string argument (used after a `.method` in a postfix
+// chain, `obj.m"x"`).
+func (p *Parser) atHuggingStringArg() bool { return isHuggingString(p.cur()) }
+
+// isHuggingString reports whether t is a string literal with no preceding space.
+func isHuggingString(t token.Token) bool {
+	return !t.SpaceBefore && (t.Type == token.STRING || t.Type == token.STRBEG)
 }
 
 // canStartCommandArg decides whether the current token begins a paren-less
