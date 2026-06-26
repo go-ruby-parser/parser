@@ -747,9 +747,11 @@ func (p *Parser) parseRescueTail(body []ast.Node) *ast.Begin {
 		p.advance()
 		clause := ast.RescueClause{}
 		if !p.is(token.NEWLINE) && !p.is(token.HASHROCKET) && !p.is(token.THEN) {
-			clause.Classes = append(clause.Classes, p.parseExprOrAssign())
+			// A rescue class list may be a `*splat` of an exception array
+			// (`rescue *EXCEPTIONS => e`, `rescue *FOO, Bar`).
+			clause.Classes = append(clause.Classes, p.parseSplatOrExpr())
 			for p.accept(token.COMMA) {
-				clause.Classes = append(clause.Classes, p.parseExprOrAssign())
+				clause.Classes = append(clause.Classes, p.parseSplatOrExpr())
 			}
 		}
 		if p.accept(token.HASHROCKET) {
@@ -816,9 +818,11 @@ func (p *Parser) parseCase() ast.Node {
 	node := &ast.Case{Subject: subject}
 	for p.is(token.WHEN) {
 		p.advance()
-		clause := ast.WhenClause{Conds: []ast.Node{p.parseExprOrAssign()}}
+		// A `when` list may contain `*splat` of an array of candidate values
+		// (`when *LIST`, `when 1, *rest`).
+		clause := ast.WhenClause{Conds: []ast.Node{p.parseSplatOrExpr()}}
 		for p.accept(token.COMMA) {
-			clause.Conds = append(clause.Conds, p.parseExprOrAssign())
+			clause.Conds = append(clause.Conds, p.parseSplatOrExpr())
 		}
 		p.accept(token.THEN)
 		clause.Body = p.parseStatements(caseBodyEnd)
@@ -1240,11 +1244,31 @@ func (p *Parser) parseMlhs() ast.Node {
 		targets = nil // all-locals fast path: Names alone suffices
 	}
 	p.expect(token.ASSIGN)
-	values := []ast.Node{p.parseTernary()}
+	values := []ast.Node{p.parseMasgnValue()}
 	for p.accept(token.COMMA) {
-		values = append(values, p.parseTernary())
+		values = append(values, p.parseMasgnValue())
 	}
 	return &ast.MultiAssign{Names: names, Targets: targets, SplatIndex: splat, Values: values}
+}
+
+// parseSplatOrExpr parses an expression that may be prefixed by a `*splat`,
+// spreading an array in a position that accepts several values (a `when`
+// candidate list, a `rescue` class list).
+func (p *Parser) parseSplatOrExpr() ast.Node {
+	if p.accept(token.STAR) {
+		return &ast.SplatArg{Value: p.parseExprOrAssign()}
+	}
+	return p.parseExprOrAssign()
+}
+
+// parseMasgnValue parses one right-hand value of a multiple assignment, which
+// may be a `*splat` whose array is spread across the targets (`a, b = *args`,
+// `x, y = 1, *rest`).
+func (p *Parser) parseMasgnValue() ast.Node {
+	if p.accept(token.STAR) {
+		return &ast.SplatArg{Value: p.parseTernary()}
+	}
+	return p.parseTernary()
 }
 
 // parseMlhsTarget parses one masgn target and returns (localName, targetNode,
