@@ -396,7 +396,7 @@ func (p *Parser) parseClass() ast.Node {
 	if p.accept(token.SHOVEL) {
 		target := p.parseTernary()
 		p.pushScope() // the singleton-class body has its own local scope
-		body := p.parseStatements(bodyEnd)
+		body := p.parseBodyWithRescue()
 		p.popScope()
 		p.expect(token.END)
 		return &ast.SingletonClassDef{Target: target, Body: body}
@@ -413,7 +413,7 @@ func (p *Parser) parseClass() ast.Node {
 		}
 	}
 	p.pushScope() // a class body has its own local scope
-	body := p.parseStatements(bodyEnd)
+	body := p.parseBodyWithRescue()
 	p.popScope()
 	p.expect(token.END)
 	return &ast.ClassDef{Name: name, NamePath: path, Super: super, SuperExpr: superExpr, Body: body}
@@ -423,7 +423,7 @@ func (p *Parser) parseModule() ast.Node {
 	p.expect(token.MODULE)
 	name, path := p.parseConstPath()
 	p.pushScope() // a module body has its own local scope
-	body := p.parseStatements(bodyEnd)
+	body := p.parseBodyWithRescue()
 	p.popScope()
 	p.expect(token.END)
 	return &ast.ModuleDef{Name: name, NamePath: path, Body: body}
@@ -471,11 +471,8 @@ func (p *Parser) parseDef() ast.Node {
 		p.popScope()
 		return &ast.MethodDef{Name: name, Params: params, Defaults: defaults, SplatIndex: splat, KwParams: kwParams, KwRest: kwRest, BlockParam: blockParam, Singleton: singleton, Recv: recv, Forward: forward, Body: body}
 	}
-	body := p.parseStatements(beginBodyEnd)
-	// A method body may carry rescue/ensure clauses without an explicit begin.
-	if p.is(token.RESCUE) || p.is(token.ELSE) || p.is(token.ENSURE) {
-		body = []ast.Node{p.parseRescueTail(body)}
-	}
+	// A method body may carry rescue/else/ensure clauses without an explicit begin.
+	body := p.parseBodyWithRescue()
 	p.popScope()
 	p.expect(token.END)
 	return &ast.MethodDef{Name: name, Params: params, Defaults: defaults, SplatIndex: splat, KwParams: kwParams, KwRest: kwRest, BlockParam: blockParam, Singleton: singleton, Recv: recv, Forward: forward, Body: body}
@@ -528,15 +525,37 @@ func (p *Parser) parseDefParams(until token.Type) (params []string, defaults []a
 			forward = true
 			break
 		}
-		if p.accept(token.AMPER) { // &block param (always last)
-			blockParam = p.expect(token.IDENT).Lit
-			p.declareLocal(blockParam)
+		if p.accept(token.AMPER) { // &block param, or anonymous & (always last)
+			// `def f(&)` — an anonymous block param (Ruby 3.1+), forwardable as `&`.
+			// It is recorded with the sentinel name "&" (no Ruby local can be named
+			// that). A named &block declares the local.
+			if p.is(token.IDENT) {
+				blockParam = p.advance().Lit
+				p.declareLocal(blockParam)
+			} else {
+				blockParam = "&"
+			}
 			break
 		}
-		if p.accept(token.POW) { // **rest keyword-splat param (always last)
-			kwRest = p.expect(token.IDENT).Lit
-			p.declareLocal(kwRest)
-			break
+		if p.accept(token.POW) { // **rest keyword-splat, anonymous **, or **nil
+			// `def f(**)` — anonymous double-splat (Ruby 3.2+), sentinel name "**".
+			// `def f(**nil)` — explicitly no keyword args, recorded as "nil".
+			switch {
+			case p.is(token.IDENT):
+				kwRest = p.advance().Lit
+				p.declareLocal(kwRest)
+			case p.is(token.NIL):
+				p.advance()
+				kwRest = "nil"
+			default:
+				kwRest = "**"
+			}
+			// A double-splat may be followed by a &block param, so do not break;
+			// consume a separating comma and continue, otherwise stop.
+			if !p.accept(token.COMMA) {
+				break
+			}
+			continue
 		}
 		if p.is(token.LABEL) { // keyword param: `a:` (required) or `a: default`
 			name := p.advance().Lit
@@ -551,11 +570,16 @@ func (p *Parser) parseDefParams(until token.Type) (params []string, defaults []a
 			}
 			continue
 		}
-		if p.accept(token.STAR) { // *rest splat param
+		if p.accept(token.STAR) { // *rest splat param, or anonymous *
 			splat = len(params)
-			params = append(params, p.expect(token.IDENT).Lit)
+			// `def f(*)` / `def f(a, *)` — anonymous splat (sentinel name "*").
+			if p.is(token.IDENT) {
+				params = append(params, p.advance().Lit)
+				p.declareLocal(params[splat])
+			} else {
+				params = append(params, "*")
+			}
 			defaults = append(defaults, nil)
-			p.declareLocal(params[splat])
 			if !p.accept(token.COMMA) {
 				break
 			}
@@ -731,6 +755,19 @@ func (p *Parser) parseRescueTail(body []ast.Node) *ast.Begin {
 		node.EnsureBody = p.parseStatements(bodyEnd)
 	}
 	return node
+}
+
+// parseBodyWithRescue parses a body that may carry rescue/else/ensure clauses
+// directly, without an explicit `begin` — as Ruby allows for method, class,
+// module, singleton-class, and do…end-block bodies. With no rescue/else/ensure
+// it returns the plain body; otherwise it wraps the body in a Begin. The caller
+// consumes the terminating `end`.
+func (p *Parser) parseBodyWithRescue() []ast.Node {
+	body := p.parseStatements(beginBodyEnd)
+	if p.is(token.RESCUE) || p.is(token.ELSE) || p.is(token.ENSURE) {
+		return []ast.Node{p.parseRescueTail(body)}
+	}
+	return body
 }
 
 // parseInterpString assembles an interpolated string from the lexer's
@@ -1036,62 +1073,158 @@ func (p *Parser) buildArrayOrFind(constName ast.Node, elems []arrayElem) ast.Pat
 // --- expressions ---
 
 // looksLikeMlhs scans ahead (without consuming) for a multiple-assignment left
-// side: `[*]TARGET (, [*]TARGET)+ =` — at least one comma, every target a local
-// name (IDENT) or a constant (CONST). It deliberately does not handle
-// ivar/attribute targets.
+// side: `[*]TARGET (, [*]TARGET)* =` with at least one top-level comma. A target
+// may be a local (IDENT), a constant (CONST), an instance/class/global variable
+// (IVAR/CVAR/GVAR), or an attribute / index target (`obj.x`, `arr[i]`, with
+// nested calls, scope-resolution, and brackets). The scan tracks bracket and
+// paren depth so commas and the trailing `=` are only recognized at the top
+// level; it succeeds only when a top-level `=` is reached after a top-level
+// comma. A lone `*TARGET =` (one splat target, no comma) is also a masgn.
 func (p *Parser) looksLikeMlhs() bool {
 	i := p.pos
 	sawComma := false
+	sawSplat := false
 	for {
+		// Optional leading splat on this target.
 		if p.toks[i].Type == token.STAR {
 			i++
+			sawSplat = true
+			// A nameless splat target (`*`, as in `a, * = x` or `* = x`) is followed
+			// directly by `,` or `=`.
+			switch p.toks[i].Type {
+			case token.COMMA:
+				sawComma = true
+				i++
+				continue
+			case token.ASSIGN:
+				return sawComma || sawSplat
+			}
 		}
-		if p.toks[i].Type != token.IDENT && p.toks[i].Type != token.CONST {
+		// A trailing comma before `=` ends the target list: `a, = x`.
+		if sawComma && p.toks[i].Type == token.ASSIGN {
+			return true
+		}
+		// A target must start with one of these kinds.
+		switch p.toks[i].Type {
+		case token.IDENT, token.CONST, token.IVAR, token.CVAR, token.GVAR, token.SELF:
+		default:
 			return false
 		}
 		i++
+		// Consume any postfix chain of this target at the top level: `.name`,
+		// `::Name`, `(...)`, `[...]`. Brackets/parens are scanned with depth so a
+		// comma or `=` inside them is not mistaken for a top-level one.
+		i = p.scanMlhsTargetTail(i)
+		if i < 0 {
+			return false
+		}
 		switch p.toks[i].Type {
 		case token.COMMA:
 			sawComma = true
 			i++
 		case token.ASSIGN:
-			return sawComma
+			return sawComma || sawSplat
 		default:
 			return false
 		}
 	}
 }
 
-// parseMlhs parses a multiple assignment whose targets are local names and/or
-// constants, with at most one *splat target. When every target is a local the
-// result uses only Names (and Targets stays nil); when any target is a constant
-// it additionally fills Targets (parallel to Names) with the per-position LHS
-// node so a consumer can store into a constant.
+// scanMlhsTargetTail advances past the postfix part of a single masgn target
+// starting at token index i (`.name`, `::Name`, balanced `(...)`/`[...]`),
+// returning the index of the first token that is not part of the target, or -1
+// on a malformed run (e.g. unbalanced brackets running off the end).
+func (p *Parser) scanMlhsTargetTail(i int) int {
+	for {
+		switch p.toks[i].Type {
+		case token.DOT, token.SAFEDOT, token.SCOPE:
+			i++
+			switch p.toks[i].Type {
+			case token.IDENT, token.CONST:
+				i++
+			default:
+				return -1
+			}
+		case token.LBRACKET:
+			j := p.scanBalanced(i, token.LBRACKET, token.RBRACKET)
+			if j < 0 {
+				return -1
+			}
+			i = j
+		case token.LPAREN:
+			j := p.scanBalanced(i, token.LPAREN, token.RPAREN)
+			if j < 0 {
+				return -1
+			}
+			i = j
+		default:
+			return i
+		}
+	}
+}
+
+// scanBalanced returns the index just past a balanced open/close pair beginning
+// at index i (which must hold the open token), or -1 if the input ends first. It
+// counts only the matching open/close kinds so other delimiters inside are
+// skipped over.
+func (p *Parser) scanBalanced(i int, open, close token.Type) int {
+	depth := 0
+	for {
+		switch p.toks[i].Type {
+		case open:
+			depth++
+		case close:
+			depth--
+			if depth == 0 {
+				return i + 1
+			}
+		case token.EOF:
+			return -1
+		}
+		i++
+	}
+}
+
+// parseMlhs parses a multiple assignment whose targets may be locals, constants,
+// instance/class/global variables, or attribute / index targets, with at most
+// one *splat target. When every target is a plain local the result uses only
+// Names (and Targets stays nil); otherwise it additionally fills Targets
+// (parallel to Names) with the per-position LHS node so a consumer can store into
+// each. For a non-local target Names[i] is "" (a splat-captured local keeps its
+// name).
 func (p *Parser) parseMlhs() ast.Node {
 	var names []string
 	var targets []ast.Node
-	hasConst := false
+	onlyLocals := true
 	splat := -1
 	for {
-		if p.accept(token.STAR) {
+		isSplat := p.accept(token.STAR)
+		if isSplat {
 			splat = len(names)
 		}
-		if p.is(token.CONST) {
-			name := p.advance().Lit
+		// A bare `*` (nameless splat target) is valid: `a, * = list`. Only when a
+		// target token follows do we parse one.
+		if isSplat && (p.is(token.COMMA) || p.is(token.ASSIGN)) {
 			names = append(names, "")
-			targets = append(targets, &ast.ConstRef{Name: name})
-			hasConst = true
+			targets = append(targets, nil)
+			onlyLocals = false
 		} else {
-			name := p.expect(token.IDENT).Lit
+			name, tgt, local := p.parseMlhsTarget()
 			names = append(names, name)
-			targets = append(targets, &ast.VarRef{Name: name})
-			p.declareLocal(name)
+			targets = append(targets, tgt)
+			if !local {
+				onlyLocals = false
+			}
 		}
 		if !p.accept(token.COMMA) {
 			break
 		}
+		// A trailing comma before `=` (`a, = x`) ends the target list.
+		if p.is(token.ASSIGN) {
+			break
+		}
 	}
-	if !hasConst {
+	if onlyLocals {
 		targets = nil // all-locals fast path: Names alone suffices
 	}
 	p.expect(token.ASSIGN)
@@ -1100,6 +1233,52 @@ func (p *Parser) parseMlhs() ast.Node {
 		values = append(values, p.parseTernary())
 	}
 	return &ast.MultiAssign{Names: names, Targets: targets, SplatIndex: splat, Values: values}
+}
+
+// parseMlhsTarget parses one masgn target and returns (localName, targetNode,
+// isPlainLocal). For a plain local, localName is its name, targetNode is a
+// *VarRef, and isPlainLocal is true. For any other target (constant, ivar,
+// cvar, gvar, attribute, or index) localName is "" and targetNode is the LHS
+// node a consumer stores into. Attribute targets are emitted as the existing
+// setter-call shape (Call with Name "x=" / "[]=") so consumers reuse their
+// single-assignment store logic.
+func (p *Parser) parseMlhsTarget() (string, ast.Node, bool) {
+	// Simple local: declare it and use a *VarRef (fast path).
+	if p.is(token.IDENT) && !isPostfixStart(p.peekTok().Type) {
+		name := p.advance().Lit
+		p.declareLocal(name)
+		return name, &ast.VarRef{Name: name}, true
+	}
+	node := p.parsePostfix()
+	switch n := node.(type) {
+	case *ast.ConstRef, *ast.ScopedConst, *ast.IvarRef, *ast.CVarRef, *ast.GVarRef:
+		return "", node, false
+	case *ast.Call:
+		// Attribute / index target with an explicit receiver: rewrite to its
+		// setter-call shape, leaving the value argument to be appended by the
+		// store. recv[i] → recv.[]=(i), recv.attr → recv.attr=(). A receiver-less
+		// call (a bare funcall) is not an assignable target.
+		if n.Recv != nil {
+			if n.Name == "[]" {
+				n.Name = "[]="
+			} else {
+				n.Name += "="
+			}
+			return "", n, false
+		}
+	}
+	p.fail("unexpected masgn target")
+	return "", nil, false
+}
+
+// isPostfixStart reports whether tt can begin a postfix operator chain (so a
+// bare IDENT followed by it is an attribute/index target, not a plain local).
+func isPostfixStart(tt token.Type) bool {
+	switch tt {
+	case token.DOT, token.SAFEDOT, token.SCOPE, token.LBRACKET:
+		return true
+	}
+	return false
 }
 
 func (p *Parser) parseExprOrAssign() ast.Node {
@@ -1438,16 +1617,10 @@ func (p *Parser) parsePostfixTail(node ast.Node) ast.Node {
 // allowed).
 func (p *Parser) parseArrayLiteral() ast.Node {
 	p.expect(token.LBRACKET)
-	var elems []ast.Node
-	p.skipNewlines()
-	for !p.is(token.RBRACKET) {
-		elems = append(elems, p.parseArg())
-		p.skipNewlines()
-		if !p.accept(token.COMMA) {
-			break
-		}
-		p.skipNewlines()
-	}
+	// An array literal shares the argument grammar so trailing `key: value` (and
+	// the value-omitted `key:` shorthand) collapse into one implicit trailing Hash
+	// element, exactly as in a call: `[a, k: v]` == `[a, {k: v}]`.
+	elems := p.parseCallArgs(token.RBRACKET)
 	p.expect(token.RBRACKET)
 	return &ast.ArrayLit{Elems: elems}
 }
@@ -1534,19 +1707,21 @@ func (p *Parser) parseLambda() ast.Node {
 // parseBraceBlock parses `{ [|params|] body }`.
 func (p *Parser) parseBraceBlock() *ast.Block {
 	p.expect(token.LBRACE)
-	return p.parseBlockRest(map[token.Type]bool{token.RBRACE: true}, token.RBRACE)
+	return p.parseBlockRest(map[token.Type]bool{token.RBRACE: true}, token.RBRACE, false)
 }
 
-// parseDoBlock parses `do [|params|] body end`.
+// parseDoBlock parses `do [|params|] body end`. A do…end block body may carry
+// rescue/else/ensure clauses without an explicit begin (unlike a brace block).
 func (p *Parser) parseDoBlock() *ast.Block {
 	p.expect(token.DO)
-	return p.parseBlockRest(bodyEnd, token.END)
+	return p.parseBlockRest(beginBodyEnd, token.END, true)
 }
 
 // parseBlockRest parses a block's optional `|params|` and body, having already
 // consumed the opener. end is the closing token; stop marks where the body
-// stops.
-func (p *Parser) parseBlockRest(stop map[token.Type]bool, end token.Type) *ast.Block {
+// stops. When withRescue is set (a do…end block), a trailing rescue/else/ensure
+// run on the body is folded into a Begin, mirroring method/class bodies.
+func (p *Parser) parseBlockRest(stop map[token.Type]bool, end token.Type, withRescue bool) *ast.Block {
 	p.pushBlockScope()
 	var params []string
 	var defaults, prepends []ast.Node
@@ -1559,6 +1734,9 @@ func (p *Parser) parseBlockRest(stop map[token.Type]bool, end token.Type) *ast.B
 	}
 	bs := p.scope()
 	body := p.parseStatements(stop)
+	if withRescue && (p.is(token.RESCUE) || p.is(token.ELSE) || p.is(token.ENSURE)) {
+		body = []ast.Node{p.parseRescueTail(body)}
+	}
 	params = p.finishImplicitParams(bs, params)
 	p.popScope()
 	p.expect(end)
@@ -1585,9 +1763,31 @@ func (p *Parser) parseBlockParams(until token.Type) (names []string, defaults, p
 	group := 0
 	for {
 		if p.accept(token.AMPER) { // &block param (always last), mirroring def params
-			blockParam = p.expect(token.IDENT).Lit
-			p.declareLocal(blockParam)
+			// `->(&) {}` — anonymous block param, sentinel name "&".
+			if p.is(token.IDENT) {
+				blockParam = p.advance().Lit
+				p.declareLocal(blockParam)
+			} else {
+				blockParam = "&"
+			}
 			break
+		}
+		if p.accept(token.POW) { // **rest keyword-splat / anonymous ** (lambda params)
+			// parseBlockParams folds a keyword-splat into the splat slot using the
+			// sentinel name "**rest"/"**"; a consumer treats it as the kwrest. (Block
+			// kwargs are rare; record it as a trailing rest so the shape round-trips.)
+			if p.is(token.IDENT) {
+				name := p.advance().Lit
+				p.declareLocal(name)
+				names = append(names, "**"+name)
+			} else {
+				names = append(names, "**")
+			}
+			defaults = append(defaults, nil)
+			if !p.accept(token.COMMA) {
+				break
+			}
+			continue
 		}
 		if p.is(token.STAR) { // top-level rest param: |*rest| / |a, *rest| / (*rest)
 			p.advance()
@@ -1595,10 +1795,15 @@ func (p *Parser) parseBlockParams(until token.Type) (names []string, defaults, p
 				p.fail("two rest parameters are not allowed")
 			}
 			splat = len(names)
-			name := p.expect(token.IDENT).Lit
-			names = append(names, name)
+			// `->(*) {}` / `(a, *)` — anonymous splat, sentinel name "*".
+			if p.is(token.IDENT) {
+				name := p.advance().Lit
+				names = append(names, name)
+				p.declareLocal(name)
+			} else {
+				names = append(names, "*")
+			}
 			defaults = append(defaults, nil)
-			p.declareLocal(name)
 		} else if p.accept(token.LPAREN) {
 			var gnames []string
 			gsplat := -1
@@ -1922,14 +2127,6 @@ func (p *Parser) parseCommandArgs() []ast.Node {
 	return args
 }
 
-// parseArg parses one argument or array element, which may be a `*splat`.
-func (p *Parser) parseArg() ast.Node {
-	if p.accept(token.STAR) {
-		return &ast.SplatArg{Value: p.parseExprOrAssign()}
-	}
-	return p.parseExprOrAssign()
-}
-
 func (p *Parser) parseCallArgs(until token.Type) []ast.Node {
 	var args []ast.Node
 	var kw *ast.HashLit
@@ -1940,6 +2137,10 @@ func (p *Parser) parseCallArgs(until token.Type) []ast.Node {
 	p.parseOneCallArg(&args, &kw)
 	for p.accept(token.COMMA) {
 		p.skipNewlines()
+		// A trailing comma before the closing delimiter is allowed: foo(1, 2,).
+		if p.is(until) {
+			break
+		}
 		p.parseOneCallArg(&args, &kw)
 	}
 	p.skipNewlines()
@@ -1968,7 +2169,15 @@ func (p *Parser) parseOneCallArg(args *[]ast.Node, kw **ast.HashLit) {
 		return
 	}
 	if p.is(token.LABEL) {
-		key := &ast.SymbolLit{Name: p.advance().Lit}
+		name := p.advance().Lit
+		key := &ast.SymbolLit{Name: name}
+		// Value-omitted shorthand (Ruby 3.4): `foo(format:, name:)` means
+		// `foo(format: format, name: name)` — when the label is not followed by a
+		// value, the value is the same-named local or method call.
+		if p.atKwShorthandEnd() {
+			p.addKwPair(kw, key, p.barewordValue(name))
+			return
+		}
 		p.addKwPair(kw, key, p.parseExprOrAssign())
 		return
 	}
@@ -1982,6 +2191,18 @@ func (p *Parser) parseOneCallArg(args *[]ast.Node, kw **ast.HashLit) {
 		return
 	}
 	*args = append(*args, node)
+}
+
+// atKwShorthandEnd reports whether the cursor sits where a value-omitted keyword
+// shorthand (`key:` with no value) ends: at a comma, newline, EOF, or a closing
+// call/array/hash delimiter.
+func (p *Parser) atKwShorthandEnd() bool {
+	switch p.cur().Type {
+	case token.COMMA, token.NEWLINE, token.EOF,
+		token.RPAREN, token.RBRACKET, token.RBRACE:
+		return true
+	}
+	return false
 }
 
 // addKwPair appends a key/value pair to the implicit trailing-hash argument,
