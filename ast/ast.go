@@ -21,6 +21,15 @@ type BignumLit struct{ Val *big.Int }
 // FloatLit is a floating-point literal.
 type FloatLit struct{ Value float64 }
 
+// RationalLit is a rational literal (`2r`, `0.5r`): Value is the underlying
+// numeric literal (an IntLit, BignumLit, or FloatLit) the `r` suffix promotes.
+type RationalLit struct{ Value Node }
+
+// ImaginaryLit is an imaginary literal (`3i`, `2.5i`, and the combined `2ri`
+// rational-imaginary): Value is the underlying numeric literal the `i` suffix
+// promotes (itself possibly a RationalLit for the `ri` form).
+type ImaginaryLit struct{ Value Node }
+
 // StringLit is a (Phase 0: non-interpolated) string literal.
 type StringLit struct{ Value string }
 
@@ -263,6 +272,7 @@ type SingletonClassDef struct {
 type Super struct {
 	Args    []Node
 	Forward bool
+	Block   *Block // a `do…end` / `{…}` block passed to super, or nil
 }
 
 // Break exits the innermost block (terminating its iterator) or loop. Value may
@@ -431,14 +441,21 @@ type Begin struct {
 // rescue StandardError.
 type RescueClause struct {
 	Classes []Node
-	Var     string
-	Body    []Node
+	Var     string // plain-local capture name (`rescue => e`), or "" — see VarTarget
+	// VarTarget is the general capture target when it is not a plain local —
+	// an instance/class/global variable, a constant, or an attribute/index
+	// (`rescue => @error`, `rescue => $g`, `rescue => obj.err`). It is the LHS
+	// node the caught exception is assigned to; nil when Var carries a local.
+	VarTarget Node
+	Body      []Node
 }
 
 func (*Program) node()           {}
 func (*ScopedConst) node()       {}
 func (*IntLit) node()            {}
 func (*BignumLit) node()         {}
+func (*RationalLit) node()       {}
+func (*ImaginaryLit) node()      {}
 func (*FloatLit) node()          {}
 func (*StringLit) node()         {}
 func (*SymbolLit) node()         {}

@@ -44,6 +44,18 @@ type Lexer struct {
 	// trailing-operator line continuation (a line ending in an infix operator
 	// joins the next line, as MRI does).
 	prevType token.Type
+	// prevBinary records whether the last token was an ambiguous operator
+	// (`|`/`&`/`^`/`<<`) lexed in binary (after-a-value) position. Only then does a
+	// trailing one continue the line; in operand position those open a block-param
+	// list, a block-pass, a heredoc, or a pattern pin instead.
+	prevBinary bool
+	// pendingBinary is set within lexToken when the token being emitted is an
+	// ambiguous operator in binary position; next() latches it into prevBinary.
+	pendingBinary bool
+	// inFitemList is set after `alias`/`undef` until the next newline: in that span
+	// a trailing operator names a method (`alias eql? ==`⏎`def …`) rather than
+	// continuing the line, so operator line-continuation is suppressed.
+	inFitemList bool
 }
 
 func New(src string) *Lexer {
@@ -91,8 +103,10 @@ func (l *Lexer) Tokenize() []token.Token {
 // next returns the next token and records its type, so the lexer can recognise a
 // trailing-operator line continuation. The lexing itself is in lexToken.
 func (l *Lexer) next() token.Token {
+	l.pendingBinary = false
 	t := l.lexToken()
 	l.prevType = t.Type
+	l.prevBinary = l.pendingBinary
 	return t
 }
 
@@ -106,7 +120,7 @@ func (l *Lexer) next() token.Token {
 func isContinuationOp(t token.Type) bool {
 	switch t {
 	case token.PLUS, token.MINUS, token.STAR, token.POW, token.SLASH, token.PERCENT,
-		token.EQ, token.EQQ, token.MATCH, token.NEQ, token.LT, token.GT, token.LE,
+		token.EQ, token.EQQ, token.MATCH, token.NMATCH, token.NEQ, token.LT, token.GT, token.LE,
 		token.GE, token.SPACESHIP, token.ANDAND, token.OROR,
 		token.ASSIGN, token.OPASSIGN, token.COMMA, token.HASHROCKET,
 		token.DOT, token.SAFEDOT, token.QUESTION, token.COLON,
@@ -175,11 +189,27 @@ func (l *Lexer) lexToken() token.Token {
 		if c == '\n' && l.nextLineStartsWithDot() {
 			return l.next()
 		}
+		// Inside an `alias`/`undef` fitem list, a trailing operator names a method
+		// (`alias eql? ==`) and must not continue the line; the newline closes it.
+		if l.inFitemList {
+			l.inFitemList = false
+			return mk(token.NEWLINE, "\\n")
+		}
 		// Trailing-operator continuation: a line ending in an infix operator
 		// (`a ||`, `x +`, a trailing comma, …) is incomplete and joins the next
 		// line. `;` is an explicit terminator and is never suppressed this way.
 		if c == '\n' && isContinuationOp(l.prevType) {
 			return l.next()
+		}
+		// The ambiguous bitwise/shift operators `|`/`&`/`^`/`<<` continue a line
+		// only when they were lexed in binary position (`new_args <<`⏎`x`,
+		// `… secure_compare(…) &`⏎`…`); in operand position they open a block param
+		// list, a block-pass, a heredoc, or a pattern pin and must not join.
+		if c == '\n' && l.prevBinary {
+			switch l.prevType {
+			case token.PIPE, token.AMPER, token.CARET, token.SHOVEL:
+				return l.next()
+			}
 		}
 		return mk(token.NEWLINE, "\\n")
 	case isDigit(c):
@@ -190,6 +220,12 @@ func (l *Lexer) lexToken() token.Token {
 		return l.lexString(spaceBefore, line, col)
 	case c == '\'':
 		return l.lexSingleQuote(spaceBefore, line, col)
+	case c == '`' && l.prevType == token.DEF:
+		// `def \`(cmd); end` — the backtick names the backtick method, not a
+		// command literal. Emit a SYMBOL-like XSTRING sentinel the parser maps to "`".
+		l.advance()
+		l.state = exprBegin
+		return mk(token.XSTRING, "`")
 	case c == '`':
 		return l.lexBacktick(spaceBefore, line, col)
 	case c == '@':
@@ -210,6 +246,12 @@ func (l *Lexer) lexToken() token.Token {
 	}
 
 	// Operators and delimiters.
+	// Record whether we are at expression-end (after a value) before consuming the
+	// operator. This disambiguates the ambiguous trailing operators `|`/`&`/`^`/`<<`
+	// at end-of-line: in binary position (after a value) a trailing one continues
+	// the line; in operand position it is a block param / block-pass / heredoc /
+	// pattern pin and does not.
+	binaryPos := l.state == exprEnd
 	l.advance()
 	switch c {
 	case '+':
@@ -307,6 +349,7 @@ func (l *Lexer) lexToken() token.Token {
 			return mk(token.OPASSIGN, "|")
 		}
 		l.state = exprBegin
+		l.pendingBinary = binaryPos
 		return mk(token.PIPE, "|")
 	case '&':
 		if l.peek() == '&' {
@@ -330,6 +373,7 @@ func (l *Lexer) lexToken() token.Token {
 			return mk(token.OPASSIGN, "&")
 		}
 		l.state = exprBegin
+		l.pendingBinary = binaryPos
 		return mk(token.AMPER, "&")
 	case ',':
 		l.state = exprBegin
@@ -376,6 +420,11 @@ func (l *Lexer) lexToken() token.Token {
 			l.state = exprBegin
 			return mk(token.NEQ, "!=")
 		}
+		if l.peek() == '~' { // !~ does-not-match operator
+			l.advance()
+			l.state = exprBegin
+			return mk(token.NMATCH, "!~")
+		}
 		l.state = exprBegin
 		return mk(token.BANG, "!")
 	case '<':
@@ -400,6 +449,7 @@ func (l *Lexer) lexToken() token.Token {
 				return l.lexHeredoc(spaceBefore, line, col)
 			}
 			l.state = exprBegin
+			l.pendingBinary = binaryPos
 			return mk(token.SHOVEL, "<<")
 		}
 		l.state = exprBegin
@@ -440,6 +490,7 @@ func (l *Lexer) lexToken() token.Token {
 			return mk(token.OPASSIGN, "^")
 		}
 		l.state = exprBegin
+		l.pendingBinary = binaryPos
 		return mk(token.CARET, "^")
 	case '~':
 		l.state = exprBegin
@@ -599,12 +650,23 @@ func (l *Lexer) lexNumber(spaceBefore bool, line, col int) token.Token {
 		}
 	}
 	lit := stripUnderscores(string(l.src[start:l.pos]))
+	// Trailing `r` (rational) and/or `i` (imaginary) suffixes: `2r`, `0.5r`,
+	// `3i`, `2.5ri`. Recorded in Flags so the parser wraps the literal accordingly.
+	suffix := ""
+	if l.peek() == 'r' {
+		l.advance()
+		suffix += "r"
+	}
+	if l.peek() == 'i' {
+		l.advance()
+		suffix += "i"
+	}
 	l.state = exprEnd
 	tt := token.INT
 	if isFloat {
 		tt = token.FLOAT
 	}
-	return token.Token{Type: tt, Lit: lit, Line: line, Col: col, SpaceBefore: spaceBefore}
+	return token.Token{Type: tt, Lit: lit, Flags: suffix, Line: line, Col: col, SpaceBefore: spaceBefore}
 }
 
 // lexRadixInt lexes a prefixed integer literal (cursor on the leading '0'). The
@@ -671,6 +733,14 @@ func (l *Lexer) lexIdent(spaceBefore bool, line, col int) token.Token {
 	// Trailing ? or ! is part of a method name (e.g. empty?, save!).
 	if c := l.peek(); c == '?' || c == '!' {
 		l.advance()
+		// A predicate/bang method name immediately followed by a single ':' is a
+		// hash label too (`frozen?: …`, `has_key?: …`, `valid!: …`).
+		if l.peek() == ':' && l.peek2() != ':' {
+			lit := string(l.src[start:l.pos])
+			l.advance() // ':'
+			l.state = exprBegin
+			return token.Token{Type: token.LABEL, Lit: lit, Line: line, Col: col, SpaceBefore: spaceBefore}
+		}
 	}
 	lit := string(l.src[start:l.pos])
 	tt := token.LookupIdent(lit)
@@ -682,6 +752,9 @@ func (l *Lexer) lexIdent(spaceBefore bool, line, col int) token.Token {
 	default:
 		l.state = exprBegin
 	}
+	if tt == token.ALIAS || tt == token.UNDEF {
+		l.inFitemList = true
+	}
 	return token.Token{Type: tt, Lit: lit, Line: line, Col: col, SpaceBefore: spaceBefore}
 }
 
@@ -690,8 +763,8 @@ func (l *Lexer) lexIdent(spaceBefore bool, line, col int) token.Token {
 // symbolOps are the operator method names that can appear as a symbol (`:+`,
 // `:[]=`, …), ordered so the first prefix match is the longest.
 var symbolOps = []string{
-	"[]=", "<=>", "===", "[]", "==", "=~", "!=", "<<", ">>", "<=", ">=", "**",
-	"+@", "-@", "+", "-", "*", "/", "%", "<", ">", "&", "|", "^", "~", "!",
+	"[]=", "<=>", "===", "[]", "==", "=~", "!~", "!=", "<<", ">>", "<=", ">=", "**",
+	"+@", "-@", "+", "-", "*", "/", "%", "<", ">", "&", "|", "^", "~", "!", "`",
 }
 
 // symbolOpAt returns the operator-symbol name starting at src[i], or "".
@@ -827,6 +900,12 @@ func (l *Lexer) lexGvar(spaceBefore bool, line, col int) token.Token {
 	l.advance() // '$'
 	start := l.pos
 	switch c := l.peek(); {
+	case c == '-':
+		// Option globals: `$-I`, `$-d`, `$-w`, `$-0`, … — a `-` plus one name char.
+		l.advance() // '-'
+		if isIdentPart(l.peek()) {
+			l.advance()
+		}
 	case isSpecialGvar(c):
 		// Single-character special globals: $~ $& $` $' $! $@ $/ $\ $; $, $.
 		// $< $> $? $* $$ $: $" $0 $+ (and the like). Each is exactly one byte.
@@ -946,7 +1025,14 @@ func (l *Lexer) atCharLiteral() bool {
 	if n == '\\' { // an escape always forms a char literal (?\n, ?\s, ?\\)
 		return true
 	}
-	// A plain single byte that begins an identifier must stand alone: the byte
+	// A multi-byte UTF-8 lead byte (>= 0x80) starts a single-rune payload (`?é`):
+	// it is taken whole, so the bytes that follow it are its own continuation
+	// bytes, not a longer word. (Checked before the identifier rule below, which
+	// would otherwise treat the rune's continuation bytes as more ident chars.)
+	if n >= 0x80 {
+		return true
+	}
+	// A plain ASCII byte that begins an identifier must stand alone: the byte
 	// after it must not continue an identifier word (so `?a` is a char but `?ab`
 	// is not). A non-identifier payload (`?|`, `?/`, `?.`) is always a char.
 	if isIdentPart(n) {
@@ -955,10 +1041,6 @@ func (l *Lexer) atCharLiteral() bool {
 			third = l.src[l.pos+2]
 		}
 		return !isIdentPart(third)
-	}
-	// A multi-byte UTF-8 lead byte (>= 0x80) starts a single rune payload (`?é`).
-	if n >= 0x80 {
-		return true
 	}
 	return true
 }
@@ -1721,9 +1803,16 @@ func (l *Lexer) scanStringSegment() (string, bool) {
 	}
 }
 
-func isDigit(c byte) bool      { return c >= '0' && c <= '9' }
-func isIdentStart(c byte) bool { return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') }
-func isIdentPart(c byte) bool  { return isIdentStart(c) || isDigit(c) }
+func isDigit(c byte) bool { return c >= '0' && c <= '9' }
+
+// isIdentStart reports whether c can begin an identifier. Besides ASCII letters
+// and `_`, any byte >= 0x80 — a UTF-8 multi-byte lead/continuation byte — counts,
+// so Unicode identifiers (`def なまえ`, `weird = Weird.create(なまえ: …)`) lex as one
+// IDENT, matching Ruby's acceptance of non-ASCII characters in names.
+func isIdentStart(c byte) bool {
+	return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c >= 0x80
+}
+func isIdentPart(c byte) bool { return isIdentStart(c) || isDigit(c) }
 
 // isSpecialGvar reports whether c is one of Ruby's single-character special
 // global-variable names that follow `$` (e.g. $! $@ $/ $\ $; $, $. $< $> $?
