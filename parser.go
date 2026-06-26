@@ -1728,10 +1728,10 @@ func (p *Parser) parseBinary(minBP int) ast.Node {
 }
 
 // valuelessJumpOperand parses a value-less control-flow jump (`return`, `break`,
-// `next`, `retry`) sitting in operand position, returning its node and true. MRI
-// accepts a bare jump as the right operand of `&&`/`||` (`x || return`, `expr &&
-// next`) but not one carrying a value (`x || return 5` is a syntax error), so
-// only the argument-less forms are recognised here.
+// `next`) sitting in operand position, returning its node and true. MRI accepts a
+// bare jump as the right operand of `&&`/`||` (`x || return`, `expr && next`) but
+// not one carrying a value (`x || return 5` is a syntax error), nor a `retry`
+// (`x || retry` is a syntax error), so only these argument-less forms qualify.
 func (p *Parser) valuelessJumpOperand() (ast.Node, bool) {
 	switch p.cur().Type {
 	case token.RETURN:
@@ -1743,9 +1743,6 @@ func (p *Parser) valuelessJumpOperand() (ast.Node, bool) {
 	case token.NEXT:
 		p.advance()
 		return &ast.Next{}, true
-	case token.RETRY:
-		p.advance()
-		return &ast.Retry{}, true
 	}
 	return nil, false
 }

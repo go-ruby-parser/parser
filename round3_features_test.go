@@ -262,7 +262,6 @@ func TestControlFlowInsideParens(t *testing.T) {
 		`(expr if cond)`,
 		`(x if y) || z`,
 		`[1].each { (m.match(s) or next)[1] }`,
-		`begin; (x or retry); rescue; end`,
 	} {
 		if _, err := parser.Parse(src); err != nil {
 			t.Errorf("Parse(%q): %v", src, err)
@@ -281,7 +280,6 @@ func TestControlFlowKeywordAsOperand(t *testing.T) {
 		`a = b || return`,
 		`def f; x or return; end`,
 		`def f; x && return; end`,
-		`begin; x || retry; rescue; end`,
 	} {
 		if _, err := parser.Parse(src); err != nil {
 			t.Errorf("Parse(%q): %v", src, err)
