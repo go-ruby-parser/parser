@@ -253,6 +253,40 @@ func TestHuggingStringOnReceiverAndConst(t *testing.T) {
 	}
 }
 
+// --- Feature 9: block params on a continued line ---
+
+func TestBlockParamsOnContinuedLine(t *testing.T) {
+	for _, src := range []string{
+		"foo {\n|x| x }",
+		"foo do\n|a, b|\na + b\nend",
+		"[1].each {\n  |x|\n  p x\n}",
+		"foo do\n\n|compare, target, success|\nnil\nend",
+	} {
+		if _, err := parser.Parse(src); err != nil {
+			t.Errorf("Parse(%q): %v", src, err)
+		}
+	}
+}
+
+func TestBlockParamsContinuedShape(t *testing.T) {
+	call := mustParseSingle(t, "foo do\n|a, b|\na\nend").(*ast.Call)
+	if call.Block == nil {
+		t.Fatal("foo do\\n|a,b| …: no block")
+	}
+	if len(call.Block.Params) != 2 || call.Block.Params[0] != "a" || call.Block.Params[1] != "b" {
+		t.Fatalf("block params = %v, want [a b]", call.Block.Params)
+	}
+}
+
+func TestBlockWithoutParamsStillWorks(t *testing.T) {
+	// A body that simply starts on the next line must not be read as params.
+	for _, src := range []string{"foo {\nx }", "foo {\n}", "foo do\nx\nend"} {
+		if _, err := parser.Parse(src); err != nil {
+			t.Errorf("Parse(%q): %v", src, err)
+		}
+	}
+}
+
 // --- Feature 5: control-flow + modifier inside parens ---
 
 func TestControlFlowInsideParens(t *testing.T) {

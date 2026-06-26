@@ -196,6 +196,17 @@ func (p *Parser) skipNewlines() {
 	}
 }
 
+// firstSignificantIs reports whether the first non-NEWLINE token at or after the
+// cursor is of type tt, without consuming anything.
+func (p *Parser) firstSignificantIs(tt token.Type) bool {
+	for i := p.pos; i < len(p.toks); i++ {
+		if p.toks[i].Type != token.NEWLINE {
+			return p.toks[i].Type == tt
+		}
+	}
+	return false
+}
+
 // --- scope ---
 
 func (p *Parser) scope() *scope         { return p.scopes[len(p.scopes)-1] }
@@ -2081,6 +2092,13 @@ func (p *Parser) parseBlockRest(stop map[token.Type]bool, end token.Type, withRe
 	var defaults, prepends []ast.Node
 	var blockParam string
 	splat := -1
+	// The `|params|` list may start on the line(s) after the block opener:
+	// `foo {`<nl>`|x| … }`, `do`<nl>`|a, b| … end`. Skip the intervening newlines
+	// before the leading `|` (a body statement can never begin with a bare `|`, so
+	// this is unambiguous). The newlines are no-ops for the body either way.
+	if p.is(token.NEWLINE) && p.firstSignificantIs(token.PIPE) {
+		p.skipNewlines()
+	}
 	if p.accept(token.PIPE) {
 		params, defaults, prepends, splat, blockParam = p.parseBlockParams(token.PIPE)
 		p.expect(token.PIPE)
