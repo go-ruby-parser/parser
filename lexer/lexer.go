@@ -8,6 +8,7 @@ package lexer
 
 import (
 	"strings"
+	"unicode/utf8"
 
 	"github.com/go-ruby-parser/parser/token"
 )
@@ -1284,6 +1285,75 @@ func isHexDigit(c byte) bool {
 	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
 }
 
+// isOctalDigit reports whether c is an octal digit (0–7).
+func isOctalDigit(c byte) bool { return c >= '0' && c <= '7' }
+
+// hexVal returns the numeric value of a single hex digit. The caller must have
+// already established that c is a hex digit (isHexDigit).
+func hexVal(c byte) int {
+	switch {
+	case c >= '0' && c <= '9':
+		return int(c - '0')
+	case c >= 'a' && c <= 'f':
+		return int(c-'a') + 10
+	default: // 'A'..'F'
+		return int(c-'A') + 10
+	}
+}
+
+// appendUnicodeEscape resolves a `\u` escape at the cursor (the leading `\u`
+// already consumed) and appends the UTF-8 encoding of each codepoint to b. Two
+// forms are accepted, mirroring MRI: `\uHHHH` (exactly four hex digits) and
+// `\u{H… H… …}` (one or more whitespace-separated codepoints). Malformed input
+// (MRI raises a SyntaxError) is handled gracefully — only the well-formed
+// prefix contributes bytes — since this lexer entry point has no error channel.
+func (l *Lexer) appendUnicodeEscape(b []byte) []byte {
+	if l.peek() == '{' {
+		l.advance() // '{'
+		for {
+			for l.peek() == ' ' || l.peek() == '\t' {
+				l.advance()
+			}
+			if !isHexDigit(l.peek()) {
+				break
+			}
+			cp := 0
+			for isHexDigit(l.peek()) {
+				cp = cp*16 + hexVal(l.advance())
+			}
+			b = appendRune(b, cp)
+		}
+		for l.peek() != '}' && l.peek() != 0 {
+			l.advance()
+		}
+		if l.peek() == '}' {
+			l.advance()
+		}
+		return b
+	}
+	// `\uHHHH`: exactly four hex digits. With none present (MRI: SyntaxError)
+	// nothing is emitted, so a stray `\u` does not inject a NUL byte.
+	if !isHexDigit(l.peek()) {
+		return b
+	}
+	cp := 0
+	for i := 0; i < 4 && isHexDigit(l.peek()); i++ {
+		cp = cp*16 + hexVal(l.advance())
+	}
+	return appendRune(b, cp)
+}
+
+// appendRune appends the UTF-8 encoding of codepoint cp to b. An out-of-range
+// or surrogate value yields the U+FFFD replacement bytes, as Go's utf8 package
+// does for invalid runes.
+func appendRune(b []byte, cp int) []byte {
+	r := rune(cp)
+	if cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF) {
+		r = '�'
+	}
+	return utf8.AppendRune(b, r)
+}
+
 // percentDelimClose returns the closing delimiter for a %-literal opener: the
 // mate of a bracket pair, or the same character for a symmetric delimiter.
 func percentDelimClose(open byte) byte {
@@ -1993,8 +2063,34 @@ func (l *Lexer) scanStringSegment() (string, bool) {
 				b = append(b, '"')
 			case 'e':
 				b = append(b, 0x1b)
-			case '0':
-				b = append(b, 0)
+			case 'x':
+				// `\xHH`: 1–2 hex digits, greedy. MRI requires at least one hex
+				// digit (`\x`/`\xZ` is a SyntaxError); lacking an error channel
+				// here we fall back to emitting a literal 'x' so the byte stream
+				// stays well-defined.
+				if !isHexDigit(l.peek()) {
+					b = append(b, 'x')
+					continue
+				}
+				v := hexVal(l.advance())
+				if isHexDigit(l.peek()) {
+					v = v*16 + hexVal(l.advance())
+				}
+				b = append(b, byte(v))
+			case '0', '1', '2', '3', '4', '5', '6', '7':
+				// `\NNN` octal: 1–3 octal digits, greedy; the leading digit was
+				// consumed as `esc`. The value is masked to a single byte
+				// (MRI: `\400` → byte 0x00).
+				v := int(esc - '0')
+				for i := 0; i < 2 && isOctalDigit(l.peek()); i++ {
+					v = v*8 + int(l.advance()-'0')
+				}
+				b = append(b, byte(v))
+			case 'u':
+				// `\uHHHH` (exactly four hex digits) or `\u{H… H… …}` (one or
+				// more whitespace-separated codepoints). Each codepoint is
+				// emitted as UTF-8, matching MRI's `.bytes`.
+				b = l.appendUnicodeEscape(b)
 			default:
 				b = append(b, esc)
 			}
