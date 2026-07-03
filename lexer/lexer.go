@@ -997,8 +997,9 @@ func (l *Lexer) lexIvar(spaceBefore bool, line, col int) token.Token {
 // lexRegexp lexes a /pattern/flags regexp literal. The opening '/' is at the
 // cursor. Escapes are preserved verbatim into the source (so \d, \. and the
 // like reach the engine untouched) except that an escaped delimiter \/ becomes
-// a literal '/'. Trailing flag letters i, m, x are collected into Flags; any
-// other trailing letters are ignored gracefully (consumed but not recorded).
+// a literal '/'. Trailing flag letters i, m, x and o (the "interpolate once"
+// flag) are collected into Flags; any other trailing letters (e.g. the encoding
+// flags n/u/e/s) are ignored gracefully (consumed but not recorded).
 func (l *Lexer) lexRegexp(spaceBefore bool, line, col int) token.Token {
 	l.advance() // opening '/'
 	var src []byte
@@ -1043,7 +1044,7 @@ func (l *Lexer) lexRegexp(spaceBefore bool, line, col int) token.Token {
 			break
 		}
 		l.advance()
-		if c == 'i' || c == 'm' || c == 'x' {
+		if c == 'i' || c == 'm' || c == 'x' || c == 'o' {
 			flags = append(flags, c)
 		}
 	}
@@ -1535,7 +1536,7 @@ func (l *Lexer) lexPercentRXS(spaceBefore bool, line, col int) token.Token {
 				break
 			}
 			l.advance()
-			if c == 'i' || c == 'm' || c == 'x' {
+			if c == 'i' || c == 'm' || c == 'x' || c == 'o' {
 				flags = append(flags, c)
 			}
 		}

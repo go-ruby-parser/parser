@@ -49,6 +49,31 @@ func TestPercentRegexpNoFlags(t *testing.T) {
 	}
 }
 
+func TestRegexpOnceFlag(t *testing.T) {
+	// The /o ("interpolate once") flag is preserved so the VM can compile an
+	// interpolated literal a single time. It sorts after i/m/x in source order.
+	rx := parseOne(t, "/a#{x}b/io").(*ast.RegexpLit)
+	if rx.Source != "a#{x}b" || rx.Flags != "io" {
+		t.Errorf("got %q/%q, want a#{x}b/io", rx.Source, rx.Flags)
+	}
+}
+
+func TestPercentRegexpOnceFlag(t *testing.T) {
+	rx := parseOne(t, "%r{a#{x}b}mo").(*ast.RegexpLit)
+	if rx.Source != "a#{x}b" || rx.Flags != "mo" {
+		t.Errorf("got %q/%q, want a#{x}b/mo", rx.Source, rx.Flags)
+	}
+}
+
+func TestRegexpEncodingFlagsStillDropped(t *testing.T) {
+	// The encoding flags n/u/e/s remain consumed-but-unrecorded (as before), so a
+	// bare /x/n exposes no flags — only i/m/x/o are meaningful to the VM.
+	rx := parseOne(t, "/x/n").(*ast.RegexpLit)
+	if rx.Flags != "" {
+		t.Errorf("Flags = %q, want empty (encoding flag n dropped)", rx.Flags)
+	}
+}
+
 func TestPercentXString(t *testing.T) {
 	xs, ok := parseOne(t, "%x{ls}").(*ast.XStr)
 	if !ok {
