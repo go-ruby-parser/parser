@@ -484,10 +484,30 @@ func (p *Parser) parseDef() ast.Node {
 	p.expect(token.DEF)
 	singleton := false
 	var recv ast.Node
+	// A parenthesised singleton receiver: def (expr).foo. MRI evaluates the paren
+	// group to an arbitrary object and defines a singleton method on it, so the
+	// receiver may be any single expression — a local (`def (obj).m`), a constant
+	// (`def (String).m`), a method call (`def (foo.bar).m`), `(self)`, a ternary,
+	// an `and`/`or`/assignment, etc. This emits the same MethodDef shape as the
+	// bare `def obj.foo` form (Recv set, Singleton false) so the compiler lowers it
+	// with no special case. A `(` right after `def` can only open this form (a
+	// method name is never a paren group). MRI requires exactly one expression in
+	// the group (a compound `def (a; b).m` is a syntax error), so a receiver that
+	// is not a single statement is rejected here too.
+	if p.is(token.LPAREN) {
+		p.advance() // (
+		stmts := p.parseStatements(map[token.Type]bool{token.RPAREN: true})
+		if len(stmts) != 1 {
+			p.fail("singleton def receiver must be a single expression")
+		}
+		recv = stmts[0]
+		p.expect(token.RPAREN)
+		p.expect(token.DOT)
+	}
 	// A receiver before the method name: def self.foo / def obj.foo / def Const.foo
 	// / def @ivar.foo / def $g.foo. The kind guard keeps peekTok in range (the
 	// receiver is always a single name token followed by a dot).
-	if isDefRecvStart(p.cur().Type) && p.peekTok().Type == token.DOT {
+	if recv == nil && isDefRecvStart(p.cur().Type) && p.peekTok().Type == token.DOT {
 		switch p.cur().Type {
 		case token.SELF:
 			p.advance() // self
