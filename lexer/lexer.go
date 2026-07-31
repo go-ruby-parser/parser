@@ -2042,6 +2042,22 @@ func (l *Lexer) scanStringSegment() (string, bool) {
 			l.advance()
 			esc := l.advance()
 			switch esc {
+			case '\n':
+				// Line continuation: a backslash immediately before a newline
+				// removes BOTH the backslash and the newline (MRI). This is the
+				// interpolating-string path (double-quoted, %Q/%(), and the
+				// interpolating heredocs, which are all re-lexed through here);
+				// single-quoted / %q / non-interpolating heredocs keep the
+				// backslash+newline verbatim and never reach this decoder.
+			case '\r':
+				// CRLF form of a line continuation (`\<CR><LF>`): strip both the
+				// CR and the LF. A lone `\<CR>` is not a continuation — MRI drops
+				// the backslash but keeps the carriage return.
+				if l.peek() == '\n' {
+					l.advance()
+				} else {
+					b = append(b, '\r')
+				}
 			case 'n':
 				b = append(b, '\n')
 			case 't':
