@@ -111,6 +111,13 @@ type Parser struct {
 	// default (`def f(a = c(1), b = nil)`), so the comma separating parameters is
 	// not mistaken for a masgn target separator (`c(1), b = nil`).
 	noMasgn bool
+	// noRescueMod suppresses the trailing modifier-`rescue` while parsing the
+	// arguments of a paren-less command call, so the `rescue` binds to the whole
+	// command rather than to its last argument: `raise "x" rescue 42` is
+	// `(raise "x") rescue 42`, not `raise("x" rescue 42)`. It is cleared inside any
+	// nested delimited context (a parenthesised group, a `(…)`/`[…]` argument list,
+	// a `{…}` hash), where an inner modifier-`rescue` is again allowed.
+	noRescueMod bool
 	// bracketDepth > 0 while parsing a parenthesised call-argument list or a hash
 	// literal, where newlines are insignificant. A `key:` whose value sits on the
 	// next line (`f(`⏎`  k:`⏎`    v)`) is then a continued pair, not a value-omitted
@@ -270,7 +277,12 @@ func (p *Parser) parseStatements(stop map[token.Type]bool) []ast.Node {
 	// for the duration and restore on exit.
 	savedMasgn := p.noMasgn
 	p.noMasgn = false
-	defer func() { p.noMasgn = savedMasgn }()
+	// A nested statement body (a parenthesised group, an interpolation, a keyword
+	// block) is a fresh context: an inner modifier-`rescue` there is not the one
+	// that binds to an enclosing command call, so re-enable it.
+	savedRescue := p.noRescueMod
+	p.noRescueMod = false
+	defer func() { p.noMasgn = savedMasgn; p.noRescueMod = savedRescue }()
 	var body []ast.Node
 	for {
 		p.skipNewlines()
@@ -366,10 +378,21 @@ func (p *Parser) parseOneLineMatch(subject ast.Node) ast.Node {
 }
 
 // applyModifiers wraps a statement in trailing `if/unless/while/until` modifiers
-// (`puts x if cond`, `return unless ok`).
+// (`puts x if cond`, `return unless ok`) and the modifier `rescue`. It is used by
+// the keyword-statement paths (`def`, `class`, `return`, …) whose head is parsed
+// before the ordinary expression machinery would apply a modifier `rescue`; an
+// ordinary-expression statement has its `rescue` consumed earlier (in
+// withRescueModifier), so none remains here. `rescue` binds tighter than the
+// conditional modifiers, matching MRI (`def…end rescue nil if c` is
+// `(def…end rescue nil) if c`), which the source-order left-to-right wrapping of
+// this loop reproduces.
 func (p *Parser) applyModifiers(node ast.Node) ast.Node {
 	for {
 		switch p.cur().Type {
+		case token.RESCUE:
+			p.advance()
+			fallback := p.parseTernary()
+			node = &ast.Begin{Body: []ast.Node{node}, Rescues: []ast.RescueClause{{Body: []ast.Node{fallback}}}}
 		case token.IF:
 			p.advance()
 			node = &ast.If{Cond: p.parseCond(), Then: []ast.Node{node}}
@@ -1960,7 +1983,11 @@ func (p *Parser) parseRhsElem() ast.Node {
 // A clause `rescue` (in a begin/def body) always starts a new line, so the
 // preceding NEWLINE keeps it from being read as a modifier. Left-associative.
 func (p *Parser) withRescueModifier(node ast.Node) ast.Node {
-	for p.is(token.RESCUE) {
+	// While parsing a paren-less command call's arguments the modifier binds to the
+	// whole call, not to this (last) argument, so leave the `rescue` for the
+	// enclosing command node to consume: `raise "x" rescue 42` == `(raise "x")
+	// rescue 42`.
+	for p.is(token.RESCUE) && !p.noRescueMod {
 		p.advance()
 		fallback := p.parseTernary()
 		node = &ast.Begin{Body: []ast.Node{node}, Rescues: []ast.RescueClause{{Body: []ast.Node{fallback}}}}
@@ -3133,6 +3160,10 @@ func (p *Parser) parseCommandArgs() []ast.Node {
 	// assignment value stops at the comma. Mirrors parameter-default handling.
 	savedMasgn := p.noMasgn
 	p.noMasgn = true
+	// A trailing modifier-`rescue` binds to the whole command call, not to its last
+	// argument, so suppress it here and let the enclosing expression consume it.
+	savedRescue := p.noRescueMod
+	p.noRescueMod = true
 	var args []ast.Node
 	var kw *ast.HashLit
 	p.parseOneCallArg(&args, &kw)
@@ -3140,6 +3171,7 @@ func (p *Parser) parseCommandArgs() []ast.Node {
 		p.skipNewlines()
 		p.parseOneCallArg(&args, &kw)
 	}
+	p.noRescueMod = savedRescue
 	p.noMasgn = savedMasgn
 	p.noDo = saved
 	if kw != nil {
@@ -3150,7 +3182,12 @@ func (p *Parser) parseCommandArgs() []ast.Node {
 
 func (p *Parser) parseCallArgs(until token.Type) []ast.Node {
 	p.bracketDepth++
-	defer func() { p.bracketDepth-- }()
+	// A parenthesised `(…)` argument list or `[…]` element list is a fresh,
+	// delimited context: an inner modifier-`rescue` (`foo(bar rescue baz)`) belongs
+	// to that argument, not to any enclosing command call, so re-enable it.
+	savedRescue := p.noRescueMod
+	p.noRescueMod = false
+	defer func() { p.bracketDepth--; p.noRescueMod = savedRescue }()
 	var args []ast.Node
 	var kw *ast.HashLit
 	p.skipNewlines()
