@@ -2003,11 +2003,20 @@ func (p *Parser) parseTernary() ast.Node {
 	if !p.accept(token.QUESTION) {
 		return cond
 	}
+	// A ternary may be split across lines: MRI allows newlines after `?`, on
+	// either side of `:`, and before the else arm (`cond ?`<nl>`a`<nl>`:`<nl>`b`).
+	// The lexer already joins a line ending in `?` or `:` (isContinuationOp), so
+	// only the newline *before* the `:` reaches us; skip newlines at each seam so
+	// blank lines anywhere inside the ternary are tolerated too, matching MRI. A
+	// newline *before* the `?` never gets here: it terminates the condition first.
+	p.skipNewlines()
 	// Each branch may itself be an assignment (`c ? a = b : d`,
 	// `x ? ENV["k"] = v : super`), which MRI permits in this position even though
 	// `=` otherwise binds looser than `?:`.
 	then := p.maybeInlineAssign(p.parseTernary())
+	p.skipNewlines()
 	p.expect(token.COLON)
+	p.skipNewlines()
 	els := p.maybeInlineAssign(p.parseTernary())
 	return &ast.If{Cond: cond, Then: []ast.Node{then}, Else: []ast.Node{els}}
 }
