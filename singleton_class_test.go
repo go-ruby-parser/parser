@@ -90,6 +90,20 @@ func TestSingletonClassExprTarget(t *testing.T) {
 	}
 }
 
+// TestSingletonClassAssignTarget covers `class << @x = expr` — MRI allows the
+// singleton target to be an assignment (assign, then open the result's singleton
+// class), which needs a full expression, not just a ternary, after the `<<`.
+func TestSingletonClassAssignTarget(t *testing.T) {
+	sc := topSingleton(t, "class << @receiver = Object.new\n  def m; end\nend")
+	asn, ok := sc.Target.(*ast.IvarAssign)
+	if !ok || asn.Name != "@receiver" {
+		t.Fatalf("Target = %T (%+v), want *ast.IvarAssign @receiver", sc.Target, sc.Target)
+	}
+	if len(sc.Body) != 1 {
+		t.Fatalf("Body has %d nodes, want 1", len(sc.Body))
+	}
+}
+
 // TestSingletonClassEmptyBody covers a singleton class with no body statements.
 func TestSingletonClassEmptyBody(t *testing.T) {
 	sc := topSingleton(t, "class << self\nend")

@@ -454,7 +454,9 @@ func (p *Parser) parseClass() ast.Node {
 	// `class << target` opens target's singleton (metaclass). A SHOVEL here is
 	// the singleton-class form, not a constant path.
 	if p.accept(token.SHOVEL) {
-		target := p.parseTernary()
+		// The target is a full expression, including an assignment — MRI allows
+		// `class << @x = Object.new` (assign, then open the result's singleton).
+		target := p.parseExprOrAssign()
 		p.pushScope() // the singleton-class body has its own local scope
 		body := p.parseBodyWithRescue()
 		p.popScope()
@@ -618,7 +620,7 @@ func (p *Parser) parseDefName() (string, bool) {
 		return name, true
 	case token.CONST,
 		token.SPACESHIP, token.LT, token.GT, token.LE, token.GE,
-		token.EQ, token.EQQ, token.NEQ, token.MATCH, token.SHOVEL, token.RSHIFT,
+		token.EQ, token.EQQ, token.NEQ, token.MATCH, token.NMATCH, token.SHOVEL, token.RSHIFT,
 		token.STAR, token.POW, token.SLASH, token.PERCENT,
 		token.AMPER, token.PIPE, token.CARET:
 		return p.advance().Lit, true
