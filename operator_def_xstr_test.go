@@ -71,6 +71,8 @@ func TestOperatorMethodDef(t *testing.T) {
 		{"def |(o); end", "|"},
 		{"def ^(o); end", "^"},
 		{"def =~(o); end", "=~"},
+		{"def !~(o); end", "!~"},
+		{"def !=(o); end", "!="},
 		{"def [](i); end", "[]"},
 		{"def []=(i, v); end", "[]="},
 		{"def +(o); end", "+"},
