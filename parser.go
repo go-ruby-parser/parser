@@ -3198,7 +3198,14 @@ func (p *Parser) parseCallArgs(until token.Type) []ast.Node {
 	// to that argument, not to any enclosing command call, so re-enable it.
 	savedRescue := p.noRescueMod
 	p.noRescueMod = false
-	defer func() { p.bracketDepth--; p.noRescueMod = savedRescue }()
+	// The comma separates arguments (or array elements), so multiple-assignment
+	// detection must be off: `f(a = 1, b = 2, 3)` is three arguments (the first two
+	// assignments), not `f(a = [1, b = [2, 3]])`, and `[x = 1, 2]` is a two-element
+	// array. An assignment argument's value stops at the comma. Mirrors the paren-
+	// less parseCommandArgs and def parameter-default handling.
+	savedMasgn := p.noMasgn
+	p.noMasgn = true
+	defer func() { p.bracketDepth--; p.noRescueMod = savedRescue; p.noMasgn = savedMasgn }()
 	var args []ast.Node
 	var kw *ast.HashLit
 	p.skipNewlines()
