@@ -854,7 +854,10 @@ func (l *Lexer) lexSymbol(spaceBefore bool, line, col int) token.Token {
 		return token.Token{Type: token.SYMBOL, Lit: op, Line: line, Col: col, SpaceBefore: spaceBefore}
 	}
 	start := l.pos
-	// Variable-name symbols: :@ivar, :@@cvar, :$global.
+	// Variable-name symbols: :@ivar, :@@cvar, :$global — including the special
+	// globals (:$~ :$! :$& :$` …), the option globals (:$-w), and match-group
+	// references (:$1), which are complete as soon as their one special byte /
+	// digit run is consumed and take no ?/!/= suffix.
 	switch l.peek() {
 	case '@':
 		l.advance()
@@ -863,6 +866,25 @@ func (l *Lexer) lexSymbol(spaceBefore bool, line, col int) token.Token {
 		}
 	case '$':
 		l.advance()
+		switch c := l.peek(); {
+		case c == '-':
+			l.advance()
+			if isIdentPart(l.peek()) {
+				l.advance()
+			}
+			l.state = exprEnd
+			return token.Token{Type: token.SYMBOL, Lit: string(l.src[start:l.pos]), Line: line, Col: col, SpaceBefore: spaceBefore}
+		case isSpecialGvar(c):
+			l.advance()
+			l.state = exprEnd
+			return token.Token{Type: token.SYMBOL, Lit: string(l.src[start:l.pos]), Line: line, Col: col, SpaceBefore: spaceBefore}
+		case c >= '1' && c <= '9':
+			for l.peek() >= '0' && l.peek() <= '9' {
+				l.advance()
+			}
+			l.state = exprEnd
+			return token.Token{Type: token.SYMBOL, Lit: string(l.src[start:l.pos]), Line: line, Col: col, SpaceBefore: spaceBefore}
+		}
 	}
 	for isIdentPart(l.peek()) {
 		l.advance()

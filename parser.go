@@ -952,14 +952,19 @@ func (p *Parser) parseReturn() ast.Node {
 	if p.atStatementEnd() {
 		return &ast.Return{}
 	}
-	first := p.parseExprOrAssign()
+	first := p.parseRhsElem()
 	if !p.is(token.COMMA) {
+		// A bare `return *ary` splats into a one-element array (`return [*ary]`),
+		// matching `x = *ary`; a plain value is returned as-is.
+		if sp, ok := first.(*ast.SplatArg); ok {
+			return &ast.Return{Value: &ast.ArrayLit{Elems: []ast.Node{sp}}}
+		}
 		return &ast.Return{Value: first}
 	}
-	// `return a, b, …` returns an array of the values.
+	// `return a, b, …` returns an array of the values (a `*splat` element allowed).
 	elems := []ast.Node{first}
 	for p.accept(token.COMMA) {
-		elems = append(elems, p.parseExprOrAssign())
+		elems = append(elems, p.parseRhsElem())
 	}
 	return &ast.Return{Value: &ast.ArrayLit{Elems: elems}}
 }
@@ -1017,13 +1022,17 @@ func (p *Parser) parseNext() ast.Node {
 // or a comma-separated list gathered into an array (`next table, true`,
 // `break a, b`), matching `return a, b`.
 func (p *Parser) parseJumpValue() ast.Node {
-	first := p.parseExprOrAssign()
+	first := p.parseRhsElem()
 	if !p.is(token.COMMA) {
+		// `break *ary` / `next *ary` splat into a one-element array, as `return *ary`.
+		if sp, ok := first.(*ast.SplatArg); ok {
+			return &ast.ArrayLit{Elems: []ast.Node{sp}}
+		}
 		return first
 	}
 	elems := []ast.Node{first}
 	for p.accept(token.COMMA) {
-		elems = append(elems, p.parseExprOrAssign())
+		elems = append(elems, p.parseRhsElem())
 	}
 	return &ast.ArrayLit{Elems: elems}
 }
@@ -2012,15 +2021,24 @@ func (p *Parser) parseTernary() ast.Node {
 	// blank lines anywhere inside the ternary are tolerated too, matching MRI. A
 	// newline *before* the `?` never gets here: it terminates the condition first.
 	p.skipNewlines()
-	// Each branch may itself be an assignment (`c ? a = b : d`,
-	// `x ? ENV["k"] = v : super`), which MRI permits in this position even though
-	// `=` otherwise binds looser than `?:`.
-	then := p.maybeInlineAssign(p.parseTernary())
+	then := p.ternaryArm()
 	p.skipNewlines()
 	p.expect(token.COLON)
 	p.skipNewlines()
-	els := p.maybeInlineAssign(p.parseTernary())
+	els := p.ternaryArm()
 	return &ast.If{Cond: cond, Then: []ast.Node{then}, Else: []ast.Node{els}}
+}
+
+// ternaryArm parses one arm of a ternary. A bare value-less control-flow jump is
+// allowed here (`cond ? next : x`, `flag ? break : y`), matching MRI. Otherwise
+// the arm may itself be an assignment (`c ? a = b : d`, `x ? ENV["k"] = v :
+// super`), which MRI permits in this position even though `=` binds looser than
+// `?:`.
+func (p *Parser) ternaryArm() ast.Node {
+	if j, ok := p.valuelessJumpOperand(); ok {
+		return j
+	}
+	return p.maybeInlineAssign(p.parseTernary())
 }
 
 // parseRange handles `lo..hi` / `lo...hi`, binding looser than the binary
@@ -2643,6 +2661,17 @@ func (p *Parser) parseBlockParams(until token.Type) (names []string, defaults, p
 	}
 	group := 0
 	for {
+		if p.is(until) || p.is(token.NEWLINE) {
+			// A trailing comma (`|a,|`, `{ |k,| }`) forces array destructuring of a
+			// single block argument — equivalent to an anonymous rest `|a, *|`, so
+			// `[1, 2]` yields a == 1 rather than a == [1, 2].
+			if splat < 0 {
+				splat = len(names)
+				names = append(names, "*")
+				defaults = append(defaults, nil)
+			}
+			break
+		}
 		if p.accept(token.AMPER) { // &block param (always last), mirroring def params
 			// `->(&) {}` — anonymous block param, sentinel name "&".
 			if p.is(token.IDENT) {
