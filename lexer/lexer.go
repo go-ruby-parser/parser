@@ -322,6 +322,11 @@ func (l *Lexer) lexToken() token.Token {
 	case '*':
 		if l.peek() == '*' {
 			l.advance()
+			if l.peek() == '=' { // `**=` power-assignment
+				l.advance()
+				l.state = exprBegin
+				return mk(token.OPASSIGN, "**")
+			}
 			l.state = exprBegin
 			return mk(token.POW, "**")
 		}

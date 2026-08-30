@@ -1897,6 +1897,15 @@ func (p *Parser) parseExprOrAssign() ast.Node {
 		rhs := p.parseExprOrAssign()
 		return &ast.CVarAssign{Name: name, Value: &ast.BinaryExpr{Op: op, Left: &ast.CVarRef{Name: name}, Right: rhs}}
 	}
+	// Compound assignment to a constant: NAME OP= expr (`C += 1`, `C ||= default`).
+	if p.is(token.CONST) && p.peekTok().Type == token.OPASSIGN {
+		name := p.advance().Lit
+		op := p.advance().Lit
+		rhs := p.parseExprOrAssign()
+		return constOpAssign(op, &ast.ConstRef{Name: name}, rhs, func(v ast.Node) ast.Node {
+			return &ast.ConstAssign{Name: name, Value: v}
+		})
+	}
 	left := p.parseTernary()
 	if p.is(token.OPASSIGN) {
 		if call, ok := left.(*ast.Call); ok && call.Recv != nil {
@@ -1917,6 +1926,14 @@ func (p *Parser) parseExprOrAssign() ast.Node {
 				newVal := &ast.BinaryExpr{Op: op, Left: read, Right: rhs}
 				return &ast.Call{Recv: call.Recv, Name: call.Name + "=", Args: []ast.Node{newVal}}
 			}
+		}
+		// Compound scope-resolved constant assignment: `A::B OP= v`.
+		if sc, ok := left.(*ast.ScopedConst); ok {
+			op := p.advance().Lit
+			rhs := p.parseExprOrAssign()
+			return constOpAssign(op, sc, rhs, func(v ast.Node) ast.Node {
+				return &ast.ScopedConstAssign{Target: sc, Value: v}
+			})
 		}
 	}
 	if p.is(token.ASSIGN) {
@@ -1945,6 +1962,21 @@ func (p *Parser) parseExprOrAssign() ast.Node {
 		}
 	}
 	return p.withRescueModifier(left)
+}
+
+// constOpAssign builds the desugaring of a constant compound assignment
+// `TARGET OP= rhs`. ref is a fresh read of the target (a *ConstRef or a
+// *ScopedConst) and assign wraps a value into the target's assignment node. For
+// `||=` the read is guarded behind `defined?`, so `C ||= x` defines C when C is
+// undefined rather than raising — matching MRI: `(defined?(C) && C) || (C = x)`.
+// Every other operator (`+=`, `-=`, `&&=`, …) reads the constant directly, as
+// MRI does (raising NameError on an undefined constant).
+func constOpAssign(op string, ref, rhs ast.Node, assign func(ast.Node) ast.Node) ast.Node {
+	if op == "||" {
+		guard := &ast.BinaryExpr{Op: "&&", Left: &ast.Call{Name: "defined?", Args: []ast.Node{ref}}, Right: ref}
+		return &ast.BinaryExpr{Op: "||", Left: guard, Right: assign(rhs)}
+	}
+	return assign(&ast.BinaryExpr{Op: op, Left: ref, Right: rhs})
 }
 
 // parseAssignRhs parses the right-hand side of a single-target assignment. It is
