@@ -36,8 +36,9 @@ type StringLit struct{ Value string }
 // SymbolLit is a symbol literal (:name); Name excludes the leading colon.
 type SymbolLit struct{ Name string }
 
-// RegexpLit is a regexp literal /source/flags. Flags holds the subset of the
-// flag letters i, m, x that were present.
+// RegexpLit is a regexp literal /source/flags. Flags holds, in source order,
+// the subset of the flag letters i, m, x, o and the encoding flags n (ASCII-8BIT),
+// u (UTF-8), e (EUC-JP) and s (Windows-31J) that were present.
 type RegexpLit struct {
 	Source string
 	Flags  string

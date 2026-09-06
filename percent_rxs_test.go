@@ -65,12 +65,38 @@ func TestPercentRegexpOnceFlag(t *testing.T) {
 	}
 }
 
-func TestRegexpEncodingFlagsStillDropped(t *testing.T) {
-	// The encoding flags n/u/e/s remain consumed-but-unrecorded (as before), so a
-	// bare /x/n exposes no flags — only i/m/x/o are meaningful to the VM.
-	rx := parseOne(t, "/x/n").(*ast.RegexpLit)
-	if rx.Flags != "" {
-		t.Errorf("Flags = %q, want empty (encoding flag n dropped)", rx.Flags)
+func TestRegexpEncodingFlagsRecorded(t *testing.T) {
+	// The encoding flags n/u/e/s are now recorded (matching MRI, which records an
+	// ARG_ENCODING for each): n=ASCII-8BIT, u=UTF-8, e=EUC-JP, s=Windows-31J. They
+	// are collected into Flags in source order alongside i/m/x/o.
+	cases := []struct{ src, want string }{
+		{"/x/n", "n"},   // n -> ASCII-8BIT (BINARY)
+		{"/x/u", "u"},   // u -> UTF-8
+		{"/x/e", "e"},   // e -> EUC-JP
+		{"/x/s", "s"},   // s -> Windows-31J (SJIS)
+		{"/a/mn", "mn"}, // encoding flag recorded after i/m/x/o, in source order
+		{"/a/un", "un"}, // multiple trailing letters preserved in the order written
+	}
+	for _, c := range cases {
+		rx := parseOne(t, c.src).(*ast.RegexpLit)
+		if rx.Flags != c.want {
+			t.Errorf("%s: Flags = %q, want %q", c.src, rx.Flags, c.want)
+		}
+	}
+}
+
+func TestPercentRegexpEncodingFlagsRecorded(t *testing.T) {
+	// The %r{…} form records the same encoding flags as the /…/ form.
+	cases := []struct{ src, want string }{
+		{"%r{x}n", "n"},
+		{"%r{x}u", "u"},
+		{"%r{x}mn", "mn"},
+	}
+	for _, c := range cases {
+		rx := parseOne(t, c.src).(*ast.RegexpLit)
+		if rx.Flags != c.want {
+			t.Errorf("%s: Flags = %q, want %q", c.src, rx.Flags, c.want)
+		}
 	}
 }
 

@@ -155,7 +155,7 @@ var Keywords = map[string]Type{
 type Token struct {
 	Type        Type
 	Lit         string
-	Flags       string // regexp flag letters (i, m, x), only set for REGEXP tokens
+	Flags       string // regexp flag letters in source order (i, m, x, o and the encoding flags n, u, e, s), only set for REGEXP tokens
 	Line        int
 	Col         int
 	SpaceBefore bool // whitespace immediately preceded this token (MRI spaceSeen)
