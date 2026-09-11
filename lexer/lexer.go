@@ -1787,11 +1787,10 @@ func unescapeInterpWord(w string) string {
 	if !strings.Contains(w, `\`) {
 		return w
 	}
-	toks := New(`"` + wrapHeredocDQ(w) + `"`).Tokenize()
-	if len(toks) == 2 && toks[0].Type == token.STRING && toks[1].Type == token.EOF {
-		return toks[0].Lit
-	}
-	return w
+	// The caller has already established that the word holds no interpolation,
+	// and the list scanner never leaves an unpaired backslash in it, so the
+	// re-lex always yields one string token followed by EOF.
+	return New(`"` + wrapHeredocDQ(w) + `"`).Tokenize()[0].Lit
 }
 
 // splitPercentWords splits a %W/%I body on whitespace, keeping whitespace that
