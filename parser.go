@@ -2917,7 +2917,9 @@ func (p *Parser) parsePrimary() ast.Node {
 	case token.WORDS, token.SYMBOLS:
 		p.advance()
 		elems := []ast.Node{}
-		for _, w := range strings.Fields(t.Lit) {
+		// The lexer splits the body: separating whitespace can only be told
+		// from an escaped literal space there, where the delimiters are known.
+		for _, w := range t.Words {
 			if t.Type == token.SYMBOLS {
 				elems = append(elems, &ast.SymbolLit{Name: w})
 			} else {
