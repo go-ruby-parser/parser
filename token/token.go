@@ -28,8 +28,8 @@ const (
 	LABEL   // name: in a hash literal
 	REGEXP  // /pattern/flags (Lit = pattern source, Flags = matched flag letters)
 	XSTRING // `cmd` / %x{cmd} backtick command literal (Lit = raw command source)
-	WORDS   // %w[…] word-array literal (Lit = raw whitespace-separated content)
-	SYMBOLS // %i[…] symbol-array literal (Lit = raw whitespace-separated content)
+	WORDS   // %w[…] word-array literal (Lit = raw body, Words = the split words)
+	SYMBOLS // %i[…] symbol-array literal (Lit = raw body, Words = the split words)
 
 	// Keywords.
 	DEF
@@ -155,7 +155,8 @@ var Keywords = map[string]Type{
 type Token struct {
 	Type        Type
 	Lit         string
-	Flags       string // regexp flag letters in source order (i, m, x, o and the encoding flags n, u, e, s), only set for REGEXP tokens
+	Flags       string   // regexp flag letters in source order (i, m, x, o and the encoding flags n, u, e, s), only set for REGEXP tokens
+	Words       []string // the words of a WORDS/SYMBOLS literal, already split and unescaped; only set for those two types
 	Line        int
 	Col         int
 	SpaceBefore bool // whitespace immediately preceded this token (MRI spaceSeen)

@@ -1426,9 +1426,15 @@ func (l *Lexer) atPercentArray() bool {
 }
 
 // lexPercentArray lexes a %w/%i/%W/%I array literal. The non-interpolating
-// %w/%i forms become a single WORDS/SYMBOLS token whose Lit the parser splits.
-// The interpolating %W/%I forms are spliced into the equivalent array of
-// (interpolated) string/symbol elements. Bracket delimiters nest.
+// %w/%i forms become a WORDS/SYMBOLS token carrying both the raw body (Lit) and
+// the words it splits into (Words). The interpolating %W/%I forms are spliced
+// into the equivalent array of (interpolated) string/symbol elements. Bracket
+// delimiters nest.
+//
+// A backslash escapes the character after it, which is therefore neither a
+// nesting bracket nor the terminator: `%w[a\]b]` is the single word `a]b`, not
+// an unterminated list (MRI parse.y, tokadd_string — the `c == '\\'` branch
+// consumes the next character before the term/paren tests can see it).
 func (l *Lexer) lexPercentArray(spaceBefore bool, line, col int) token.Token {
 	l.advance() // %
 	kind := l.advance()
@@ -1436,10 +1442,21 @@ func (l *Lexer) lexPercentArray(spaceBefore bool, line, col int) token.Token {
 	closing := percentDelimClose(open)
 	depth := 1
 	var content []byte
+	unterminated := token.Token{Type: token.ILLEGAL, Lit: "unterminated %-array literal", Line: line, Col: col, SpaceBefore: spaceBefore}
 	for {
 		c := l.peek()
 		if c == 0 {
-			return token.Token{Type: token.ILLEGAL, Lit: "unterminated %-array literal", Line: line, Col: col, SpaceBefore: spaceBefore}
+			return unterminated
+		}
+		if c == '\\' {
+			// Keep both bytes raw; the escape is resolved when the body is
+			// split into words, which is where the delimiters are still known.
+			content = append(content, l.advance())
+			if l.peek() == 0 {
+				return unterminated
+			}
+			content = append(content, l.advance())
+			continue
 		}
 		if open != closing && c == open {
 			depth++
@@ -1460,7 +1477,79 @@ func (l *Lexer) lexPercentArray(spaceBefore bool, line, col int) token.Token {
 	if kind == 'i' {
 		tt = token.SYMBOLS
 	}
-	return token.Token{Type: tt, Lit: string(content), Line: line, Col: col, SpaceBefore: spaceBefore}
+	return token.Token{
+		Type:        tt,
+		Lit:         string(content),
+		Words:       splitWordList(string(content), open, closing),
+		Line:        line,
+		Col:         col,
+		SpaceBefore: spaceBefore,
+	}
+}
+
+// isWordListSpace reports whether c separates two words of a %-list. It is
+// MRI's ISSPACE: space, tab, newline, vertical tab, form feed, carriage return.
+func isWordListSpace(c byte) bool {
+	switch c {
+	case ' ', '\t', '\n', '\v', '\f', '\r':
+		return true
+	}
+	return false
+}
+
+// splitWordList splits the raw body of a NON-interpolating %w/%i list into its
+// words, resolving escapes as MRI does (parse.y, tokadd_string with
+// func = str_sword: STR_FUNC_QWORDS, no STR_FUNC_EXPAND, no STR_FUNC_ESCAPE).
+//
+// Two rules matter and both follow from the backslash branch being tested
+// before the word-splitting one:
+//
+//   - Only UNESCAPED whitespace separates words. `%w[a\ b c]` is the two words
+//     "a b" and "c" — the escaped space is an ordinary character of the first
+//     word. (ruby -e 'p %w[a\ b c]' => ["a b", "c"])
+//   - The backslash itself survives EXCEPT before whitespace, a delimiter, or
+//     another backslash, where it escapes a literal character instead. So
+//     `%w[a\tb]` is the four characters a \ t b and NOT a tab, while
+//     `%w[a\\b]` is the three characters a \ b.
+//     (ruby -e 'p %w[a\tb]' => ["a\\tb"]; ruby -e 'p %w[a\\b]' => ["a\\b"])
+func splitWordList(body string, open, closing byte) []string {
+	words := []string{}
+	var cur []byte
+	flush := func() {
+		if len(cur) > 0 {
+			words = append(words, string(cur))
+			cur = nil
+		}
+	}
+	for i := 0; i < len(body); i++ {
+		c := body[i]
+		if c == '\\' && i+1 < len(body) {
+			d := body[i+1]
+			switch {
+			case isWordListSpace(d):
+				// The backslash is dropped and the whitespace becomes a
+				// literal character of the current word, never a separator.
+				cur = append(cur, d)
+			case d == '\\':
+				cur = append(cur, '\\')
+			case d == closing || (open != closing && d == open):
+				cur = append(cur, d)
+			default:
+				// Everything else keeps the backslash verbatim; there is no
+				// escape set here, only the four cases above.
+				cur = append(cur, '\\', d)
+			}
+			i++
+			continue
+		}
+		if isWordListSpace(c) {
+			flush()
+			continue
+		}
+		cur = append(cur, c)
+	}
+	flush()
+	return words
 }
 
 // isPercentDelim reports whether b can open a %-literal. MRI accepts any
@@ -1670,7 +1759,7 @@ func (l *Lexer) splicePercentInterp(content string, symbols, spaceBefore bool, l
 			toks = append(toks, token.Token{Type: token.COMMA, Lit: ",", Line: line, Col: col})
 		}
 		if symbols && !strings.Contains(w, "#{") {
-			toks = append(toks, token.Token{Type: token.SYMBOL, Lit: w, Line: line, Col: col})
+			toks = append(toks, token.Token{Type: token.SYMBOL, Lit: unescapeInterpWord(w), Line: line, Col: col})
 			continue
 		}
 		for _, t := range New(`"` + wrapHeredocDQ(w) + `"`).Tokenize() {
@@ -1689,8 +1778,32 @@ func (l *Lexer) splicePercentInterp(content string, symbols, spaceBefore bool, l
 	return toks[0]
 }
 
+// unescapeInterpWord resolves the escapes of a %I word that carries no
+// interpolation, so `%I[a\ b]` is the symbol :"a b" and not the four characters
+// a \ space b. A %I list interpolates, so its escape set is the double-quoted
+// one; the word is re-lexed as a double-quoted string to reuse that decoder.
+// (ruby -e 'p %I[a\ b]' => [:"a b"])
+func unescapeInterpWord(w string) string {
+	if !strings.Contains(w, `\`) {
+		return w
+	}
+	toks := New(`"` + wrapHeredocDQ(w) + `"`).Tokenize()
+	if len(toks) == 2 && toks[0].Type == token.STRING && toks[1].Type == token.EOF {
+		return toks[0].Lit
+	}
+	return w
+}
+
 // splitPercentWords splits a %W/%I body on whitespace, keeping whitespace that
-// falls inside a #{…} interpolation as part of the word.
+// is escaped, or that falls inside a #{…} interpolation, as part of the word.
+//
+// Escapes are left in place rather than resolved: each word is re-lexed as a
+// double-quoted string, whose decoder already implements the full escape set
+// MRI applies to an interpolating list (parse.y, str_dword: read_escape). The
+// one divergence is a backslash before a newline — MRI's QWORDS test precedes
+// its EXPAND test, so in %W that is a literal newline rather than the line
+// continuation it would be in a string — so it is rewritten to `\n` here.
+// (ruby -e 'p %W[a\<newline>b]' => ["a\nb"])
 func splitPercentWords(s string) []string {
 	var words []string
 	var cur []byte
@@ -1703,7 +1816,16 @@ func splitPercentWords(s string) []string {
 	}
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if depth == 0 && (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v') {
+		if depth == 0 && c == '\\' && i+1 < len(s) {
+			if d := s[i+1]; d == '\n' {
+				cur = append(cur, '\\', 'n')
+			} else {
+				cur = append(cur, '\\', d)
+			}
+			i++
+			continue
+		}
+		if depth == 0 && isWordListSpace(c) {
 			flush()
 			continue
 		}
