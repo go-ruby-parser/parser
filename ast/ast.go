@@ -414,14 +414,29 @@ type FindPattern struct {
 // Alias is `alias NewName OldName` — it makes NewName an alias of an existing
 // method (or global variable). Each name is the bare method/symbol/global text
 // without a leading colon.
+//
+// MRI's `fitem` admits a dynamic symbol (`alias :"#{x}" y`), whose name is only
+// known at run time. Such a name arrives in NewNameExpr/OldNameExpr, with the
+// matching string field empty; the expression evaluates to the symbol. Both Expr
+// fields are nil for the ordinary all-static form.
 type Alias struct {
-	NewName string
-	OldName string
+	NewName     string
+	OldName     string
+	NewNameExpr Node
+	OldNameExpr Node
 }
 
 // Undef is `undef name [, name…]` — it removes the named method(s) from the
 // current class/module. Names hold the bare method names.
-type Undef struct{ Names []string }
+//
+// A dynamic symbol (`undef :"#{x}"`) has an empty string at its position in
+// Names and its expression at the same index of Exprs. Exprs is nil when every
+// name is static, and otherwise has exactly len(Names) entries, nil at each
+// static position.
+type Undef struct {
+	Names []string
+	Exprs []Node
+}
 
 // Retry restarts the enclosing begin body from inside a rescue clause.
 type Retry struct{}

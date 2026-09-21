@@ -965,32 +965,64 @@ func (p *Parser) parseReturn() ast.Node {
 // a global variable. The two names are separated by whitespace, not a comma.
 func (p *Parser) parseAlias() ast.Node {
 	p.expect(token.ALIAS)
-	return &ast.Alias{NewName: p.parseFitem(), OldName: p.parseFitem()}
+	newName, newExpr := p.parseFitem()
+	oldName, oldExpr := p.parseFitem()
+	return &ast.Alias{NewName: newName, OldName: oldName, NewNameExpr: newExpr, OldNameExpr: oldExpr}
 }
 
 // parseUndef parses `undef name [, name…]`, removing the named methods.
 func (p *Parser) parseUndef() ast.Node {
 	p.expect(token.UNDEF)
-	names := []string{p.parseFitem()}
-	for p.accept(token.COMMA) {
-		names = append(names, p.parseFitem())
+	var names []string
+	var exprs []ast.Node
+	dynamic := false
+	for {
+		name, expr := p.parseFitem()
+		names = append(names, name)
+		exprs = append(exprs, expr)
+		dynamic = dynamic || expr != nil
+		if !p.accept(token.COMMA) {
+			break
+		}
 	}
-	return &ast.Undef{Names: names}
+	if !dynamic {
+		return &ast.Undef{Names: names}
+	}
+	return &ast.Undef{Names: names, Exprs: exprs}
 }
 
 // parseFitem reads one method-name item for alias/undef: a symbol (`:foo`,
-// `:==`), a global variable (`$x`, alias only), or a bare method name — an
-// identifier, a constant, a reserved word, or an operator (`==`, `<=>`, `[]`).
-func (p *Parser) parseFitem() string {
+// `:==`), a global variable (`$x`, alias only), a bare method name — an
+// identifier, a constant, a reserved word, or an operator (`==`, `<=>`, `[]`) —
+// or a dynamic symbol (`:"#{x}"`), which is returned as an expression instead
+// of a name.
+//
+// MRI: `fitem: fname | symbol` with `symbol: ssym | dsym` and
+// `dsym: tSYMBEG string_contents tSTRING_END` (parse.y v3_4_0), so an
+// interpolated symbol is an ordinary alias/undef name. The lexer has already
+// desugared `:"…#{…}…"` into the equivalent `"…".to_sym`, which is why the item
+// begins with a STRBEG here; a symbol with no interpolation is a plain SYMBOL.
+func (p *Parser) parseFitem() (string, ast.Node) {
 	switch p.cur().Type {
 	case token.SYMBOL, token.GVAR:
-		return p.advance().Lit
+		return p.advance().Lit, nil
+	case token.STRBEG:
+		// Take exactly the desugared `"…".to_sym` and no more: the name that
+		// follows an alias's first item (`alias :"#{x}" v`) must not be read as a
+		// paren-less argument of to_sym.
+		str := p.parseStringConcat()
+		if !p.is(token.DOT) || p.peekTok().Lit != "to_sym" {
+			p.fail("expected a method name")
+		}
+		p.advance() // .
+		p.advance() // to_sym
+		return "", &ast.Call{Recv: str, Name: "to_sym"}
 	}
 	if name, ok := p.parseDefName(); ok {
-		return name
+		return name, nil
 	}
 	p.fail("expected a method name")
-	return ""
+	return "", nil
 }
 
 func (p *Parser) parseBreak() ast.Node {
