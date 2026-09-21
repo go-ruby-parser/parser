@@ -106,3 +106,79 @@ func TestParenGroupShape(t *testing.T) {
 		t.Fatalf("expected *ast.IntLit for (1), got %T", prog.Body[0])
 	}
 }
+
+// TestLambdaBodyBraceAfterUnparenthesisedParams covers the `{` that closes an
+// unparenthesised stabby-lambda parameter list. MRI decides this in the lexer:
+// `p->lex.lpar_beg = p->lex.paren_nest` is recorded at the `->`, and a later `{`
+// is tLAMBEG — the lambda body — exactly when `lambda_beginning_p()`
+// (`p->lex.lpar_beg == p->lex.paren_nest`) holds (parse.y v3_4_0). So in
+// `-> a=a() { a }` the brace opens the body, not a block on the `a()` call;
+// inside a still-open bracket it is an ordinary block again.
+func TestLambdaBodyBraceAfterUnparenthesisedParams(t *testing.T) {
+	t.Parallel()
+
+	t.Run("brace closes the parameter list", func(t *testing.T) {
+		t.Parallel()
+		src := `-> a=a() { a }`
+		n := lambdaNode(t, src)
+		call, ok := n.(*ast.Call)
+		if !ok || call.Name != "lambda" || call.Block == nil {
+			t.Fatalf("Parse(%q): node = %T, want the lambda call with a block", src, n)
+		}
+		if len(call.Block.Params) != 1 || call.Block.Params[0] != "a" {
+			t.Errorf("Parse(%q): params = %q, want [a]", src, call.Block.Params)
+		}
+		if len(call.Block.Defaults) != 1 {
+			t.Fatalf("Parse(%q): %d defaults, want 1", src, len(call.Block.Defaults))
+		}
+		def, ok := call.Block.Defaults[0].(*ast.Call)
+		if !ok {
+			t.Fatalf("Parse(%q): default = %T, want *ast.Call", src, call.Block.Defaults[0])
+		}
+		if def.Block != nil {
+			t.Errorf("Parse(%q): the brace was attached to the default's call as a block", src)
+		}
+		if len(call.Block.Body) != 1 {
+			t.Errorf("Parse(%q): %d body statements, want 1", src, len(call.Block.Body))
+		}
+	})
+
+	t.Run("an open bracket restores ordinary blocks", func(t *testing.T) {
+		t.Parallel()
+		for _, src := range []string{
+			`-> x = ([1].map { |v| v }) { x }`,  // parenthesised group
+			`-> x = f([1].map { |v| v }) { x }`, // parenthesised argument list
+			`->(a = [1].map { |v| v }) { a }`,   // parenthesised parameter list
+		} {
+			call, ok := lambdaNode(t, src).(*ast.Call)
+			if !ok || call.Block == nil {
+				t.Fatalf("Parse(%q): want the lambda call with a block", src)
+			}
+			if len(call.Block.Body) != 1 {
+				t.Errorf("Parse(%q): %d body statements, want 1", src, len(call.Block.Body))
+			}
+		}
+	})
+
+	t.Run("blocks elsewhere are unaffected", func(t *testing.T) {
+		t.Parallel()
+		for _, src := range []string{`foo.map { |x| x }`, `[1].each { |x| x }`, `->x { x }`} {
+			if _, err := Parse(src); err != nil {
+				t.Errorf("Parse(%q) returned error: %v", src, err)
+			}
+		}
+	})
+}
+
+// lambdaNode parses src and returns its single top-level statement.
+func lambdaNode(t *testing.T, src string) ast.Node {
+	t.Helper()
+	prog, err := Parse(src)
+	if err != nil {
+		t.Fatalf("Parse(%q) returned error: %v", src, err)
+	}
+	if len(prog.Body) != 1 {
+		t.Fatalf("Parse(%q): want 1 statement, got %d", src, len(prog.Body))
+	}
+	return prog.Body[0]
+}

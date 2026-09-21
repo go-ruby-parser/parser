@@ -118,6 +118,18 @@ type Parser struct {
 	// nested delimited context (a parenthesised group, a `(…)`/`[…]` argument list,
 	// a `{…}` hash), where an inner modifier-`rescue` is again allowed.
 	noRescueMod bool
+	// noBraceBlock suppresses `{ … }` block attachment while parsing the
+	// unparenthesised parameter list of a stabby lambda: there the next `{` at
+	// the lambda's own bracket nesting opens the lambda BODY, so `-> a=a() { a }`
+	// is a lambda whose body is `a`, not a call `a() { a }`. MRI decides this in
+	// the lexer, by comparing the bracket nesting against the one recorded at the
+	// `->` (parse.y v3_4_0: `lambda_beginning_p()` is
+	// `p->lex.lpar_beg == p->lex.paren_nest`, with `p->lex.lpar_beg =
+	// p->lex.paren_nest` at the `->`, and paren_nest counting `(`, `[` and `{`).
+	// enterBracket clears it inside any still-open bracket, which is why
+	// `-> x = ([1].map { |v| v }) { x }` keeps its inner block while the same
+	// expression without the parentheses is a syntax error in MRI too.
+	noBraceBlock bool
 	// bracketDepth > 0 while parsing a parenthesised call-argument list or a hash
 	// literal, where newlines are insignificant. A `key:` whose value sits on the
 	// next line (`f(`⏎`  k:`⏎`    v)`) is then a continued pair, not a value-omitted
@@ -204,6 +216,16 @@ func (p *Parser) expect(tt token.Type) token.Token {
 func (p *Parser) fail(format string, args ...any) ast.Node {
 	t := p.cur()
 	panic(parseError{msg: fmt.Sprintf("parse error at line %d: %s", t.Line, fmt.Sprintf(format, args...))})
+}
+
+// enterBracket marks the parser as being inside a still-open bracket and
+// returns the function restoring the previous state; use it as
+// `defer p.enterBracket()()`. Only noBraceBlock depends on bracket nesting: a
+// `{` inside a bracket is an ordinary block again, never a lambda body.
+func (p *Parser) enterBracket() func() {
+	saved := p.noBraceBlock
+	p.noBraceBlock = false
+	return func() { p.noBraceBlock = saved }
 }
 
 func (p *Parser) skipNewlines() {
@@ -2459,7 +2481,7 @@ func (p *Parser) parsePostfixTail(node ast.Node) ast.Node {
 			args := p.parseCallArgs(token.RBRACKET)
 			p.expect(token.RBRACKET)
 			node = &ast.Call{Recv: node, Name: "[]", Args: args}
-		case p.is(token.LBRACE) || (p.is(token.DO) && !p.noDo):
+		case (p.is(token.LBRACE) && !p.noBraceBlock) || (p.is(token.DO) && !p.noDo):
 			// A block binds to the immediately preceding method call; chaining
 			// then continues (`recv.map { … }.join`). A `super` also takes a block
 			// (`super { … }`, `super(x) do … end`).
@@ -2590,15 +2612,23 @@ func (p *Parser) parseLambda() ast.Node {
 	splat := -1
 	if p.accept(token.LPAREN) {
 		// The stabby-lambda `(...)` list shares the block parameter grammar, so it
-		// supports the same optional, *splat, &block, and destructuring forms.
+		// supports the same optional, *splat, &block, and destructuring forms. The
+		// parenthesis is an open bracket, so a `{` inside is an ordinary block.
+		restore := p.enterBracket()
 		params, defaults, prepends, splat, blockParam = p.parseBlockParams(token.RPAREN)
+		restore()
 		p.expect(token.RPAREN)
 		p.scope().explicitParams = true
 	} else if p.is(token.IDENT) || p.is(token.STAR) || p.is(token.POW) || p.is(token.AMPER) {
 		// Unparenthesized parameters: `->x { }`, `-> ctx { }`, `->a, b { }`,
 		// `-> message do … end`. The list runs up to the block opener (`{`/`do`);
-		// parseBlockParams stops at the first token that is not a parameter.
+		// parseBlockParams stops at the first token that is not a parameter. A `{`
+		// reached at this nesting is the lambda body, not a block on whatever the
+		// last default expression called: `-> a=a() { a }` (see noBraceBlock).
+		savedBrace := p.noBraceBlock
+		p.noBraceBlock = true
 		params, defaults, prepends, splat, blockParam = p.parseBlockParams(token.LBRACE)
+		p.noBraceBlock = savedBrace
 		p.scope().explicitParams = true
 	}
 	bs := p.scope()
@@ -2980,7 +3010,9 @@ func (p *Parser) parsePrimary() ast.Node {
 		// semicolon/newline-separated statements (`(a; b)`), evaluating to the
 		// last. A single statement returns directly; a sequence is wrapped in a
 		// Begin (whose value is its last expression).
+		restore := p.enterBracket()
 		stmts := p.parseStatements(map[token.Type]bool{token.RPAREN: true})
+		restore()
 		p.expect(token.RPAREN)
 		if len(stmts) == 1 {
 			return stmts[0]
@@ -3325,6 +3357,7 @@ func (p *Parser) parseCallArgs(until token.Type) []ast.Node {
 	// less parseCommandArgs and def parameter-default handling.
 	savedMasgn := p.noMasgn
 	p.noMasgn = true
+	defer p.enterBracket()()
 	defer func() { p.bracketDepth--; p.noRescueMod = savedRescue; p.noMasgn = savedMasgn }()
 	var args []ast.Node
 	var kw *ast.HashLit
