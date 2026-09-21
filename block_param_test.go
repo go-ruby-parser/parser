@@ -60,3 +60,41 @@ func TestDefBlockParamUnchanged(t *testing.T) {
 		t.Errorf("MethodDef.BlockParam=%q, want %q", def.BlockParam, "b")
 	}
 }
+
+// TestBlockLocalsAreCarriedOnTheBlock pins that the block-local list after the
+// `;` reaches the AST. MRI's `opt_bv_decl: '\n'? ';' bv_decls '\n'?` with
+// `bvar: tIDENTIFIER { new_bv(p, $1); }` (parse.y v3_4_0) adds each name to the
+// block's own local table, where it is nil-valued and shadows any enclosing
+// binding — so a consumer needs the names to give them slots.
+func TestBlockLocalsAreCarriedOnTheBlock(t *testing.T) {
+	for _, tc := range []struct {
+		src    string
+		params []string
+		locals []string
+	}{
+		{`f { |one; bl| bl }`, []string{"one"}, []string{"bl"}},
+		{`f { |one; bl, bl2| bl }`, []string{"one"}, []string{"bl", "bl2"}},
+		{`f { |one| one }`, []string{"one"}, nil},
+	} {
+		prog, err := parser.Parse(tc.src)
+		if err != nil {
+			t.Fatalf("Parse(%q) error: %v", tc.src, err)
+		}
+		call, ok := prog.Body[0].(*ast.Call)
+		if !ok || call.Block == nil {
+			t.Fatalf("Parse(%q): want a call with a block", tc.src)
+		}
+		if got := call.Block.Locals; len(got) != len(tc.locals) {
+			t.Errorf("Parse(%q): locals = %q, want %q", tc.src, got, tc.locals)
+		} else {
+			for i, w := range tc.locals {
+				if got[i] != w {
+					t.Errorf("Parse(%q): local %d = %q, want %q", tc.src, i, got[i], w)
+				}
+			}
+		}
+		if len(call.Block.Params) != len(tc.params) {
+			t.Errorf("Parse(%q): params = %q, want %q", tc.src, call.Block.Params, tc.params)
+		}
+	}
+}

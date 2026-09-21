@@ -113,7 +113,13 @@ type Block struct {
 	Defaults   []Node // parallel to Params; nil for a required or *splat param
 	SplatIndex int    // index of the top-level *splat param in Params, or -1
 	BlockParam string // name of the &block param, or "" if none (parallels MethodDef.BlockParam)
-	Body       []Node
+	// Locals are the block-local variables declared after a `;` in the parameter
+	// list (`{ |a; x, y| … }`): fresh, nil-valued locals of this block that shadow
+	// any enclosing binding of the same name. MRI: `opt_bv_decl: '\n'? ';'
+	// bv_decls '\n'?` with `bvar: tIDENTIFIER { new_bv(p, $1); }`. Empty when the
+	// list has no `;` part.
+	Locals []string
+	Body   []Node
 }
 
 // Yield invokes the block passed to the enclosing method.

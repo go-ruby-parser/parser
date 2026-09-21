@@ -2701,6 +2701,7 @@ func (p *Parser) parseBlockRest(stop map[token.Type]bool, end token.Type, withRe
 	var params []string
 	var defaults, prepends []ast.Node
 	var blockParam string
+	var locals []string
 	splat := -1
 	// The `|params|` list may start on the line(s) after the block opener:
 	// `foo {`<nl>`|x| … }`, `do`<nl>`|a, b| … end`. Skip the intervening newlines
@@ -2720,7 +2721,7 @@ func (p *Parser) parseBlockRest(stop map[token.Type]bool, end token.Type, withRe
 		// the body sees them, but carried no further than the parameter list.
 		if p.is(token.NEWLINE) {
 			p.advance()
-			p.parseBlockLocals()
+			locals = p.parseBlockLocals()
 		}
 		p.expect(token.PIPE)
 		p.scope().explicitParams = true
@@ -2745,21 +2746,27 @@ func (p *Parser) parseBlockRest(stop map[token.Type]bool, end token.Type, withRe
 	if len(prepends) > 0 {
 		body = append(prepends, body...)
 	}
-	return &ast.Block{Params: params, Defaults: defaults, SplatIndex: splat, BlockParam: blockParam, Body: body}
+	return &ast.Block{Params: params, Defaults: defaults, SplatIndex: splat, BlockParam: blockParam, Locals: locals, Body: body}
 }
 
 // parseBlockLocals parses the block-local variable list after the `;` in a block
-// parameter list (`|a, b; x, y|`). Each name is declared in the current block
-// scope so the body resolves it as a local; the list is otherwise discarded
-// since block-locals carry no arity or default.
-func (p *Parser) parseBlockLocals() {
+// parameter list (`|a, b; x, y|`) and returns the names. Each is declared in the
+// current block scope so the body resolves it as a local, and carried on the
+// Block so a consumer can give it a slot: MRI's `opt_bv_decl: '\n'? ';' bv_decls
+// '\n'?` with `bvar: tIDENTIFIER { new_bv(p, $1); }` (parse.y v3_4_0) adds each
+// to the block's own local table, where it starts out nil and shadows any
+// enclosing binding of the same name. They carry no arity and no default.
+func (p *Parser) parseBlockLocals() []string {
+	var locals []string
 	for {
 		name := p.expect(token.IDENT).Lit
 		p.declareLocal(name)
+		locals = append(locals, name)
 		if !p.accept(token.COMMA) {
 			break
 		}
 	}
+	return locals
 }
 
 // parseBlockParams parses a block's parameter list (the `|...|` form for brace/do
