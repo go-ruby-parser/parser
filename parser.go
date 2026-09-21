@@ -130,6 +130,17 @@ type Parser struct {
 	// `-> x = ([1].map { |v| v }) { x }` keeps its inner block while the same
 	// expression without the parentheses is a syntax error in MRI too.
 	noBraceBlock bool
+	// argParenEnd is the token index just past the `)` that closed a SPACED
+	// parenthesised group standing as the FIRST token of a paren-less command
+	// argument list — MRI's tLPAREN_ARG, whose `)` sets EXPR_ENDARG (parse.y
+	// v3_4_0: `primary: tLPAREN_ARG compstmt {SET_LEX_STATE(EXPR_ENDARG);} ')'`).
+	// A `{` reached in that state lexes as tLBRACE_ARG, and the grammar gives it
+	// to the COMMAND through `command: primary_value call_op operation2
+	// command_args cmd_brace_block` (3464-3480), not to the group. So
+	// `o.s (:a){ 1 }` yields the block to `s`, while `f g(1) { 2 }` — a hugging
+	// paren, hence EXPR_END — yields it to `g(1)`. It is an absolute index, so a
+	// stale value is inert: the cursor only moves forward.
+	argParenEnd int
 	// bracketDepth > 0 while parsing a parenthesised call-argument list or a hash
 	// literal, where newlines are insignificant. A `key:` whose value sits on the
 	// next line (`f(`⏎`  k:`⏎`    v)`) is then a continued pair, not a value-omitted
@@ -147,7 +158,7 @@ var parseHook func()
 // parse error rather than propagating to the caller.
 func Parse(src string) (prog *ast.Program, err error) {
 	toks := lexer.New(src).Tokenize()
-	p := &Parser{toks: toks, scopes: []*scope{newScope(true)}}
+	p := &Parser{toks: toks, scopes: []*scope{newScope(true)}, argParenEnd: -1}
 	defer func() {
 		if r := recover(); r != nil {
 			if pe, ok := r.(parseError); ok {
@@ -222,6 +233,21 @@ func (p *Parser) fail(format string, args ...any) ast.Node {
 // returns the function restoring the previous state; use it as
 // `defer p.enterBracket()()`. Only noBraceBlock depends on bracket nesting: a
 // `{` inside a bracket is an ordinary block again, never a lambda body.
+// atCommandBrace reports whether the cursor sits on the `{` that MRI lexes as
+// tLBRACE_ARG: the one immediately after the `)` recorded in argParenEnd. Such a
+// brace opens the command's block, so no inner call may take it.
+func (p *Parser) atCommandBrace() bool {
+	return p.is(token.LBRACE) && p.pos == p.argParenEnd
+}
+
+// attachCommandBrace gives that `{ … }` to the command call being built, which
+// is what `command_args cmd_brace_block` does in MRI's grammar.
+func (p *Parser) attachCommandBrace(block **ast.Block) {
+	if *block == nil && p.atCommandBrace() {
+		*block = p.parseBraceBlock()
+	}
+}
+
 func (p *Parser) enterBracket() func() {
 	saved := p.noBraceBlock
 	p.noBraceBlock = false
@@ -2417,6 +2443,7 @@ func (p *Parser) parsePostfixTail(node ast.Node) ast.Node {
 				// as MRI attaches it to the outermost command rather than to an
 				// argument call.
 				call := &ast.Call{Recv: node, Name: name, Args: p.parseCommandArgs(), Safe: safe}
+				p.attachCommandBrace(&call.Block)
 				if p.is(token.DO) && !p.noDo {
 					call.Block = p.parseDoBlock()
 					// The block-bearing command call may itself be chained
@@ -2448,6 +2475,7 @@ func (p *Parser) parsePostfixTail(node ast.Node) ast.Node {
 				// scoped constant (`Math::PI`).
 				if p.canStartCommandArg() || p.atHuggingStringArg() {
 					call := &ast.Call{Recv: node, Name: name, Args: p.parseCommandArgs()}
+					p.attachCommandBrace(&call.Block)
 					if p.is(token.DO) && !p.noDo {
 						call.Block = p.parseDoBlock()
 						node = call
@@ -2468,6 +2496,7 @@ func (p *Parser) parsePostfixTail(node ast.Node) ast.Node {
 			} else if p.canStartCommandArg() || p.atHuggingStringArg() {
 				// Paren-less scope-resolution command call: `Mod::meth arg`.
 				call := &ast.Call{Recv: node, Name: name, Args: p.parseCommandArgs()}
+				p.attachCommandBrace(&call.Block)
 				if p.is(token.DO) && !p.noDo {
 					call.Block = p.parseDoBlock()
 					node = call
@@ -2481,7 +2510,8 @@ func (p *Parser) parsePostfixTail(node ast.Node) ast.Node {
 			args := p.parseCallArgs(token.RBRACKET)
 			p.expect(token.RBRACKET)
 			node = &ast.Call{Recv: node, Name: "[]", Args: args}
-		case (p.is(token.LBRACE) && !p.noBraceBlock) || (p.is(token.DO) && !p.noDo):
+		case (p.is(token.LBRACE) && !p.noBraceBlock && !p.atCommandBrace()) ||
+			(p.is(token.DO) && !p.noDo):
 			// A block binds to the immediately preceding method call; chaining
 			// then continues (`recv.map { … }.join`). A `super` also takes a block
 			// (`super { … }`, `super(x) do … end`).
@@ -2820,27 +2850,22 @@ func (p *Parser) parseBlockParams(until token.Type) (names []string, defaults, p
 				names = append(names, "*")
 			}
 			defaults = append(defaults, nil)
-		} else if p.accept(token.LPAREN) {
-			var gnames []string
-			gsplat := -1
-			for {
-				if p.accept(token.STAR) {
-					gsplat = len(gnames)
-				}
-				gn := p.expect(token.IDENT).Lit
-				gnames = append(gnames, gn)
-				p.declareLocal(gn)
-				if !p.accept(token.COMMA) {
-					break
-				}
-			}
-			p.expect(token.RPAREN)
-			syn := "(" + strconv.Itoa(group) + ")"
-			group++
-			names = append(names, syn)
+		} else if p.is(token.LPAREN) {
+			// A parenthesised destructuring parameter, which nests: MRI's
+			// `f_marg: f_norm_arg | tLPAREN f_margs rparen` (parse.y v3_4_0) puts
+			// f_marg back inside f_margs, so `|a, (b, (c, d))|` is as legal as
+			// `|a, (b, c)|`. parseDestructureParam is the shared implementation —
+			// the `def` parameter list already used it; this list had a flat copy
+			// that could only read identifiers one level down.
+			outer, chained := p.parseDestructureParam(&group)
+			names = append(names, outer.Values[0].(*ast.VarRef).Name)
 			defaults = append(defaults, nil)
-			p.declareLocal(syn)
-			prepends = append(prepends, &ast.MultiAssign{Names: gnames, SplatIndex: gsplat, Values: []ast.Node{&ast.VarRef{Name: syn}}})
+			// The outer unpack binds the inner synthetics first; the chained inner
+			// unpacks then read them.
+			prepends = append(prepends, outer)
+			for _, c := range chained {
+				prepends = append(prepends, c)
+			}
 		} else {
 			name := p.expect(token.IDENT).Lit
 			names = append(names, name)
@@ -3154,6 +3179,7 @@ func (p *Parser) parseIdentExpr() ast.Node {
 	if p.huggingStringArg() {
 		p.advance() // name
 		call := &ast.Call{Name: name, Args: p.parseCommandArgs()}
+		p.attachCommandBrace(&call.Block)
 		if p.is(token.DO) && !p.noDo {
 			call.Block = p.parseDoBlock()
 		}
@@ -3172,6 +3198,7 @@ func (p *Parser) parseIdentExpr() ast.Node {
 		}
 		if p.localCommandArgFollows() {
 			call := &ast.Call{Name: name, Args: p.parseCommandArgs()}
+			p.attachCommandBrace(&call.Block)
 			if p.is(token.DO) && !p.noDo {
 				call.Block = p.parseDoBlock()
 			}
@@ -3194,7 +3221,9 @@ func (p *Parser) parseIdentExpr() ast.Node {
 	// Otherwise it is a method call on self.
 	p.advance()
 	if p.canStartCommandArg() {
-		return &ast.Call{Name: name, Args: p.parseCommandArgs()}
+		call := &ast.Call{Name: name, Args: p.parseCommandArgs()}
+		p.attachCommandBrace(&call.Block)
+		return call
 	}
 	// Bare `it` (no receiver, no args) inside a param-less block is the implicit
 	// single parameter (Ruby 3.4). With args/parens — or a block, as in RSpec's
@@ -3309,6 +3338,17 @@ func (p *Parser) canStartCommandArg() bool {
 // keyword/hash-pair forms a parenthesized call does, collapsing trailing
 // `key: value` / `expr => value` pairs into one implicit Hash argument.
 func (p *Parser) parseCommandArgs() []ast.Node {
+	// A leading SPACED `(` opens MRI's tLPAREN_ARG group, whose `)` puts the
+	// lexer in EXPR_ENDARG so that a `{` right after it belongs to this command
+	// rather than to anything inside the group (see argParenEnd). Record where
+	// that `)` is before parsing, and restore the value on the way out so a
+	// nested command's own record does not outlive it.
+	argParen := -1
+	if p.is(token.LPAREN) && p.cur().SpaceBefore {
+		argParen = p.scanBalanced(p.pos, token.LPAREN, token.RPAREN)
+	}
+	p.argParenEnd = argParen
+	defer func() { p.argParenEnd = argParen }()
 	// A trailing `do…end` binds to the command call, not to an argument that is
 	// itself a call (`foo bar do…end` → the block is foo's). Suppress block
 	// attachment while parsing the arguments so the enclosing postfix chain picks
