@@ -12,7 +12,7 @@ func firstType(src string) token.Type {
 }
 
 // TestPercentNonDelimiters checks that a character that cannot delimit a
-// percent-literal (an alphanumeric, whitespace, '=', or a multi-byte UTF-8 lead)
+// percent-literal (an alphanumeric, whitespace, or a multi-byte UTF-8 lead)
 // leaves the '%' as the modulo/percent operator rather than opening a literal.
 // This exercises every false branch of isPercentDelim.
 func TestPercentNonDelimiters(t *testing.T) {
@@ -29,7 +29,7 @@ func TestPercentNonDelimiters(t *testing.T) {
 	}
 	// A bare `%` followed by a non-delimiter is the percent operator.
 	for _, src := range []string{
-		"%=",  // compound-assignment, never a literal
+		"%",   // end of input: no delimiter byte at all
 		"%9",  // digit
 		"%a",  // alpha (not q/Q/w/i/r/x/s)
 		"% ",  // space
@@ -64,6 +64,27 @@ func TestPercentDelimiterAccepted(t *testing.T) {
 	for src, want := range cases {
 		if got := firstType(src); got != want {
 			t.Errorf("%q: first token = %s, want %s", src, got, want)
+		}
+	}
+}
+
+// TestPercentEqualsIsOpAssignAfterAValue pins the state-dependent half of
+// percentDelimOK: after a value MRI's parse_percent reaches its `'='` test
+// before the quotation branch, so `%=` is the modulo compound assignment.
+func TestPercentEqualsIsOpAssignAfterAValue(t *testing.T) {
+	toks := New("a %= 2").Tokenize()
+	if toks[1].Type != token.OPASSIGN || toks[1].Lit != "%" {
+		t.Errorf("a %%= 2: second token = %s %q, want OPASSIGN %q", toks[1].Type, toks[1].Lit, "%")
+	}
+}
+
+// TestPercentEqualsDelimitsAtExpressionBegin is the other half: where a value is
+// expected, `=` delimits the literal.
+func TestPercentEqualsDelimitsAtExpressionBegin(t *testing.T) {
+	for _, src := range []string{"%=hey=", "%q=hey=", "%w=a b="} {
+		toks := New(src).Tokenize()
+		if toks[0].Type == token.OPASSIGN || toks[0].Type == token.ILLEGAL {
+			t.Errorf("%q: first token = %s, want a literal", src, toks[0].Type)
 		}
 	}
 }

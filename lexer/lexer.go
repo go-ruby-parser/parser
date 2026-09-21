@@ -1414,6 +1414,20 @@ func (l *Lexer) percentBeginsLiteral(spaceBefore bool) bool {
 	return spaceBefore
 }
 
+// percentDelimOK reports whether b may delimit a %-literal starting at the
+// cursor. MRI accepts every non-alphanumeric ASCII character as a delimiter
+// (parse.y v3_4_0, parse_percent: `if (!ISALNUM(c)) { term = c; … c = 'Q'; }`),
+// but only reaches that code at expression-begin: everywhere else the op-assign
+// test runs first (`if ((c = nextc(p)) == '=') … return tOP_ASGN;`). So `%=`
+// opens a literal where a value is expected (`%=hey=.length`) and stays the
+// modulo op-assign after one (`a %= 2`).
+func (l *Lexer) percentDelimOK(b byte) bool {
+	if b == '=' {
+		return l.state == exprBegin
+	}
+	return isPercentDelim(b)
+}
+
 // atPercentArray reports whether the cursor (positioned at '%') begins a
 // %w/%i array literal: the kind letter must be followed by a delimiter.
 func (l *Lexer) atPercentArray() bool {
@@ -1422,7 +1436,7 @@ func (l *Lexer) atPercentArray() bool {
 	default:
 		return false
 	}
-	return l.pos+2 < len(l.src) && isPercentDelim(l.src[l.pos+2])
+	return l.pos+2 < len(l.src) && l.percentDelimOK(l.src[l.pos+2])
 }
 
 // lexPercentArray lexes a %w/%i/%W/%I array literal. The non-interpolating
@@ -1456,6 +1470,13 @@ func (l *Lexer) lexPercentArray(spaceBefore bool, line, col int) token.Token {
 				return unterminated
 			}
 			content = append(content, l.advance())
+			continue
+		}
+		if (kind == 'W' || kind == 'I') && c == '#' && l.peek2() == '{' {
+			// As in lexPercentString: an interpolation is copied verbatim so a
+			// delimiter character inside it cannot close the list.
+			content = append(content, l.advance(), l.advance()) // '#' '{'
+			content = l.copyInterpolation(content)
 			continue
 		}
 		if open != closing && c == open {
@@ -1552,14 +1573,15 @@ func splitWordList(body string, open, closing byte) []string {
 	return words
 }
 
-// isPercentDelim reports whether b can open a %-literal. MRI accepts any
-// non-alphanumeric character as the delimiter (`%r"..."`, `%q[...]`, `%w'a b'`,
-// `%i<x y>`, `%(...)`, `%!...!`, `%|...|`, `%@...@`, …); a bracket pair nests.
-// Excluded: alphanumerics (they would be the literal's body), whitespace, and
-// `=` so a `%=` compound assignment is never mistaken for a literal opener.
+// isPercentDelim reports whether b can open a %-literal irrespective of the
+// lexer state. MRI accepts any non-alphanumeric character as the delimiter
+// (`%r"..."`, `%q[...]`, `%w'a b'`, `%i<x y>`, `%(...)`, `%!...!`, `%|...|`,
+// `%@...@`, …); a bracket pair nests. Excluded: alphanumerics (they would be
+// the literal's body) and whitespace. `=` is state-dependent and is decided by
+// percentDelimOK, which is what the call sites use.
 func isPercentDelim(b byte) bool {
 	switch {
-	case b == 0 || b == '=':
+	case b == 0:
 		return false
 	case b == ' ' || b == '\t' || b == '\n' || b == '\r' || b == '\f' || b == '\v':
 		return false
@@ -1582,7 +1604,7 @@ func (l *Lexer) atPercentRXS() bool {
 	default:
 		return false
 	}
-	return l.pos+2 < len(l.src) && isPercentDelim(l.src[l.pos+2])
+	return l.pos+2 < len(l.src) && l.percentDelimOK(l.src[l.pos+2])
 }
 
 // lexPercentRXS lexes a %r{…}flags regexp, %x{…} backtick command, or %s{…}
@@ -1672,9 +1694,9 @@ func (l *Lexer) lexPercentRXS(spaceBefore bool, line, col int) token.Token {
 // followed by a delimiter (== %Q).
 func (l *Lexer) atPercentString() bool {
 	if c := l.peek2(); c == 'q' || c == 'Q' {
-		return l.pos+2 < len(l.src) && isPercentDelim(l.src[l.pos+2])
+		return l.pos+2 < len(l.src) && l.percentDelimOK(l.src[l.pos+2])
 	}
-	return isPercentDelim(l.peek2())
+	return l.percentDelimOK(l.peek2())
 }
 
 // lexPercentString lexes %q(…) (non-interpolating; only \<delim> and \\ escape),
@@ -1696,6 +1718,20 @@ func (l *Lexer) lexPercentString(spaceBefore bool, line, col int) token.Token {
 		if c == 0 {
 			return token.Token{Type: token.ILLEGAL, Lit: "unterminated %-string literal", Line: line, Col: col, SpaceBefore: spaceBefore}
 		}
+		if open != closing && c == open {
+			depth++
+			body = append(body, l.advance())
+			continue
+		}
+		if c == closing {
+			depth--
+			if depth == 0 {
+				l.advance() // closing delimiter
+				break
+			}
+			body = append(body, l.advance())
+			continue
+		}
 		if c == '\\' { // keep escape pairs verbatim; an escaped delimiter never nests
 			body = append(body, l.advance())
 			if l.peek() != 0 {
@@ -1703,14 +1739,15 @@ func (l *Lexer) lexPercentString(spaceBefore bool, line, col int) token.Token {
 			}
 			continue
 		}
-		if open != closing && c == open {
-			depth++
-		} else if c == closing {
-			depth--
-			if depth == 0 {
-				l.advance() // closing delimiter
-				break
-			}
+		if interp && c == '#' && l.peek2() == '{' {
+			// MRI's tokadd_string leaves the literal scan at `#{` and hands the
+			// embedded expression to the main lexer, so the terminator is never
+			// looked for inside an interpolation: `%@a #{@b}@` closes on the final
+			// '@', not on the one starting @b. Copy the whole brace-balanced
+			// interpolation verbatim instead of scanning it for the delimiter.
+			body = append(body, l.advance(), l.advance()) // '#' '{'
+			body = l.copyInterpolation(body)
+			continue
 		}
 		body = append(body, l.advance())
 	}
