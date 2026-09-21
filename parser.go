@@ -1344,7 +1344,7 @@ func (p *Parser) parseCaseIn(subject ast.Node) ast.Node {
 // form.
 func (p *Parser) parsePattern() ast.Pattern {
 	// A leading label is an implicit (brace-less) hash pattern: `in a:, b:`.
-	if p.is(token.LABEL) || p.is(token.POW) {
+	if p.atPatternLabel() || p.is(token.POW) {
 		return p.parseHashPatternBody(nil, token.NEWLINE)
 	}
 	first := p.parseArrayPatternElem()
@@ -1396,9 +1396,23 @@ func (p *Parser) parsePatternAtom() ast.Pattern {
 			p.expect(token.RPAREN)
 			return &ast.ValuePattern{Value: e}
 		}
+		// MRI pins a local (`p_var_ref: '^' tIDENTIFIER`) or a non-local
+		// (`'^' nonlocal_var`, with `nonlocal_var: tIVAR | tGVAR | tCVAR`) —
+		// parse.y v3_4_0, 5883-5897.
+		switch t := p.cur(); t.Type {
+		case token.IVAR:
+			p.advance()
+			return &ast.ValuePattern{Value: &ast.IvarRef{Name: t.Lit}}
+		case token.GVAR:
+			p.advance()
+			return &ast.ValuePattern{Value: &ast.GVarRef{Name: t.Lit}}
+		case token.CVAR:
+			p.advance()
+			return &ast.ValuePattern{Value: &ast.CVarRef{Name: t.Lit}}
+		}
 		return &ast.ValuePattern{Value: &ast.VarRef{Name: p.expect(token.IDENT).Lit}}
 	case token.LBRACKET:
-		return p.parseArrayPattern(nil)
+		return p.parseArrayPattern(nil, token.LBRACKET, token.RBRACKET)
 	case token.LBRACE:
 		return p.parseHashPattern(nil)
 	case token.IDENT:
@@ -1414,12 +1428,16 @@ func (p *Parser) parsePatternAtom() ast.Pattern {
 		// class match.
 		c := p.parsePatternConst()
 		if p.is(token.LBRACKET) {
-			return p.parseArrayPattern(c)
+			return p.parseArrayPattern(c, token.LBRACKET, token.RBRACKET)
 		}
-		if p.accept(token.LPAREN) {
-			hp := p.parseHashPatternBody(c, token.RPAREN)
-			p.expect(token.RPAREN)
-			return hp
+		if p.is(token.LPAREN) {
+			// `Const(…)` and `Const[…]` are the SAME four alternatives in MRI
+			// (parse.y v3_4_0, p_expr_basic): `p_const p_lparen p_args rparen`,
+			// `… p_find rparen`, `… p_kwargs rparen`, `p_const '(' rparen`, and the
+			// identical quartet with p_lbracket/rbracket. So `Array(0, 1, 2)` is an
+			// array pattern, exactly as `Array[0, 1, 2]` is, and `Point(x:, y:)` a
+			// hash pattern — the body decides, not the bracket.
+			return p.parseArrayPattern(c, token.LPAREN, token.RPAREN)
 		}
 		return &ast.ConstPattern{Const: c}
 	default:
@@ -1455,30 +1473,35 @@ func (p *Parser) parsePatternValue() ast.Node {
 // parseArrayPattern parses `[pat, …]`, with an optional leading constant. When
 // the bracket body begins with a label or `**`, it is a hash pattern written
 // with bracket delimiters (`Const[key:]`, deconstruct_keys), which MRI accepts.
-func (p *Parser) parseArrayPattern(constName ast.Node) ast.Pattern {
-	p.expect(token.LBRACKET)
+func (p *Parser) parseArrayPattern(constName ast.Node, open, close token.Type) ast.Pattern {
+	p.expect(open)
 	// A bracket pattern body may span several lines (`Const[`⏎`  a: 1,`⏎`]`), so
-	// newlines after the `[` and around the separating commas are insignificant.
+	// newlines after the opener and around the separating commas are insignificant.
 	p.skipNewlines()
-	if p.is(token.LABEL) || p.is(token.POW) {
-		hp := p.parseHashPatternBody(constName, token.RBRACKET)
+	if p.atPatternLabel() || p.is(token.POW) {
+		hp := p.parseHashPatternBody(constName, close)
 		p.skipNewlines()
-		p.expect(token.RBRACKET)
+		p.expect(close)
 		return hp
 	}
 	var elems []arrayElem
-	if !p.accept(token.RBRACKET) {
+	if !p.accept(close) {
 		elems = append(elems, p.parseArrayPatternElem())
 		p.skipNewlines()
 		for p.accept(token.COMMA) {
 			p.skipNewlines()
-			if p.is(token.RBRACKET) { // trailing comma
+			if p.is(close) {
+				// A trailing comma is MRI's `p_top_expr_body: p_expr ','`
+				// (parse.y v3_4_0), an array pattern with an ANONYMOUS REST: it
+				// matches any array STARTING with the listed elements, so
+				// `in [0, 1, ]` matches [0, 1, 2, 3].
+				elems = append(elems, arrayElem{splat: true})
 				break
 			}
 			elems = append(elems, p.parseArrayPatternElem())
 			p.skipNewlines()
 		}
-		p.expect(token.RBRACKET)
+		p.expect(close)
 	}
 	return p.buildArrayOrFind(constName, elems)
 }
@@ -1495,6 +1518,26 @@ func (p *Parser) parseHashPattern(constName ast.Node) ast.Pattern {
 // parseHashPatternBody parses the comma-separated entries of a hash pattern up
 // to (but not consuming) end. Entries are `label: [value-pattern]` or the
 // double-splat `**name` / `**nil`.
+// atPatternLabel reports whether the cursor opens a hash-pattern key. MRI's
+// `p_kw_label: tLABEL | tSTRING_BEG string_contents tLABEL_END` (parse.y
+// v3_4_0) accepts a quoted string followed by `:` wherever a bare label is
+// accepted, so `in {"a": 0}` is `in {a: 0}`.
+func (p *Parser) atPatternLabel() bool {
+	return p.is(token.LABEL) || (p.is(token.STRING) && p.peekTok().Type == token.COLON)
+}
+
+// patternKey reads one hash-pattern key in either of p_kw_label's two spellings
+// and returns the symbol it names. A `"a" => 1` rocket entry is deliberately not
+// accepted: ruby/spec requires `case {a: 1}; in {"a" => 1}` to raise SyntaxError.
+func (p *Parser) patternKey() string {
+	if p.is(token.STRING) && p.peekTok().Type == token.COLON {
+		key := p.advance().Lit
+		p.advance() // ':'
+		return key
+	}
+	return p.expect(token.LABEL).Lit
+}
+
 func (p *Parser) parseHashPatternBody(constName ast.Node, end token.Type) *ast.HashPattern {
 	hp := &ast.HashPattern{Const: constName}
 	for !p.is(end) && !p.is(token.NEWLINE) && !p.is(token.THEN) && !p.is(token.IF) && !p.is(token.UNLESS) {
@@ -1512,7 +1555,7 @@ func (p *Parser) parseHashPatternBody(constName ast.Node, end token.Type) *ast.H
 				}
 			}
 		} else {
-			key := p.expect(token.LABEL).Lit
+			key := p.patternKey()
 			hp.Keys = append(hp.Keys, key)
 			// `name:` with no following pattern binds local `name`; otherwise the
 			// value is a sub-pattern. A clause/entry boundary means no value.
@@ -1536,9 +1579,29 @@ func (p *Parser) parseHashPatternBody(constName ast.Node, end token.Type) *ast.H
 func (p *Parser) parseArrayPatternRest(constName ast.Node, first arrayElem) ast.Pattern {
 	elems := []arrayElem{first}
 	for p.accept(token.COMMA) {
+		if p.atPatternEnd() {
+			// The un-bracketed spelling of the same rule: `in 0, 1,` is
+			// `p_top_expr_body: p_expr ','`, an anonymous rest.
+			elems = append(elems, arrayElem{splat: true})
+			break
+		}
 		elems = append(elems, p.parseArrayPatternElem())
 	}
 	return p.buildArrayOrFind(constName, elems)
+}
+
+// atPatternEnd reports whether the cursor ends an un-bracketed pattern list, so
+// that a `,` just consumed was a trailing one. A `case/in` pattern runs up to
+// the clause body (a newline — which is what the lexer makes of the `;` in
+// `in 0, 1,;` — or `then`) or a guard (`if`/`unless`); a one-line `=>`/`in`
+// match also ends at a closing bracket or at the end of input.
+func (p *Parser) atPatternEnd() bool {
+	switch p.cur().Type {
+	case token.NEWLINE, token.EOF, token.THEN, token.IF, token.UNLESS,
+		token.RPAREN, token.RBRACKET, token.RBRACE, token.END:
+		return true
+	}
+	return false
 }
 
 // arrayElem is one parsed array-pattern element: an ordinary sub-pattern, or a
