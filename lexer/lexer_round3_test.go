@@ -88,3 +88,19 @@ func TestPercentEqualsDelimitsAtExpressionBegin(t *testing.T) {
 		}
 	}
 }
+
+// TestIgnoreCaseGlobal covers `$=`, the obsolete ignore-case flag. MRI's
+// parse_gvar (parse.y v3_4_0) lists `=` among the single-character globals that
+// lex as tGVAR, alongside `_ ~ * $ ? ! @ / \ ; , . : < > "`.
+func TestIgnoreCaseGlobal(t *testing.T) {
+	toks := New("p $=").Tokenize()
+	if toks[1].Type != token.GVAR || toks[1].Lit != "$=" {
+		t.Errorf("p $=: second token = %s %q, want GVAR %q", toks[1].Type, toks[1].Lit, "$=")
+	}
+	// An assignment to it still sees the following `=` as the operator.
+	toks = New("$= = false").Tokenize()
+	if toks[0].Type != token.GVAR || toks[0].Lit != "$=" || toks[1].Type != token.ASSIGN {
+		t.Errorf("$= = false: got %s %q then %s, want GVAR %q then ASSIGN",
+			toks[0].Type, toks[0].Lit, toks[1].Type, "$=")
+	}
+}

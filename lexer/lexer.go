@@ -984,7 +984,11 @@ func (l *Lexer) lexGvar(spaceBefore bool, line, col int) token.Token {
 		}
 	case isSpecialGvar(c):
 		// Single-character special globals: $~ $& $` $' $! $@ $/ $\ $; $, $.
-		// $< $> $? $* $$ $: $" $0 $+ (and the like). Each is exactly one byte.
+		// $< $> $? $* $$ $: $" $= $+ (and the like). Each is exactly one byte.
+		// This is MRI's parse_gvar switch (parse.y v3_4_0), whose tGVAR arm lists
+		// `_ ~ * $ ? ! @ / \ ; , . = : < > "` and whose tBACK_REF arm adds
+		// `& ` ' +`; `$=` (the obsolete ignore-case flag) belongs to it and was
+		// the one missing here, which made `p $=` a lexer error.
 		l.advance()
 	case c >= '1' && c <= '9':
 		for l.peek() >= '0' && l.peek() <= '9' {
@@ -2322,7 +2326,7 @@ func isIdentPart(c byte) bool { return isIdentStart(c) || isDigit(c) }
 func isSpecialGvar(c byte) bool {
 	switch c {
 	case '~', '&', '`', '\'', '!', '@', '/', '\\', ';', ',', '.',
-		'<', '>', '?', '*', '$', ':', '"', '+':
+		'<', '>', '?', '*', '$', ':', '"', '+', '=':
 		return true
 	}
 	return false
