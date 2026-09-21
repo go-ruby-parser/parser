@@ -147,13 +147,28 @@ type While struct {
 	Body []Node
 }
 
-// For is a `for VARS in ITER ... end` loop. Vars names the one or more loop
-// variables (`for a, b in pairs`); unlike a block, a `for` does not introduce a
-// new scope, so the variables remain visible after the loop.
+// For is a `for VARS in ITER ... end` loop. Unlike a block, a `for` does not
+// introduce a new scope, so its variables remain visible after the loop.
+//
+// MRI's loop variable is `for_var: lhs | mlhs`, i.e. any assignment target or
+// any multiple-assignment target list. The common shapes — one local, or a
+// comma-separated list of locals — are in Vars, which is what they have always
+// been. Everything else needs a node, and then Target is non-nil and Vars is
+// EMPTY, so there is only ever one place to read the loop variable from:
+//
+//   - a single non-local target (`for @v in …`, `for $v in …`, `for C in …`,
+//     `for o.a in …`, `for a[0] in …`): Target is that target, already in its
+//     assignable form (a setter call for the attribute and index forms).
+//   - any list that Vars cannot spell — one holding a `*rest` (`for a, *b in …`),
+//     a nested group (`for a, (b, c) in …`), a non-local (`for @a, b in …`), or a
+//     trailing comma (`for a, in …`, which destructures where `for a in …` does
+//     not): Target is a *MultiAssign with Values nil, the same shape a nested
+//     masgn target has.
 type For struct {
-	Vars []string
-	Iter Node
-	Body []Node
+	Vars   []string
+	Target Node
+	Iter   Node
+	Body   []Node
 }
 
 // MethodDef defines a method on the current self.

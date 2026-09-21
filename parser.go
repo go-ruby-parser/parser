@@ -958,28 +958,84 @@ func (p *Parser) parseUntil() ast.Node {
 	return &ast.While{Cond: not(cond), Body: body}
 }
 
-// parseFor parses `for VAR[, VAR…] in ITER [do] ... end`. The loop variables are
-// plain names (one or more, comma-separated) that — unlike block parameters —
-// are declared in the enclosing scope and outlive the loop, so they are recorded
-// as locals here. The iterator expression is parsed with `do…end` attachment
-// suppressed so a trailing `do` belongs to the loop, not to a call within it.
+// parseFor parses `for VARS in ITER [do] ... end`. The loop variables — unlike
+// block parameters — are declared in the enclosing scope and outlive the loop,
+// so they are recorded as locals here. The iterator expression is parsed with
+// `do…end` attachment suppressed so a trailing `do` belongs to the loop, not to
+// a call within it.
 func (p *Parser) parseFor() ast.Node {
 	p.expect(token.FOR)
-	var vars []string
-	for {
-		name := p.expect(token.IDENT).Lit
-		vars = append(vars, name)
-		p.declareLocal(name)
-		if !p.accept(token.COMMA) {
-			break
-		}
-	}
+	vars, target := p.parseForVar()
 	p.expect(token.IN)
 	iter := p.parseLoopCond()
 	p.accept(token.DO)
 	body := p.parseStatements(bodyEnd)
 	p.expect(token.END)
-	return &ast.For{Vars: vars, Iter: iter, Body: body}
+	return &ast.For{Vars: vars, Target: target, Iter: iter, Body: body}
+}
+
+// parseForVar parses MRI's `for_var: lhs | mlhs` (parse.y v3_4_0). `lhs` is any
+// assignment target, and `mlhs` the same target list a multiple assignment
+// takes, `mlhs_basic` and all: a `*rest` (`mlhs_head tSTAR mlhs_node`), nested
+// groups (`mlhs_item: tLPAREN mlhs_inner rparen`) and a trailing comma
+// (`mlhs_head: mlhs_item ','`, which is a COMPLETE mlhs and therefore
+// destructures — `for i, in [[1,2]]` binds i to 1 where `for i in [[1,2]]` binds
+// it to [1,2]).
+//
+// It returns the plain-local spelling in the first result when the list is one
+// or more plain locals with none of those features, and otherwise the general
+// target in the second (see ast.For). The two are never both set.
+func (p *Parser) parseForVar() ([]string, ast.Node) {
+	var names []string
+	var targets []ast.Node
+	onlyLocals := true
+	splat := -1
+	trailingComma := false
+	for {
+		if p.accept(token.STAR) {
+			splat = len(names)
+			onlyLocals = false
+			// A nameless rest (`for i, * in …`) is followed straight by `,` or `in`.
+			if p.is(token.COMMA) || p.is(token.IN) {
+				names = append(names, "")
+				targets = append(targets, nil)
+			} else {
+				name, tgt, _ := p.parseMlhsTarget()
+				names = append(names, name)
+				targets = append(targets, tgt)
+			}
+		} else {
+			name, tgt, local := p.parseMlhsTarget()
+			names = append(names, name)
+			targets = append(targets, tgt)
+			if !local {
+				onlyLocals = false
+			}
+		}
+		if !p.accept(token.COMMA) {
+			break
+		}
+		if p.is(token.IN) { // `for i, in …`
+			trailingComma = true
+			break
+		}
+	}
+	if splat < 0 && !trailingComma {
+		// One or more plain locals keep the Vars spelling.
+		if onlyLocals {
+			return names, nil
+		}
+		// A single target is MRI's `for_var: lhs`, which binds the whole element:
+		// `for @v in [[1,2]]` sets @v to [1,2]. Wrapping it in a one-element
+		// MultiAssign would make it an `mlhs` instead, and destructure.
+		if len(names) == 1 {
+			return nil, targets[0]
+		}
+	}
+	if onlyLocals {
+		targets = nil // Names alone suffice, as in parseMlhs
+	}
+	return nil, &ast.MultiAssign{Names: names, Targets: targets, SplatIndex: splat}
 }
 
 func (p *Parser) parseReturn() ast.Node {
