@@ -278,3 +278,65 @@ func TestMasgnSelfAttrTarget(t *testing.T) {
 		t.Errorf("self.x masgn: recv=%T, want *ast.SelfLit", call.Recv)
 	}
 }
+
+// TestParenthesisedReceiverTarget covers MRI's mlhs_node, whose receiver is any
+// primary_value: `primary_value call_op tIDENTIFIER`,
+// `primary_value '[' opt_call_args rbracket`, `primary_value tCOLON2
+// tIDENTIFIER` (parse.y v3_4_0, 3639-3652). A parenthesised expression is a
+// primary, so `(o).a, (o).a = 1, 2` is a multiple assignment — the shape
+// ruby/spec uses to pin evaluation order. A parenthesised group NOT followed by
+// a postfix chain stays a nested target list.
+func TestParenthesisedReceiverTarget(t *testing.T) {
+	for _, tc := range []struct {
+		src     string
+		targets int
+	}{
+		{`(o).a, (o).a = 1, 2`, 2},
+		{`(o)[1], x = 1, 2`, 2},
+		{`(o).a, (b, c) = 1, [2, 3]`, 2},
+	} {
+		prog, err := parser.Parse(tc.src)
+		if err != nil {
+			t.Fatalf("Parse(%q) error: %v", tc.src, err)
+		}
+		ma, ok := prog.Body[0].(*ast.MultiAssign)
+		if !ok {
+			t.Fatalf("Parse(%q): node = %T, want *ast.MultiAssign", tc.src, prog.Body[0])
+		}
+		if len(ma.Targets) != tc.targets {
+			t.Errorf("Parse(%q): %d targets, want %d", tc.src, len(ma.Targets), tc.targets)
+		}
+	}
+
+	// The first target is the setter call on the parenthesised receiver.
+	prog, err := parser.Parse(`(o).a, x = 1, 2`)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	ma := prog.Body[0].(*ast.MultiAssign)
+	call, ok := ma.Targets[0].(*ast.Call)
+	if !ok {
+		t.Fatalf("first target = %T, want *ast.Call", ma.Targets[0])
+	}
+	if call.Name != "a=" || call.Recv == nil {
+		t.Errorf("first target = %q on %T, want a= on a receiver", call.Name, call.Recv)
+	}
+
+	// A group with no postfix chain is still a nested target list, and a single
+	// `(o).a = 1` is a plain attribute assignment, not a masgn.
+	prog, err = parser.Parse(`(a, b), c = [1, 2], 3`)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	ma = prog.Body[0].(*ast.MultiAssign)
+	if _, ok := ma.Targets[0].(*ast.MultiAssign); !ok {
+		t.Errorf("(a, b) group = %T, want a nested *ast.MultiAssign", ma.Targets[0])
+	}
+	prog, err = parser.Parse(`(o).a = 1`)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	if _, ok := prog.Body[0].(*ast.MultiAssign); ok {
+		t.Error("(o).a = 1 parsed as a multiple assignment")
+	}
+}

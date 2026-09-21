@@ -1703,6 +1703,28 @@ func (p *Parser) looksLikeMlhs() bool {
 			if j < 0 {
 				return false
 			}
+			// `(expr).attr` / `(expr)[i]` is a TARGET, not a nested group: MRI's
+			// mlhs_node takes any primary_value as the receiver
+			// (`primary_value call_op tIDENTIFIER`, `primary_value '[' opt_call_args
+			// rbracket`, `primary_value tCOLON2 tIDENTIFIER` — parse.y v3_4_0,
+			// 3639-3652) and a parenthesised expression is a primary. ruby/spec uses
+			// it to pin evaluation order: `(ScratchPad << :a; obj).a, … = …`.
+			if isPostfixStart(p.toks[j].Type) {
+				i = p.scanMlhsTargetTail(j)
+				if i < 0 {
+					return false
+				}
+				switch p.toks[i].Type {
+				case token.COMMA:
+					sawComma = true
+					i++
+					continue
+				case token.ASSIGN:
+					return sawComma || sawSplat
+				default:
+					return false
+				}
+			}
 			sawGroup = true
 			i = j
 			switch p.toks[i].Type {
@@ -1919,7 +1941,11 @@ func (p *Parser) parseMlhsTarget() (string, ast.Node, bool) {
 	// group destructures one value into its own sub-targets; it is represented as
 	// a nested *MultiAssign with no Values (Values stays nil), stored as a target.
 	if p.is(token.LPAREN) {
-		return "", p.parseMlhsGroup(), false
+		// Unless the group is followed by a postfix chain, in which case it is the
+		// receiver of an attribute/index target (see looksLikeMlhs).
+		if j := p.scanBalanced(p.pos, token.LPAREN, token.RPAREN); j < 0 || !isPostfixStart(p.toks[j].Type) {
+			return "", p.parseMlhsGroup(), false
+		}
 	}
 	// Simple local: declare it and use a *VarRef (fast path).
 	if p.is(token.IDENT) && !isPostfixStart(p.peekTok().Type) {
