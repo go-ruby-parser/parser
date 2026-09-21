@@ -113,7 +113,13 @@ type Block struct {
 	Defaults   []Node // parallel to Params; nil for a required or *splat param
 	SplatIndex int    // index of the top-level *splat param in Params, or -1
 	BlockParam string // name of the &block param, or "" if none (parallels MethodDef.BlockParam)
-	Body       []Node
+	// Locals are the block-local variables declared after a `;` in the parameter
+	// list (`{ |a; x, y| … }`): fresh, nil-valued locals of this block that shadow
+	// any enclosing binding of the same name. MRI: `opt_bv_decl: '\n'? ';'
+	// bv_decls '\n'?` with `bvar: tIDENTIFIER { new_bv(p, $1); }`. Empty when the
+	// list has no `;` part.
+	Locals []string
+	Body   []Node
 }
 
 // Yield invokes the block passed to the enclosing method.
@@ -141,13 +147,28 @@ type While struct {
 	Body []Node
 }
 
-// For is a `for VARS in ITER ... end` loop. Vars names the one or more loop
-// variables (`for a, b in pairs`); unlike a block, a `for` does not introduce a
-// new scope, so the variables remain visible after the loop.
+// For is a `for VARS in ITER ... end` loop. Unlike a block, a `for` does not
+// introduce a new scope, so its variables remain visible after the loop.
+//
+// MRI's loop variable is `for_var: lhs | mlhs`, i.e. any assignment target or
+// any multiple-assignment target list. The common shapes — one local, or a
+// comma-separated list of locals — are in Vars, which is what they have always
+// been. Everything else needs a node, and then Target is non-nil and Vars is
+// EMPTY, so there is only ever one place to read the loop variable from:
+//
+//   - a single non-local target (`for @v in …`, `for $v in …`, `for C in …`,
+//     `for o.a in …`, `for a[0] in …`): Target is that target, already in its
+//     assignable form (a setter call for the attribute and index forms).
+//   - any list that Vars cannot spell — one holding a `*rest` (`for a, *b in …`),
+//     a nested group (`for a, (b, c) in …`), a non-local (`for @a, b in …`), or a
+//     trailing comma (`for a, in …`, which destructures where `for a in …` does
+//     not): Target is a *MultiAssign with Values nil, the same shape a nested
+//     masgn target has.
 type For struct {
-	Vars []string
-	Iter Node
-	Body []Node
+	Vars   []string
+	Target Node
+	Iter   Node
+	Body   []Node
 }
 
 // MethodDef defines a method on the current self.
@@ -414,14 +435,29 @@ type FindPattern struct {
 // Alias is `alias NewName OldName` — it makes NewName an alias of an existing
 // method (or global variable). Each name is the bare method/symbol/global text
 // without a leading colon.
+//
+// MRI's `fitem` admits a dynamic symbol (`alias :"#{x}" y`), whose name is only
+// known at run time. Such a name arrives in NewNameExpr/OldNameExpr, with the
+// matching string field empty; the expression evaluates to the symbol. Both Expr
+// fields are nil for the ordinary all-static form.
 type Alias struct {
-	NewName string
-	OldName string
+	NewName     string
+	OldName     string
+	NewNameExpr Node
+	OldNameExpr Node
 }
 
 // Undef is `undef name [, name…]` — it removes the named method(s) from the
 // current class/module. Names hold the bare method names.
-type Undef struct{ Names []string }
+//
+// A dynamic symbol (`undef :"#{x}"`) has an empty string at its position in
+// Names and its expression at the same index of Exprs. Exprs is nil when every
+// name is static, and otherwise has exactly len(Names) entries, nil at each
+// static position.
+type Undef struct {
+	Names []string
+	Exprs []Node
+}
 
 // Retry restarts the enclosing begin body from inside a rescue clause.
 type Retry struct{}

@@ -118,6 +118,29 @@ type Parser struct {
 	// nested delimited context (a parenthesised group, a `(…)`/`[…]` argument list,
 	// a `{…}` hash), where an inner modifier-`rescue` is again allowed.
 	noRescueMod bool
+	// noBraceBlock suppresses `{ … }` block attachment while parsing the
+	// unparenthesised parameter list of a stabby lambda: there the next `{` at
+	// the lambda's own bracket nesting opens the lambda BODY, so `-> a=a() { a }`
+	// is a lambda whose body is `a`, not a call `a() { a }`. MRI decides this in
+	// the lexer, by comparing the bracket nesting against the one recorded at the
+	// `->` (parse.y v3_4_0: `lambda_beginning_p()` is
+	// `p->lex.lpar_beg == p->lex.paren_nest`, with `p->lex.lpar_beg =
+	// p->lex.paren_nest` at the `->`, and paren_nest counting `(`, `[` and `{`).
+	// enterBracket clears it inside any still-open bracket, which is why
+	// `-> x = ([1].map { |v| v }) { x }` keeps its inner block while the same
+	// expression without the parentheses is a syntax error in MRI too.
+	noBraceBlock bool
+	// argParenEnd is the token index just past the `)` that closed a SPACED
+	// parenthesised group standing as the FIRST token of a paren-less command
+	// argument list — MRI's tLPAREN_ARG, whose `)` sets EXPR_ENDARG (parse.y
+	// v3_4_0: `primary: tLPAREN_ARG compstmt {SET_LEX_STATE(EXPR_ENDARG);} ')'`).
+	// A `{` reached in that state lexes as tLBRACE_ARG, and the grammar gives it
+	// to the COMMAND through `command: primary_value call_op operation2
+	// command_args cmd_brace_block` (3464-3480), not to the group. So
+	// `o.s (:a){ 1 }` yields the block to `s`, while `f g(1) { 2 }` — a hugging
+	// paren, hence EXPR_END — yields it to `g(1)`. It is an absolute index, so a
+	// stale value is inert: the cursor only moves forward.
+	argParenEnd int
 	// bracketDepth > 0 while parsing a parenthesised call-argument list or a hash
 	// literal, where newlines are insignificant. A `key:` whose value sits on the
 	// next line (`f(`⏎`  k:`⏎`    v)`) is then a continued pair, not a value-omitted
@@ -135,7 +158,7 @@ var parseHook func()
 // parse error rather than propagating to the caller.
 func Parse(src string) (prog *ast.Program, err error) {
 	toks := lexer.New(src).Tokenize()
-	p := &Parser{toks: toks, scopes: []*scope{newScope(true)}}
+	p := &Parser{toks: toks, scopes: []*scope{newScope(true)}, argParenEnd: -1}
 	defer func() {
 		if r := recover(); r != nil {
 			if pe, ok := r.(parseError); ok {
@@ -204,6 +227,31 @@ func (p *Parser) expect(tt token.Type) token.Token {
 func (p *Parser) fail(format string, args ...any) ast.Node {
 	t := p.cur()
 	panic(parseError{msg: fmt.Sprintf("parse error at line %d: %s", t.Line, fmt.Sprintf(format, args...))})
+}
+
+// enterBracket marks the parser as being inside a still-open bracket and
+// returns the function restoring the previous state; use it as
+// `defer p.enterBracket()()`. Only noBraceBlock depends on bracket nesting: a
+// `{` inside a bracket is an ordinary block again, never a lambda body.
+// atCommandBrace reports whether the cursor sits on the `{` that MRI lexes as
+// tLBRACE_ARG: the one immediately after the `)` recorded in argParenEnd. Such a
+// brace opens the command's block, so no inner call may take it.
+func (p *Parser) atCommandBrace() bool {
+	return p.is(token.LBRACE) && p.pos == p.argParenEnd
+}
+
+// attachCommandBrace gives that `{ … }` to the command call being built, which
+// is what `command_args cmd_brace_block` does in MRI's grammar.
+func (p *Parser) attachCommandBrace(block **ast.Block) {
+	if *block == nil && p.atCommandBrace() {
+		*block = p.parseBraceBlock()
+	}
+}
+
+func (p *Parser) enterBracket() func() {
+	saved := p.noBraceBlock
+	p.noBraceBlock = false
+	return func() { p.noBraceBlock = saved }
 }
 
 func (p *Parser) skipNewlines() {
@@ -301,15 +349,6 @@ func (p *Parser) parseStatements(stop map[token.Type]bool) []ast.Node {
 
 func (p *Parser) parseStatement() ast.Node {
 	switch p.cur().Type {
-	case token.DEF:
-		// A method definition may carry a trailing modifier (`def f; …; end if c`)
-		// and is occasionally chained (`def f; end.tap { … }`), so feed it through
-		// the postfix/modifier machinery rather than returning it raw.
-		return p.applyModifiers(p.parsePostfixTail(p.parseDef()))
-	case token.CLASS:
-		return p.applyModifiers(p.parsePostfixTail(p.parseClass()))
-	case token.MODULE:
-		return p.applyModifiers(p.parsePostfixTail(p.parseModule()))
 	case token.RETURN:
 		return p.applyModifiers(p.parseReturn())
 	case token.BREAK:
@@ -919,28 +958,84 @@ func (p *Parser) parseUntil() ast.Node {
 	return &ast.While{Cond: not(cond), Body: body}
 }
 
-// parseFor parses `for VAR[, VAR…] in ITER [do] ... end`. The loop variables are
-// plain names (one or more, comma-separated) that — unlike block parameters —
-// are declared in the enclosing scope and outlive the loop, so they are recorded
-// as locals here. The iterator expression is parsed with `do…end` attachment
-// suppressed so a trailing `do` belongs to the loop, not to a call within it.
+// parseFor parses `for VARS in ITER [do] ... end`. The loop variables — unlike
+// block parameters — are declared in the enclosing scope and outlive the loop,
+// so they are recorded as locals here. The iterator expression is parsed with
+// `do…end` attachment suppressed so a trailing `do` belongs to the loop, not to
+// a call within it.
 func (p *Parser) parseFor() ast.Node {
 	p.expect(token.FOR)
-	var vars []string
-	for {
-		name := p.expect(token.IDENT).Lit
-		vars = append(vars, name)
-		p.declareLocal(name)
-		if !p.accept(token.COMMA) {
-			break
-		}
-	}
+	vars, target := p.parseForVar()
 	p.expect(token.IN)
 	iter := p.parseLoopCond()
 	p.accept(token.DO)
 	body := p.parseStatements(bodyEnd)
 	p.expect(token.END)
-	return &ast.For{Vars: vars, Iter: iter, Body: body}
+	return &ast.For{Vars: vars, Target: target, Iter: iter, Body: body}
+}
+
+// parseForVar parses MRI's `for_var: lhs | mlhs` (parse.y v3_4_0). `lhs` is any
+// assignment target, and `mlhs` the same target list a multiple assignment
+// takes, `mlhs_basic` and all: a `*rest` (`mlhs_head tSTAR mlhs_node`), nested
+// groups (`mlhs_item: tLPAREN mlhs_inner rparen`) and a trailing comma
+// (`mlhs_head: mlhs_item ','`, which is a COMPLETE mlhs and therefore
+// destructures — `for i, in [[1,2]]` binds i to 1 where `for i in [[1,2]]` binds
+// it to [1,2]).
+//
+// It returns the plain-local spelling in the first result when the list is one
+// or more plain locals with none of those features, and otherwise the general
+// target in the second (see ast.For). The two are never both set.
+func (p *Parser) parseForVar() ([]string, ast.Node) {
+	var names []string
+	var targets []ast.Node
+	onlyLocals := true
+	splat := -1
+	trailingComma := false
+	for {
+		if p.accept(token.STAR) {
+			splat = len(names)
+			onlyLocals = false
+			// A nameless rest (`for i, * in …`) is followed straight by `,` or `in`.
+			if p.is(token.COMMA) || p.is(token.IN) {
+				names = append(names, "")
+				targets = append(targets, nil)
+			} else {
+				name, tgt, _ := p.parseMlhsTarget()
+				names = append(names, name)
+				targets = append(targets, tgt)
+			}
+		} else {
+			name, tgt, local := p.parseMlhsTarget()
+			names = append(names, name)
+			targets = append(targets, tgt)
+			if !local {
+				onlyLocals = false
+			}
+		}
+		if !p.accept(token.COMMA) {
+			break
+		}
+		if p.is(token.IN) { // `for i, in …`
+			trailingComma = true
+			break
+		}
+	}
+	if splat < 0 && !trailingComma {
+		// One or more plain locals keep the Vars spelling.
+		if onlyLocals {
+			return names, nil
+		}
+		// A single target is MRI's `for_var: lhs`, which binds the whole element:
+		// `for @v in [[1,2]]` sets @v to [1,2]. Wrapping it in a one-element
+		// MultiAssign would make it an `mlhs` instead, and destructure.
+		if len(names) == 1 {
+			return nil, targets[0]
+		}
+	}
+	if onlyLocals {
+		targets = nil // Names alone suffice, as in parseMlhs
+	}
+	return nil, &ast.MultiAssign{Names: names, Targets: targets, SplatIndex: splat}
 }
 
 func (p *Parser) parseReturn() ast.Node {
@@ -974,32 +1069,64 @@ func (p *Parser) parseReturn() ast.Node {
 // a global variable. The two names are separated by whitespace, not a comma.
 func (p *Parser) parseAlias() ast.Node {
 	p.expect(token.ALIAS)
-	return &ast.Alias{NewName: p.parseFitem(), OldName: p.parseFitem()}
+	newName, newExpr := p.parseFitem()
+	oldName, oldExpr := p.parseFitem()
+	return &ast.Alias{NewName: newName, OldName: oldName, NewNameExpr: newExpr, OldNameExpr: oldExpr}
 }
 
 // parseUndef parses `undef name [, name…]`, removing the named methods.
 func (p *Parser) parseUndef() ast.Node {
 	p.expect(token.UNDEF)
-	names := []string{p.parseFitem()}
-	for p.accept(token.COMMA) {
-		names = append(names, p.parseFitem())
+	var names []string
+	var exprs []ast.Node
+	dynamic := false
+	for {
+		name, expr := p.parseFitem()
+		names = append(names, name)
+		exprs = append(exprs, expr)
+		dynamic = dynamic || expr != nil
+		if !p.accept(token.COMMA) {
+			break
+		}
 	}
-	return &ast.Undef{Names: names}
+	if !dynamic {
+		return &ast.Undef{Names: names}
+	}
+	return &ast.Undef{Names: names, Exprs: exprs}
 }
 
 // parseFitem reads one method-name item for alias/undef: a symbol (`:foo`,
-// `:==`), a global variable (`$x`, alias only), or a bare method name — an
-// identifier, a constant, a reserved word, or an operator (`==`, `<=>`, `[]`).
-func (p *Parser) parseFitem() string {
+// `:==`), a global variable (`$x`, alias only), a bare method name — an
+// identifier, a constant, a reserved word, or an operator (`==`, `<=>`, `[]`) —
+// or a dynamic symbol (`:"#{x}"`), which is returned as an expression instead
+// of a name.
+//
+// MRI: `fitem: fname | symbol` with `symbol: ssym | dsym` and
+// `dsym: tSYMBEG string_contents tSTRING_END` (parse.y v3_4_0), so an
+// interpolated symbol is an ordinary alias/undef name. The lexer has already
+// desugared `:"…#{…}…"` into the equivalent `"…".to_sym`, which is why the item
+// begins with a STRBEG here; a symbol with no interpolation is a plain SYMBOL.
+func (p *Parser) parseFitem() (string, ast.Node) {
 	switch p.cur().Type {
 	case token.SYMBOL, token.GVAR:
-		return p.advance().Lit
+		return p.advance().Lit, nil
+	case token.STRBEG:
+		// Take exactly the desugared `"…".to_sym` and no more: the name that
+		// follows an alias's first item (`alias :"#{x}" v`) must not be read as a
+		// paren-less argument of to_sym.
+		str := p.parseStringConcat()
+		if !p.is(token.DOT) || p.peekTok().Lit != "to_sym" {
+			p.fail("expected a method name")
+		}
+		p.advance() // .
+		p.advance() // to_sym
+		return "", &ast.Call{Recv: str, Name: "to_sym"}
 	}
 	if name, ok := p.parseDefName(); ok {
-		return name
+		return name, nil
 	}
 	p.fail("expected a method name")
-	return ""
+	return "", nil
 }
 
 func (p *Parser) parseBreak() ast.Node {
@@ -1273,7 +1400,7 @@ func (p *Parser) parseCaseIn(subject ast.Node) ast.Node {
 // form.
 func (p *Parser) parsePattern() ast.Pattern {
 	// A leading label is an implicit (brace-less) hash pattern: `in a:, b:`.
-	if p.is(token.LABEL) || p.is(token.POW) {
+	if p.atPatternLabel() || p.is(token.POW) {
 		return p.parseHashPatternBody(nil, token.NEWLINE)
 	}
 	first := p.parseArrayPatternElem()
@@ -1325,9 +1452,23 @@ func (p *Parser) parsePatternAtom() ast.Pattern {
 			p.expect(token.RPAREN)
 			return &ast.ValuePattern{Value: e}
 		}
+		// MRI pins a local (`p_var_ref: '^' tIDENTIFIER`) or a non-local
+		// (`'^' nonlocal_var`, with `nonlocal_var: tIVAR | tGVAR | tCVAR`) —
+		// parse.y v3_4_0, 5883-5897.
+		switch t := p.cur(); t.Type {
+		case token.IVAR:
+			p.advance()
+			return &ast.ValuePattern{Value: &ast.IvarRef{Name: t.Lit}}
+		case token.GVAR:
+			p.advance()
+			return &ast.ValuePattern{Value: &ast.GVarRef{Name: t.Lit}}
+		case token.CVAR:
+			p.advance()
+			return &ast.ValuePattern{Value: &ast.CVarRef{Name: t.Lit}}
+		}
 		return &ast.ValuePattern{Value: &ast.VarRef{Name: p.expect(token.IDENT).Lit}}
 	case token.LBRACKET:
-		return p.parseArrayPattern(nil)
+		return p.parseArrayPattern(nil, token.LBRACKET, token.RBRACKET)
 	case token.LBRACE:
 		return p.parseHashPattern(nil)
 	case token.IDENT:
@@ -1343,12 +1484,16 @@ func (p *Parser) parsePatternAtom() ast.Pattern {
 		// class match.
 		c := p.parsePatternConst()
 		if p.is(token.LBRACKET) {
-			return p.parseArrayPattern(c)
+			return p.parseArrayPattern(c, token.LBRACKET, token.RBRACKET)
 		}
-		if p.accept(token.LPAREN) {
-			hp := p.parseHashPatternBody(c, token.RPAREN)
-			p.expect(token.RPAREN)
-			return hp
+		if p.is(token.LPAREN) {
+			// `Const(…)` and `Const[…]` are the SAME four alternatives in MRI
+			// (parse.y v3_4_0, p_expr_basic): `p_const p_lparen p_args rparen`,
+			// `… p_find rparen`, `… p_kwargs rparen`, `p_const '(' rparen`, and the
+			// identical quartet with p_lbracket/rbracket. So `Array(0, 1, 2)` is an
+			// array pattern, exactly as `Array[0, 1, 2]` is, and `Point(x:, y:)` a
+			// hash pattern — the body decides, not the bracket.
+			return p.parseArrayPattern(c, token.LPAREN, token.RPAREN)
 		}
 		return &ast.ConstPattern{Const: c}
 	default:
@@ -1384,30 +1529,35 @@ func (p *Parser) parsePatternValue() ast.Node {
 // parseArrayPattern parses `[pat, …]`, with an optional leading constant. When
 // the bracket body begins with a label or `**`, it is a hash pattern written
 // with bracket delimiters (`Const[key:]`, deconstruct_keys), which MRI accepts.
-func (p *Parser) parseArrayPattern(constName ast.Node) ast.Pattern {
-	p.expect(token.LBRACKET)
+func (p *Parser) parseArrayPattern(constName ast.Node, open, close token.Type) ast.Pattern {
+	p.expect(open)
 	// A bracket pattern body may span several lines (`Const[`⏎`  a: 1,`⏎`]`), so
-	// newlines after the `[` and around the separating commas are insignificant.
+	// newlines after the opener and around the separating commas are insignificant.
 	p.skipNewlines()
-	if p.is(token.LABEL) || p.is(token.POW) {
-		hp := p.parseHashPatternBody(constName, token.RBRACKET)
+	if p.atPatternLabel() || p.is(token.POW) {
+		hp := p.parseHashPatternBody(constName, close)
 		p.skipNewlines()
-		p.expect(token.RBRACKET)
+		p.expect(close)
 		return hp
 	}
 	var elems []arrayElem
-	if !p.accept(token.RBRACKET) {
+	if !p.accept(close) {
 		elems = append(elems, p.parseArrayPatternElem())
 		p.skipNewlines()
 		for p.accept(token.COMMA) {
 			p.skipNewlines()
-			if p.is(token.RBRACKET) { // trailing comma
+			if p.is(close) {
+				// A trailing comma is MRI's `p_top_expr_body: p_expr ','`
+				// (parse.y v3_4_0), an array pattern with an ANONYMOUS REST: it
+				// matches any array STARTING with the listed elements, so
+				// `in [0, 1, ]` matches [0, 1, 2, 3].
+				elems = append(elems, arrayElem{splat: true})
 				break
 			}
 			elems = append(elems, p.parseArrayPatternElem())
 			p.skipNewlines()
 		}
-		p.expect(token.RBRACKET)
+		p.expect(close)
 	}
 	return p.buildArrayOrFind(constName, elems)
 }
@@ -1424,6 +1574,26 @@ func (p *Parser) parseHashPattern(constName ast.Node) ast.Pattern {
 // parseHashPatternBody parses the comma-separated entries of a hash pattern up
 // to (but not consuming) end. Entries are `label: [value-pattern]` or the
 // double-splat `**name` / `**nil`.
+// atPatternLabel reports whether the cursor opens a hash-pattern key. MRI's
+// `p_kw_label: tLABEL | tSTRING_BEG string_contents tLABEL_END` (parse.y
+// v3_4_0) accepts a quoted string followed by `:` wherever a bare label is
+// accepted, so `in {"a": 0}` is `in {a: 0}`.
+func (p *Parser) atPatternLabel() bool {
+	return p.is(token.LABEL) || (p.is(token.STRING) && p.peekTok().Type == token.COLON)
+}
+
+// patternKey reads one hash-pattern key in either of p_kw_label's two spellings
+// and returns the symbol it names. A `"a" => 1` rocket entry is deliberately not
+// accepted: ruby/spec requires `case {a: 1}; in {"a" => 1}` to raise SyntaxError.
+func (p *Parser) patternKey() string {
+	if p.is(token.STRING) && p.peekTok().Type == token.COLON {
+		key := p.advance().Lit
+		p.advance() // ':'
+		return key
+	}
+	return p.expect(token.LABEL).Lit
+}
+
 func (p *Parser) parseHashPatternBody(constName ast.Node, end token.Type) *ast.HashPattern {
 	hp := &ast.HashPattern{Const: constName}
 	for !p.is(end) && !p.is(token.NEWLINE) && !p.is(token.THEN) && !p.is(token.IF) && !p.is(token.UNLESS) {
@@ -1441,7 +1611,7 @@ func (p *Parser) parseHashPatternBody(constName ast.Node, end token.Type) *ast.H
 				}
 			}
 		} else {
-			key := p.expect(token.LABEL).Lit
+			key := p.patternKey()
 			hp.Keys = append(hp.Keys, key)
 			// `name:` with no following pattern binds local `name`; otherwise the
 			// value is a sub-pattern. A clause/entry boundary means no value.
@@ -1465,9 +1635,29 @@ func (p *Parser) parseHashPatternBody(constName ast.Node, end token.Type) *ast.H
 func (p *Parser) parseArrayPatternRest(constName ast.Node, first arrayElem) ast.Pattern {
 	elems := []arrayElem{first}
 	for p.accept(token.COMMA) {
+		if p.atPatternEnd() {
+			// The un-bracketed spelling of the same rule: `in 0, 1,` is
+			// `p_top_expr_body: p_expr ','`, an anonymous rest.
+			elems = append(elems, arrayElem{splat: true})
+			break
+		}
 		elems = append(elems, p.parseArrayPatternElem())
 	}
 	return p.buildArrayOrFind(constName, elems)
+}
+
+// atPatternEnd reports whether the cursor ends an un-bracketed pattern list, so
+// that a `,` just consumed was a trailing one. A `case/in` pattern runs up to
+// the clause body (a newline — which is what the lexer makes of the `;` in
+// `in 0, 1,;` — or `then`) or a guard (`if`/`unless`); a one-line `=>`/`in`
+// match also ends at a closing bracket or at the end of input.
+func (p *Parser) atPatternEnd() bool {
+	switch p.cur().Type {
+	case token.NEWLINE, token.EOF, token.THEN, token.IF, token.UNLESS,
+		token.RPAREN, token.RBRACKET, token.RBRACE, token.END:
+		return true
+	}
+	return false
 }
 
 // arrayElem is one parsed array-pattern element: an ordinary sub-pattern, or a
@@ -1568,6 +1758,28 @@ func (p *Parser) looksLikeMlhs() bool {
 			j := p.scanBalanced(i, token.LPAREN, token.RPAREN)
 			if j < 0 {
 				return false
+			}
+			// `(expr).attr` / `(expr)[i]` is a TARGET, not a nested group: MRI's
+			// mlhs_node takes any primary_value as the receiver
+			// (`primary_value call_op tIDENTIFIER`, `primary_value '[' opt_call_args
+			// rbracket`, `primary_value tCOLON2 tIDENTIFIER` — parse.y v3_4_0,
+			// 3639-3652) and a parenthesised expression is a primary. ruby/spec uses
+			// it to pin evaluation order: `(ScratchPad << :a; obj).a, … = …`.
+			if isPostfixStart(p.toks[j].Type) {
+				i = p.scanMlhsTargetTail(j)
+				if i < 0 {
+					return false
+				}
+				switch p.toks[i].Type {
+				case token.COMMA:
+					sawComma = true
+					i++
+					continue
+				case token.ASSIGN:
+					return sawComma || sawSplat
+				default:
+					return false
+				}
 			}
 			sawGroup = true
 			i = j
@@ -1785,7 +1997,11 @@ func (p *Parser) parseMlhsTarget() (string, ast.Node, bool) {
 	// group destructures one value into its own sub-targets; it is represented as
 	// a nested *MultiAssign with no Values (Values stays nil), stored as a target.
 	if p.is(token.LPAREN) {
-		return "", p.parseMlhsGroup(), false
+		// Unless the group is followed by a postfix chain, in which case it is the
+		// receiver of an attribute/index target (see looksLikeMlhs).
+		if j := p.scanBalanced(p.pos, token.LPAREN, token.RPAREN); j < 0 || !isPostfixStart(p.toks[j].Type) {
+			return "", p.parseMlhsGroup(), false
+		}
 	}
 	// Simple local: declare it and use a *VarRef (fast path).
 	if p.is(token.IDENT) && !isPostfixStart(p.peekTok().Type) {
@@ -2372,6 +2588,7 @@ func (p *Parser) parsePostfixTail(node ast.Node) ast.Node {
 				// as MRI attaches it to the outermost command rather than to an
 				// argument call.
 				call := &ast.Call{Recv: node, Name: name, Args: p.parseCommandArgs(), Safe: safe}
+				p.attachCommandBrace(&call.Block)
 				if p.is(token.DO) && !p.noDo {
 					call.Block = p.parseDoBlock()
 					// The block-bearing command call may itself be chained
@@ -2403,6 +2620,7 @@ func (p *Parser) parsePostfixTail(node ast.Node) ast.Node {
 				// scoped constant (`Math::PI`).
 				if p.canStartCommandArg() || p.atHuggingStringArg() {
 					call := &ast.Call{Recv: node, Name: name, Args: p.parseCommandArgs()}
+					p.attachCommandBrace(&call.Block)
 					if p.is(token.DO) && !p.noDo {
 						call.Block = p.parseDoBlock()
 						node = call
@@ -2423,6 +2641,7 @@ func (p *Parser) parsePostfixTail(node ast.Node) ast.Node {
 			} else if p.canStartCommandArg() || p.atHuggingStringArg() {
 				// Paren-less scope-resolution command call: `Mod::meth arg`.
 				call := &ast.Call{Recv: node, Name: name, Args: p.parseCommandArgs()}
+				p.attachCommandBrace(&call.Block)
 				if p.is(token.DO) && !p.noDo {
 					call.Block = p.parseDoBlock()
 					node = call
@@ -2436,7 +2655,8 @@ func (p *Parser) parsePostfixTail(node ast.Node) ast.Node {
 			args := p.parseCallArgs(token.RBRACKET)
 			p.expect(token.RBRACKET)
 			node = &ast.Call{Recv: node, Name: "[]", Args: args}
-		case p.is(token.LBRACE) || (p.is(token.DO) && !p.noDo):
+		case (p.is(token.LBRACE) && !p.noBraceBlock && !p.atCommandBrace()) ||
+			(p.is(token.DO) && !p.noDo):
 			// A block binds to the immediately preceding method call; chaining
 			// then continues (`recv.map { … }.join`). A `super` also takes a block
 			// (`super { … }`, `super(x) do … end`).
@@ -2567,15 +2787,23 @@ func (p *Parser) parseLambda() ast.Node {
 	splat := -1
 	if p.accept(token.LPAREN) {
 		// The stabby-lambda `(...)` list shares the block parameter grammar, so it
-		// supports the same optional, *splat, &block, and destructuring forms.
+		// supports the same optional, *splat, &block, and destructuring forms. The
+		// parenthesis is an open bracket, so a `{` inside is an ordinary block.
+		restore := p.enterBracket()
 		params, defaults, prepends, splat, blockParam = p.parseBlockParams(token.RPAREN)
+		restore()
 		p.expect(token.RPAREN)
 		p.scope().explicitParams = true
 	} else if p.is(token.IDENT) || p.is(token.STAR) || p.is(token.POW) || p.is(token.AMPER) {
 		// Unparenthesized parameters: `->x { }`, `-> ctx { }`, `->a, b { }`,
 		// `-> message do … end`. The list runs up to the block opener (`{`/`do`);
-		// parseBlockParams stops at the first token that is not a parameter.
+		// parseBlockParams stops at the first token that is not a parameter. A `{`
+		// reached at this nesting is the lambda body, not a block on whatever the
+		// last default expression called: `-> a=a() { a }` (see noBraceBlock).
+		savedBrace := p.noBraceBlock
+		p.noBraceBlock = true
 		params, defaults, prepends, splat, blockParam = p.parseBlockParams(token.LBRACE)
+		p.noBraceBlock = savedBrace
 		p.scope().explicitParams = true
 	}
 	bs := p.scope()
@@ -2618,6 +2846,7 @@ func (p *Parser) parseBlockRest(stop map[token.Type]bool, end token.Type, withRe
 	var params []string
 	var defaults, prepends []ast.Node
 	var blockParam string
+	var locals []string
 	splat := -1
 	// The `|params|` list may start on the line(s) after the block opener:
 	// `foo {`<nl>`|x| … }`, `do`<nl>`|a, b| … end`. Skip the intervening newlines
@@ -2637,7 +2866,7 @@ func (p *Parser) parseBlockRest(stop map[token.Type]bool, end token.Type, withRe
 		// the body sees them, but carried no further than the parameter list.
 		if p.is(token.NEWLINE) {
 			p.advance()
-			p.parseBlockLocals()
+			locals = p.parseBlockLocals()
 		}
 		p.expect(token.PIPE)
 		p.scope().explicitParams = true
@@ -2662,21 +2891,27 @@ func (p *Parser) parseBlockRest(stop map[token.Type]bool, end token.Type, withRe
 	if len(prepends) > 0 {
 		body = append(prepends, body...)
 	}
-	return &ast.Block{Params: params, Defaults: defaults, SplatIndex: splat, BlockParam: blockParam, Body: body}
+	return &ast.Block{Params: params, Defaults: defaults, SplatIndex: splat, BlockParam: blockParam, Locals: locals, Body: body}
 }
 
 // parseBlockLocals parses the block-local variable list after the `;` in a block
-// parameter list (`|a, b; x, y|`). Each name is declared in the current block
-// scope so the body resolves it as a local; the list is otherwise discarded
-// since block-locals carry no arity or default.
-func (p *Parser) parseBlockLocals() {
+// parameter list (`|a, b; x, y|`) and returns the names. Each is declared in the
+// current block scope so the body resolves it as a local, and carried on the
+// Block so a consumer can give it a slot: MRI's `opt_bv_decl: '\n'? ';' bv_decls
+// '\n'?` with `bvar: tIDENTIFIER { new_bv(p, $1); }` (parse.y v3_4_0) adds each
+// to the block's own local table, where it starts out nil and shadows any
+// enclosing binding of the same name. They carry no arity and no default.
+func (p *Parser) parseBlockLocals() []string {
+	var locals []string
 	for {
 		name := p.expect(token.IDENT).Lit
 		p.declareLocal(name)
+		locals = append(locals, name)
 		if !p.accept(token.COMMA) {
 			break
 		}
 	}
+	return locals
 }
 
 // parseBlockParams parses a block's parameter list (the `|...|` form for brace/do
@@ -2767,27 +3002,22 @@ func (p *Parser) parseBlockParams(until token.Type) (names []string, defaults, p
 				names = append(names, "*")
 			}
 			defaults = append(defaults, nil)
-		} else if p.accept(token.LPAREN) {
-			var gnames []string
-			gsplat := -1
-			for {
-				if p.accept(token.STAR) {
-					gsplat = len(gnames)
-				}
-				gn := p.expect(token.IDENT).Lit
-				gnames = append(gnames, gn)
-				p.declareLocal(gn)
-				if !p.accept(token.COMMA) {
-					break
-				}
-			}
-			p.expect(token.RPAREN)
-			syn := "(" + strconv.Itoa(group) + ")"
-			group++
-			names = append(names, syn)
+		} else if p.is(token.LPAREN) {
+			// A parenthesised destructuring parameter, which nests: MRI's
+			// `f_marg: f_norm_arg | tLPAREN f_margs rparen` (parse.y v3_4_0) puts
+			// f_marg back inside f_margs, so `|a, (b, (c, d))|` is as legal as
+			// `|a, (b, c)|`. parseDestructureParam is the shared implementation —
+			// the `def` parameter list already used it; this list had a flat copy
+			// that could only read identifiers one level down.
+			outer, chained := p.parseDestructureParam(&group)
+			names = append(names, outer.Values[0].(*ast.VarRef).Name)
 			defaults = append(defaults, nil)
-			p.declareLocal(syn)
-			prepends = append(prepends, &ast.MultiAssign{Names: gnames, SplatIndex: gsplat, Values: []ast.Node{&ast.VarRef{Name: syn}}})
+			// The outer unpack binds the inner synthetics first; the chained inner
+			// unpacks then read them.
+			prepends = append(prepends, outer)
+			for _, c := range chained {
+				prepends = append(prepends, c)
+			}
 		} else {
 			name := p.expect(token.IDENT).Lit
 			names = append(names, name)
@@ -2957,7 +3187,9 @@ func (p *Parser) parsePrimary() ast.Node {
 		// semicolon/newline-separated statements (`(a; b)`), evaluating to the
 		// last. A single statement returns directly; a sequence is wrapped in a
 		// Begin (whose value is its last expression).
+		restore := p.enterBracket()
 		stmts := p.parseStatements(map[token.Type]bool{token.RPAREN: true})
+		restore()
 		p.expect(token.RPAREN)
 		if len(stmts) == 1 {
 			return stmts[0]
@@ -3009,6 +3241,21 @@ func (p *Parser) parsePrimary() ast.Node {
 	case token.MODULE:
 		// A module definition as an rvalue (`m = module M; …; end`).
 		return p.parseModule()
+	case token.BREAK:
+		// A bare `break`/`next`/`retry`/`return` is an alternative of `primary` in
+		// MRI (parse.y v3_4_0: `k_return` at 4438, `keyword_break`/`keyword_next`/
+		// `keyword_redo`/`keyword_retry` at 4682-4697), and `k_return call_args` /
+		// `keyword_break call_args` / `keyword_next call_args` are alternatives of
+		// `command`, so both the bare and the valued forms belong in expression
+		// position: `defined?(break)` and `defined?(break 1)` are both legal.
+		return p.parseBreak()
+	case token.NEXT:
+		return p.parseNext()
+	case token.RETRY:
+		p.advance()
+		return &ast.Retry{}
+	case token.RETURN:
+		return p.parseReturn()
 	case token.BEGIN:
 		return p.parseBegin()
 	case token.CASE:
@@ -3049,6 +3296,25 @@ func (p *Parser) parseIdentExpr() ast.Node {
 	name := p.cur().Lit
 	next := p.peekTok()
 
+	// `defined?` is a keyword, not a method. MRI gives it two productions
+	// (parse.y v3_4_0): `keyword_defined '\n'? '(' begin_defined expr rparen`,
+	// an alternative of `primary`, and `keyword_defined '\n'? begin_defined arg`,
+	// an alternative of `arg`. The parenthesised form takes a full `expr`, which
+	// admits the low-precedence keyword operators — `defined?($x and true)` is
+	// legal where an ordinary call argument is not. It takes ONE expr, not a
+	// statement sequence (`defined?($x; $y)` is a syntax error in MRI), and only
+	// a hugging paren selects it: `defined? (1) && nil` answers "expression",
+	// because there the parenthesis opens the `arg` instead.
+	if name == "defined?" && next.Type == token.LPAREN && !next.SpaceBefore {
+		p.advance() // defined?
+		p.advance() // (
+		p.skipNewlines()
+		arg := p.parseKeywordLogical()
+		p.skipNewlines()
+		p.expect(token.RPAREN)
+		return &ast.Call{Name: name, Args: []ast.Node{arg}}
+	}
+
 	// foo(...) — paren call (the '(' must hug the name).
 	if next.Type == token.LPAREN && !next.SpaceBefore {
 		p.advance() // name
@@ -3065,6 +3331,7 @@ func (p *Parser) parseIdentExpr() ast.Node {
 	if p.huggingStringArg() {
 		p.advance() // name
 		call := &ast.Call{Name: name, Args: p.parseCommandArgs()}
+		p.attachCommandBrace(&call.Block)
 		if p.is(token.DO) && !p.noDo {
 			call.Block = p.parseDoBlock()
 		}
@@ -3083,6 +3350,7 @@ func (p *Parser) parseIdentExpr() ast.Node {
 		}
 		if p.localCommandArgFollows() {
 			call := &ast.Call{Name: name, Args: p.parseCommandArgs()}
+			p.attachCommandBrace(&call.Block)
 			if p.is(token.DO) && !p.noDo {
 				call.Block = p.parseDoBlock()
 			}
@@ -3105,7 +3373,9 @@ func (p *Parser) parseIdentExpr() ast.Node {
 	// Otherwise it is a method call on self.
 	p.advance()
 	if p.canStartCommandArg() {
-		return &ast.Call{Name: name, Args: p.parseCommandArgs()}
+		call := &ast.Call{Name: name, Args: p.parseCommandArgs()}
+		p.attachCommandBrace(&call.Block)
+		return call
 	}
 	// Bare `it` (no receiver, no args) inside a param-less block is the implicit
 	// single parameter (Ruby 3.4). With args/parens — or a block, as in RSpec's
@@ -3220,6 +3490,17 @@ func (p *Parser) canStartCommandArg() bool {
 // keyword/hash-pair forms a parenthesized call does, collapsing trailing
 // `key: value` / `expr => value` pairs into one implicit Hash argument.
 func (p *Parser) parseCommandArgs() []ast.Node {
+	// A leading SPACED `(` opens MRI's tLPAREN_ARG group, whose `)` puts the
+	// lexer in EXPR_ENDARG so that a `{` right after it belongs to this command
+	// rather than to anything inside the group (see argParenEnd). Record where
+	// that `)` is before parsing, and restore the value on the way out so a
+	// nested command's own record does not outlive it.
+	argParen := -1
+	if p.is(token.LPAREN) && p.cur().SpaceBefore {
+		argParen = p.scanBalanced(p.pos, token.LPAREN, token.RPAREN)
+	}
+	p.argParenEnd = argParen
+	defer func() { p.argParenEnd = argParen }()
 	// A trailing `do…end` binds to the command call, not to an argument that is
 	// itself a call (`foo bar do…end` → the block is foo's). Suppress block
 	// attachment while parsing the arguments so the enclosing postfix chain picks
@@ -3268,6 +3549,7 @@ func (p *Parser) parseCallArgs(until token.Type) []ast.Node {
 	// less parseCommandArgs and def parameter-default handling.
 	savedMasgn := p.noMasgn
 	p.noMasgn = true
+	defer p.enterBracket()()
 	defer func() { p.bracketDepth--; p.noRescueMod = savedRescue; p.noMasgn = savedMasgn }()
 	var args []ast.Node
 	var kw *ast.HashLit
