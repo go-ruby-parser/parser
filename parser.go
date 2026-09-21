@@ -301,15 +301,6 @@ func (p *Parser) parseStatements(stop map[token.Type]bool) []ast.Node {
 
 func (p *Parser) parseStatement() ast.Node {
 	switch p.cur().Type {
-	case token.DEF:
-		// A method definition may carry a trailing modifier (`def f; …; end if c`)
-		// and is occasionally chained (`def f; end.tap { … }`), so feed it through
-		// the postfix/modifier machinery rather than returning it raw.
-		return p.applyModifiers(p.parsePostfixTail(p.parseDef()))
-	case token.CLASS:
-		return p.applyModifiers(p.parsePostfixTail(p.parseClass()))
-	case token.MODULE:
-		return p.applyModifiers(p.parsePostfixTail(p.parseModule()))
 	case token.RETURN:
 		return p.applyModifiers(p.parseReturn())
 	case token.BREAK:
