@@ -217,3 +217,23 @@ func TestModifierRescueBindsTighterThanIf(t *testing.T) {
 		t.Fatalf("%q: fallback = %T, want *ast.IntLit", src, fallback)
 	}
 }
+
+// TestRescueModifierOnAliasAndUndef covers applyModifiers' RESCUE arm. Most
+// statements have their `rescue` modifier consumed by withRescueModifier on the
+// way out of the expression layers; `alias`/`undef` never enter those layers
+// (MRI: `stmt: keyword_alias fitem fitem | keyword_undef undef_list`, both
+// reached through `stmt_or_begin`, with `stmt modifier_rescue stmt` wrapping
+// them), so the modifier is applied by the statement layer instead.
+func TestRescueModifierOnAliasAndUndef(t *testing.T) {
+	t.Parallel()
+	for _, src := range []string{`alias a b rescue nil`, `undef a rescue nil`} {
+		n := parseOne(t, src)
+		b, ok := n.(*ast.Begin)
+		if !ok {
+			t.Fatalf("Parse(%q): node = %T, want *ast.Begin", src, n)
+		}
+		if len(b.Rescues) != 1 {
+			t.Errorf("Parse(%q): %d rescue clauses, want 1", src, len(b.Rescues))
+		}
+	}
+}
