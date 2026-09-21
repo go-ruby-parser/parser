@@ -3032,6 +3032,21 @@ func (p *Parser) parsePrimary() ast.Node {
 	case token.MODULE:
 		// A module definition as an rvalue (`m = module M; …; end`).
 		return p.parseModule()
+	case token.BREAK:
+		// A bare `break`/`next`/`retry`/`return` is an alternative of `primary` in
+		// MRI (parse.y v3_4_0: `k_return` at 4438, `keyword_break`/`keyword_next`/
+		// `keyword_redo`/`keyword_retry` at 4682-4697), and `k_return call_args` /
+		// `keyword_break call_args` / `keyword_next call_args` are alternatives of
+		// `command`, so both the bare and the valued forms belong in expression
+		// position: `defined?(break)` and `defined?(break 1)` are both legal.
+		return p.parseBreak()
+	case token.NEXT:
+		return p.parseNext()
+	case token.RETRY:
+		p.advance()
+		return &ast.Retry{}
+	case token.RETURN:
+		return p.parseReturn()
 	case token.BEGIN:
 		return p.parseBegin()
 	case token.CASE:
@@ -3071,6 +3086,25 @@ func (p *Parser) parseSuper() ast.Node {
 func (p *Parser) parseIdentExpr() ast.Node {
 	name := p.cur().Lit
 	next := p.peekTok()
+
+	// `defined?` is a keyword, not a method. MRI gives it two productions
+	// (parse.y v3_4_0): `keyword_defined '\n'? '(' begin_defined expr rparen`,
+	// an alternative of `primary`, and `keyword_defined '\n'? begin_defined arg`,
+	// an alternative of `arg`. The parenthesised form takes a full `expr`, which
+	// admits the low-precedence keyword operators — `defined?($x and true)` is
+	// legal where an ordinary call argument is not. It takes ONE expr, not a
+	// statement sequence (`defined?($x; $y)` is a syntax error in MRI), and only
+	// a hugging paren selects it: `defined? (1) && nil` answers "expression",
+	// because there the parenthesis opens the `arg` instead.
+	if name == "defined?" && next.Type == token.LPAREN && !next.SpaceBefore {
+		p.advance() // defined?
+		p.advance() // (
+		p.skipNewlines()
+		arg := p.parseKeywordLogical()
+		p.skipNewlines()
+		p.expect(token.RPAREN)
+		return &ast.Call{Name: name, Args: []ast.Node{arg}}
+	}
 
 	// foo(...) — paren call (the '(' must hug the name).
 	if next.Type == token.LPAREN && !next.SpaceBefore {
