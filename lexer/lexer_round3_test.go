@@ -104,3 +104,36 @@ func TestIgnoreCaseGlobal(t *testing.T) {
 			toks[0].Type, toks[0].Lit, toks[1].Type, "$=")
 	}
 }
+
+// TestSetterSymbolBeforeRocket covers MRI's parse_ident rule for a trailing `=`
+// in a symbol name (parse.y v3_4_0):
+//
+//	c == '=' && IS_lex_state(EXPR_FNAME) &&
+//	 (!peek(p,'~') && !peek(p,'>') && (!peek(p,'=') || peek_n(p,'>',1)))
+//
+// so `{:a==>1}` is `{:a= => 1}` — the `=` joins the name precisely because the
+// `=` after it is followed by `>`.
+func TestSetterSymbolBeforeRocket(t *testing.T) {
+	for _, src := range []string{`{:a==>1}`, `{:a= =>1}`, `{:a= => 1}`} {
+		toks := New(src).Tokenize()
+		if toks[1].Type != token.SYMBOL || toks[1].Lit != "a=" {
+			t.Errorf("%s: second token = %s %q, want SYMBOL %q", src, toks[1].Type, toks[1].Lit, "a=")
+		}
+		if toks[2].Type != token.HASHROCKET {
+			t.Errorf("%s: third token = %s, want ROCKET", src, toks[2].Type)
+		}
+	}
+	// The `=` must still not be taken when it opens `==`, `=~` or `=>`.
+	for _, tc := range []struct{ src, want string }{
+		{`:a == 1`, "a"},
+		{`:a =~ /x/`, "a"},
+		{`:a => 1`, "a"},
+		{`:a = 1`, "a"},
+		{`:a= 1`, "a="},
+	} {
+		toks := New(tc.src).Tokenize()
+		if toks[0].Type != token.SYMBOL || toks[0].Lit != tc.want {
+			t.Errorf("%s: first token = %s %q, want SYMBOL %q", tc.src, toks[0].Type, toks[0].Lit, tc.want)
+		}
+	}
+}

@@ -91,6 +91,13 @@ func (l *Lexer) peek2() byte {
 	return l.src[l.pos+1]
 }
 
+func (l *Lexer) peek3() byte {
+	if l.pos+2 >= len(l.src) {
+		return 0
+	}
+	return l.src[l.pos+2]
+}
+
 func (l *Lexer) advance() byte {
 	c := l.src[l.pos]
 	l.pos++
@@ -897,8 +904,16 @@ func (l *Lexer) lexSymbol(spaceBefore bool, line, col int) token.Token {
 	switch c := l.peek(); {
 	case c == '?' || c == '!': // :empty?, :save!
 		l.advance()
-	case c == '=' && l.peek2() != '=' && l.peek2() != '~' && l.peek2() != '>':
-		l.advance() // setter symbol :name= (but not :foo== / :foo=~ / :foo=>)
+	case c == '=' && l.peek2() != '~' && l.peek2() != '>' &&
+		(l.peek2() != '=' || l.peek3() == '>'):
+		// Setter symbol `:name=`, but not `:foo=~` / `:foo=>` / `:foo==`. MRI's
+		// parse_ident (parse.y v3_4_0) takes the `=` into the name when, in
+		// EXPR_FNAME, the byte after it is neither `~` nor `>` and is either not
+		// `=` or is an `=` followed by `>`:
+		//   `(!peek(p,'~') && !peek(p,'>') && (!peek(p,'=') || peek_n(p,'>',1)))`
+		// That last clause is what makes `{:a==>1}` the pair `:a= => 1`, while
+		// `{:a ==> 1}` (where the `:a` has already ended) is a syntax error.
+		l.advance()
 	}
 	l.state = exprEnd
 	return token.Token{Type: token.SYMBOL, Lit: string(l.src[start:l.pos]), Line: line, Col: col, SpaceBefore: spaceBefore}
