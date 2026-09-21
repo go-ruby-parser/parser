@@ -125,6 +125,7 @@ func TestSetterSymbolBeforeRocket(t *testing.T) {
 	}
 	// The `=` must still not be taken when it opens `==`, `=~` or `=>`.
 	for _, tc := range []struct{ src, want string }{
+		{`:a==`, "a"}, // end of input right after the `==`
 		{`:a == 1`, "a"},
 		{`:a =~ /x/`, "a"},
 		{`:a => 1`, "a"},
