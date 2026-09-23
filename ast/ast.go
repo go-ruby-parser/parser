@@ -10,7 +10,27 @@ import "math/big"
 type Node interface{ node() }
 
 // Program is the top-level sequence of expressions.
-type Program struct{ Body []Node }
+//
+// Lines gives the 1-based source line each STATEMENT node in the tree began
+// on, keyed by the node itself (every Node is a distinct pointer, so the map is
+// exact). It is how a consumer says WHERE something is: a backtrace, Ruby's
+// __LINE__, Module#const_source_location. A node with no entry reads back as
+// line 0, which is what MRI's rb_iseq_line_no returns for a pc its own table
+// cannot place (iseq.c v3_4_0:2314).
+//
+// The granularity is deliberate. MRI attaches a line to every node and compiles
+// a per-instruction table from it (compile.c v3_4_0: ADD_INSN records
+// nd_line(node); iseq.c:673 rb_iseq_insns_info_encode_positions builds
+// insns_info + positions), but that table is COMPRESSED — one entry per line
+// CHANGE, not per instruction — and every reader resolves a pc to the nearest
+// preceding entry. Statement boundaries are where the line changes in all but
+// pathological source, so this map holds the same information at the
+// granularity a consumer can observe, without a position field on all 55 node
+// types.
+type Program struct {
+	Body  []Node
+	Lines map[Node]int
+}
 
 // IntLit is an integer literal that fits in int64.
 type IntLit struct{ Value int64 }
