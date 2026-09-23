@@ -34,10 +34,7 @@ jobs:
           COVERPKG=$(go list ./... | grep -v /ast | paste -sd, -)
           go test -race -coverpkg="$COVERPKG" -coverprofile=cover.out ./...
           go tool cover -func=cover.out | tail -n 25
-          cov=$(go tool cover -func=cover.out | tail -1 | awk '{print $3}' | tr -d '%')
-          echo "coverage: ${cov}%"
-          awk -v t="$cov" 'BEGIN { exit !(t+0 >= 100.0) }' || {
-            echo "::error::coverage ${cov}% < 100%"; exit 1; }
+          "$GITHUB_WORKSPACE/.github/coverage-gate.sh" cover.out
 
   # The parser is architecture-independent Go; the org still validates it on all
   # six supported 64-bit targets. amd64/arm64 run natively, the rest under qemu.
