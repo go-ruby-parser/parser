@@ -146,6 +146,9 @@ type Parser struct {
 	// next line (`f(`⏎`  k:`⏎`    v)`) is then a continued pair, not a value-omitted
 	// shorthand; at top level (depth 0) a newline after `key:` ends the command.
 	bracketDepth int
+	// lines collects the 1-based source line each statement node began on; it
+	// becomes ast.Program.Lines.
+	lines map[ast.Node]int
 }
 
 // parseHook, when non-nil, runs at the start of Parse. It exists only so a
@@ -157,8 +160,19 @@ var parseHook func()
 // yields a parse error, and any unexpected internal panic is also surfaced as a
 // parse error rather than propagating to the caller.
 func Parse(src string) (prog *ast.Program, err error) {
+
 	toks := lexer.New(src).Tokenize()
-	p := &Parser{toks: toks, scopes: []*scope{newScope(true)}, argParenEnd: -1}
+	// One statement per source line is the dense case, and the lexer emits one
+	// NEWLINE per line (and per `;`), so the terminator count is a tight upper
+	// bound on the entries: sizing the map by it removes the rehash growth that
+	// otherwise makes the table cost several times what it stores.
+	terms := 0
+	for _, t := range toks {
+		if t.Type == token.NEWLINE {
+			terms++
+		}
+	}
+	p := &Parser{toks: toks, scopes: []*scope{newScope(true)}, argParenEnd: -1, lines: make(map[ast.Node]int, terms)}
 	defer func() {
 		if r := recover(); r != nil {
 			if pe, ok := r.(parseError); ok {
@@ -176,7 +190,7 @@ func Parse(src string) (prog *ast.Program, err error) {
 	}
 	body := p.parseStatements(map[token.Type]bool{})
 	p.expect(token.EOF)
-	return &ast.Program{Body: body}, nil
+	return &ast.Program{Body: body, Lines: p.lines}, nil
 }
 
 // --- token cursor ---
@@ -347,7 +361,27 @@ func (p *Parser) parseStatements(stop map[token.Type]bool) []ast.Node {
 	return body
 }
 
+// parseStatement parses one statement and records the line it started on into
+// Program.Lines.
+//
+// The stamp is first-write-wins, and that is what makes it precise: an inner
+// statement is stamped when ITS parseStatement returns, before the enclosing one
+// finishes, so a construct that yields its body's node straight through
+// (`begin; foo; end`) keeps foo's own line rather than the begin's. MRI reaches
+// the same answer from the other side — the node it compiles IS foo's node, and
+// nd_line(foo) is foo's line.
 func (p *Parser) parseStatement() ast.Node {
+	line := p.cur().Line
+	n := p.parseStatement1()
+	if n != nil {
+		if _, seen := p.lines[n]; !seen {
+			p.lines[n] = line
+		}
+	}
+	return n
+}
+
+func (p *Parser) parseStatement1() ast.Node {
 	switch p.cur().Type {
 	case token.RETURN:
 		return p.applyModifiers(p.parseReturn())
