@@ -7,6 +7,6 @@ module github.com/go-ruby-parser/parser/benchmarks
 
 go 1.26.4
 
-require github.com/go-ruby-parser/parser v0.2.0
+require github.com/go-ruby-parser/parser v0.3.0
 
 replace github.com/go-ruby-parser/parser => ../
