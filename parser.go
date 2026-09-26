@@ -143,13 +143,31 @@ type Parser struct {
 	// default (`def f(a = c(1), b = nil)`), so the comma separating parameters is
 	// not mistaken for a masgn target separator (`c(1), b = nil`).
 	noMasgn bool
-	// noRescueMod suppresses the trailing modifier-`rescue` while parsing the
-	// arguments of a paren-less command call, so the `rescue` binds to the whole
-	// command rather than to its last argument: `raise "x" rescue 42` is
-	// `(raise "x") rescue 42`, not `raise("x" rescue 42)`. It is cleared inside any
-	// nested delimited context (a parenthesised group, a `(…)`/`[…]` argument list,
-	// a `{…}` hash), where an inner modifier-`rescue` is again allowed.
-	noRescueMod bool
+	// rescueModOK marks a grammar position that HAS a `modifier_rescue`
+	// alternative. MRI has exactly two families of them and `arg` is not one:
+	// `stmt: stmt modifier_rescue after_rescue stmt` (parse.y v3_4_0 3184), which
+	// every `compstmt` reaches, and the assignment right-hand sides
+	// `arg_rhs: arg modifier_rescue after_rescue arg` (4162) with its
+	// `command_rhs`/`mrhs_arg`/`endless_arg` siblings (3219, 3305, 3323, 4081).
+	// There is NO `arg: arg modifier_rescue arg` production, so a
+	// modifier-`rescue` is a SyntaxError in every `arg` position — `[x rescue
+	// nil]`, `{k: x rescue nil}`, `f(1, x rescue nil)`, `a[x rescue nil]`,
+	// `case x; when y rescue nil` — and in every `expr_value` position too, since
+	// `expr` has no such alternative either: `if x rescue nil; end` and `while x
+	// rescue nil; end` are SyntaxErrors where `if (x rescue nil); end` is not.
+	// The assignment carve-out is what makes `[a = x rescue nil]` and
+	// `f(a = 1 rescue nil)` legal in the very positions that refuse the bare form.
+	//
+	// It is false through a paren-less command call's OWN argument list too, so
+	// the `rescue` binds to the whole command rather than to its last argument:
+	// `raise "x" rescue 42` is `(raise "x") rescue 42` (`stmt modifier_rescue
+	// stmt`), not `raise("x" rescue 42)`.
+	//
+	// The zero value is therefore the refusing one, and it is inherited by the
+	// whole expression descent; only the positions MRI gives a production to turn
+	// it on. permitRescueMod is the only writer and withRescueModifier the only
+	// reader.
+	rescueModOK bool
 	// argOnly marks a grammar position MRI reaches through `arg_value: arg`
 	// (parse.y v3_4_0 4133), which has NO `command` alternative: an array-literal
 	// element, a hash key or value, a splat/double-splat/block-pass operand, any
@@ -368,6 +386,16 @@ func (p *Parser) permitCommand(allowed bool) func() {
 	return func() { p.argOnly = saved }
 }
 
+// permitRescueMod records whether the position about to be parsed admits a
+// trailing modifier-`rescue` (MRI's `modifier_rescue`) and returns the function
+// restoring the previous answer; use it as `defer p.permitRescueMod(false)()`.
+// It is the only writer of rescueModOK — see that field for the rule it carries.
+func (p *Parser) permitRescueMod(allowed bool) func() {
+	saved := p.rescueModOK
+	p.rescueModOK = allowed
+	return func() { p.rescueModOK = saved }
+}
+
 // commandArgShape selects which token shapes may open a paren-less argument list
 // for the name just decided on; the spellings differ only in that.
 type commandArgShape int
@@ -511,11 +539,13 @@ func (p *Parser) parseStatements(stop map[token.Type]bool) []ast.Node {
 	// `[begin; foo bar; end]`, `[(foo bar)]`, `[proc do foo bar end]` all parse in
 	// MRI while `[foo bar]` does not.
 	defer p.permitCommand(true)()
-	// A nested statement body (a parenthesised group, an interpolation, a keyword
-	// block) is a fresh context: an inner modifier-`rescue` there is not the one
-	// that binds to an enclosing command call, so re-enable it.
-	savedRescue := p.noRescueMod
-	p.noRescueMod = false
+	// A statement body is MRI's `compstmt`, and `stmt: stmt modifier_rescue
+	// after_rescue stmt` (3184) is the production that gives a modifier-`rescue`
+	// its main home. Every nested body — a parenthesised group, an interpolation,
+	// a keyword block, a method or block body — is one, which is why
+	// `[(x rescue nil)]` and `f(begin; x rescue nil; end)` parse where
+	// `[x rescue nil]` and `f(x rescue nil)` do not.
+	defer p.permitRescueMod(true)()
 	// A nested statement body also resets MRI's CMDARG bit-stack, so a `do` inside
 	// it opens a block for the call it follows even when the body itself sits in a
 	// paren-less command-argument list: `foo :a, begin; y do end; end`,
@@ -534,7 +564,6 @@ func (p *Parser) parseStatements(stop map[token.Type]bool) []ast.Node {
 	p.noDoBlock = false
 	defer func() {
 		p.noMasgn = savedMasgn
-		p.noRescueMod = savedRescue
 		p.noDoBlock = savedDoBlock
 	}()
 	var body []ast.Node
@@ -1132,6 +1161,11 @@ func (p *Parser) parseCond() ast.Node {
 	// on parsing inside an `arg` position too: `[while foo bar; end]` is legal
 	// where `[foo bar]` is not.
 	defer p.permitCommand(true)()
+	// `expr_value` is an `expr`, and only `stmt` has a `modifier_rescue`
+	// alternative (3184), so `if x rescue nil; end` and `while x rescue nil; end`
+	// are SyntaxErrors in MRI while `if (x rescue nil); end` is not — the
+	// parenthesised group is a `compstmt`.
+	defer p.permitRescueMod(false)()
 	return p.parseOneLineMatch(p.parseKeywordLogical())
 }
 
@@ -1436,6 +1470,33 @@ func (p *Parser) parseBegin() ast.Node {
 	return node
 }
 
+// clauseThen consumes MRI's `then` nonterminal — `term | keyword_then | term
+// keyword_then`, where a `term` is a newline or a `;` — which both
+// `opt_rescue: k_rescue exc_list exc_var then compstmt` (parse.y v3_4_0 5926)
+// and `case_body: k_when case_args then compstmt` (5397) REQUIRE: `begin; x;
+// rescue Foo end` and `case x; when 1 end` are SyntaxErrors in MRI.
+//
+// Requiring it is also what makes the `arg_value`-ness of those two lists
+// observable. `exc_list: arg_value` and `case_args: arg_value` have no
+// `command` alternative, so commandArgsFollow already declines to give `foo` the
+// argument `bar` in `rescue foo bar` / `when foo bar` — but with the terminator
+// optional the leftover `bar` was simply read as the clause's FIRST STATEMENT
+// and the whole clause parsed. A refused production only shows up as an error
+// if something downstream insists on what must come next.
+func (p *Parser) clauseThen(clause string) {
+	if p.accept(token.THEN) {
+		return
+	}
+	if !p.is(token.NEWLINE) {
+		p.fail("expected a newline, %q or %q after the %s clause head, got %q (%s)",
+			";", "then", clause, p.cur().Lit, p.cur().Type)
+	}
+	p.advance()
+	// `term keyword_then` — `rescue Foo; then y` and `when 1; then 2` are legal.
+	p.skipNewlines()
+	p.accept(token.THEN)
+}
+
 // parseRescueTail parses the `(rescue …)* [else …] [ensure …]` clauses that
 // follow an already-parsed body, returning a Begin. The caller consumes `end`.
 // It is shared by `begin … end` and method-level rescue (`def … rescue … end`).
@@ -1463,7 +1524,7 @@ func (p *Parser) parseRescueTail(body []ast.Node) *ast.Begin {
 				clause.VarTarget = p.rescueVarTarget()
 			}
 		}
-		p.accept(token.THEN)
+		p.clauseThen("rescue")
 		clause.Body = p.parseStatements(beginBodyEnd)
 		node.Rescues = append(node.Rescues, clause)
 	}
@@ -1592,9 +1653,13 @@ func (p *Parser) parseCase() ast.Node {
 	var subject ast.Node
 	if !p.is(token.NEWLINE) {
 		// `k_case expr_value opt_terms case_body k_end` — the subject admits a
-		// command (`case foo bar` ⏎ `when 1` ⏎ `end` parses in MRI).
+		// command (`case foo bar` ⏎ `when 1` ⏎ `end` parses in MRI) but, being an
+		// `expr_value`, not a modifier-`rescue`: `case x rescue nil; when 1; end`
+		// is a SyntaxError where `case (x rescue nil); when 1; end` is not.
 		restore := p.permitCommand(true)
+		restoreRescue := p.permitRescueMod(false)
 		subject = p.parseExprOrAssign()
+		restoreRescue()
 		restore()
 	}
 	p.skipNewlines()
@@ -1610,7 +1675,7 @@ func (p *Parser) parseCase() ast.Node {
 		for p.accept(token.COMMA) {
 			clause.Conds = append(clause.Conds, p.parseSplatOrExpr())
 		}
-		p.accept(token.THEN)
+		p.clauseThen("when")
 		clause.Body = p.parseStatements(caseBodyEnd)
 		node.Whens = append(node.Whens, clause)
 	}
@@ -2355,35 +2420,35 @@ func (p *Parser) parseExprOrAssign() ast.Node {
 	if p.is(token.IDENT) && p.peekTok().Type == token.OPASSIGN {
 		name := p.advance().Lit
 		op := p.advance().Lit
-		rhs := p.parseExprOrAssign()
+		rhs := p.assignRhsValue()
 		p.declareLocal(name)
 		return &ast.OpAssign{Name: name, Op: op, Value: rhs}
 	}
 	if p.is(token.IVAR) && p.peekTok().Type == token.OPASSIGN {
 		name := p.advance().Lit
 		op := p.advance().Lit
-		rhs := p.parseExprOrAssign()
+		rhs := p.assignRhsValue()
 		return &ast.IvarAssign{Name: name, Value: &ast.BinaryExpr{Op: op, Left: &ast.IvarRef{Name: name}, Right: rhs}}
 	}
 	// Compound assignment to a global: $name OP= expr → $name = $name OP expr.
 	if p.is(token.GVAR) && p.peekTok().Type == token.OPASSIGN {
 		name := p.advance().Lit
 		op := p.advance().Lit
-		rhs := p.parseExprOrAssign()
+		rhs := p.assignRhsValue()
 		return &ast.GVarAssign{Name: name, Value: &ast.BinaryExpr{Op: op, Left: &ast.GVarRef{Name: name}, Right: rhs}}
 	}
 	// Compound assignment to a class variable: @@name OP= expr.
 	if p.is(token.CVAR) && p.peekTok().Type == token.OPASSIGN {
 		name := p.advance().Lit
 		op := p.advance().Lit
-		rhs := p.parseExprOrAssign()
+		rhs := p.assignRhsValue()
 		return &ast.CVarAssign{Name: name, Value: &ast.BinaryExpr{Op: op, Left: &ast.CVarRef{Name: name}, Right: rhs}}
 	}
 	// Compound assignment to a constant: NAME OP= expr (`C += 1`, `C ||= default`).
 	if p.is(token.CONST) && p.peekTok().Type == token.OPASSIGN {
 		name := p.advance().Lit
 		op := p.advance().Lit
-		rhs := p.parseExprOrAssign()
+		rhs := p.assignRhsValue()
 		return constOpAssign(op, &ast.ConstRef{Name: name}, rhs, func(v ast.Node) ast.Node {
 			return &ast.ConstAssign{Name: name, Value: v}
 		})
@@ -2394,7 +2459,7 @@ func (p *Parser) parseExprOrAssign() ast.Node {
 			// Compound index assignment: recv[i] OP= v → recv[i] = recv[i] OP v.
 			if call.Name == "[]" {
 				op := p.advance().Lit
-				rhs := p.parseExprOrAssign()
+				rhs := p.assignRhsValue()
 				read := &ast.Call{Recv: call.Recv, Name: "[]", Args: call.Args}
 				newVal := &ast.BinaryExpr{Op: op, Left: read, Right: rhs}
 				args := append(append([]ast.Node{}, call.Args...), newVal)
@@ -2403,7 +2468,7 @@ func (p *Parser) parseExprOrAssign() ast.Node {
 			// Compound attribute assignment: recv.a OP= v → recv.a = recv.a OP v.
 			if len(call.Args) == 0 && call.Block == nil {
 				op := p.advance().Lit
-				rhs := p.parseExprOrAssign()
+				rhs := p.assignRhsValue()
 				read := &ast.Call{Recv: call.Recv, Name: call.Name}
 				newVal := &ast.BinaryExpr{Op: op, Left: read, Right: rhs}
 				return &ast.Call{Recv: call.Recv, Name: call.Name + "=", Args: []ast.Node{newVal}}
@@ -2412,7 +2477,7 @@ func (p *Parser) parseExprOrAssign() ast.Node {
 		// Compound scope-resolved constant assignment: `A::B OP= v`.
 		if sc, ok := left.(*ast.ScopedConst); ok {
 			op := p.advance().Lit
-			rhs := p.parseExprOrAssign()
+			rhs := p.assignRhsValue()
 			return constOpAssign(op, sc, rhs, func(v ast.Node) ast.Node {
 				return &ast.ScopedConstAssign{Target: sc, Value: v}
 			})
@@ -2466,6 +2531,12 @@ func constOpAssign(op string, ref, rhs ast.Node, assign func(ast.Node) ast.Node)
 // leading `*splat` — makes the RHS an implicit array: `x = 1, 2, 3` ≡ `x = [1,
 // 2, 3]` and `a = *list, y` ≡ `a = [*list, y]`, matching MRI.
 func (p *Parser) parseAssignRhs() ast.Node {
+	// `arg_rhs: arg modifier_rescue after_rescue arg` (parse.y v3_4_0 4162) — an
+	// assignment's right-hand side is the ONE `arg` position with a
+	// `modifier_rescue` alternative, which is why `[a = x rescue nil]` and
+	// `f(a = 1 rescue nil)` are legal where `[x rescue nil]` and `f(x rescue nil)`
+	// are not.
+	defer p.permitRescueMod(true)()
 	first := p.parseRhsElem()
 	// While masgn is suppressed (a parameter default or a keyword-argument value),
 	// a comma ends this value rather than gathering an implicit array RHS, so
@@ -2490,6 +2561,17 @@ func (p *Parser) parseAssignRhs() ast.Node {
 		elems = append(elems, p.restElem())
 	}
 	return &ast.ArrayLit{Elems: elems}
+}
+
+// assignRhsValue parses a single-value assignment right-hand side — the one an
+// `OP=` takes, and the one an attribute/index `=` takes when the target was
+// already parsed. Like parseAssignRhs it is MRI's `arg_rhs` (parse.y v3_4_0
+// 4157-4166), so a modifier-`rescue` is available even inside an `arg` position:
+// `f(a ||= 1 rescue nil)` and `f(a.b = 1 rescue nil)` parse where
+// `f(a rescue nil)` does not. It takes no comma list, which `arg_rhs` has none of.
+func (p *Parser) assignRhsValue() ast.Node {
+	defer p.permitRescueMod(true)()
+	return p.parseExprOrAssign()
 }
 
 // parseRhsElem parses one element of an assignment right-hand side, which may be
@@ -2522,11 +2604,15 @@ func (p *Parser) restElem() ast.Node {
 // A clause `rescue` (in a begin/def body) always starts a new line, so the
 // preceding NEWLINE keeps it from being read as a modifier. Left-associative.
 func (p *Parser) withRescueModifier(node ast.Node) ast.Node {
-	// While parsing a paren-less command call's arguments the modifier binds to the
-	// whole call, not to this (last) argument, so leave the `rescue` for the
-	// enclosing command node to consume: `raise "x" rescue 42` == `(raise "x")
-	// rescue 42`.
-	for p.is(token.RESCUE) && !p.noRescueMod {
+	// It is the ONE place MRI's "which positions have a `modifier_rescue`
+	// alternative" question is answered, so the rule cannot drift between call
+	// sites (the lesson commandArgsFollow already encodes for `arg`/`command`).
+	// A `rescue` left unconsumed here is not silently dropped: the caller's
+	// terminator check reports it. That is how `f(x rescue nil)` and
+	// `[x rescue nil]` become parse errors, and how the modifier binds to the
+	// whole paren-less call rather than to its last argument — `raise "x" rescue
+	// 42` == `(raise "x") rescue 42`.
+	for p.is(token.RESCUE) && p.rescueModOK {
 		p.advance()
 		fallback := p.parseTernary()
 		node = &ast.Begin{Body: []ast.Node{node}, Rescues: []ast.RescueClause{{Body: []ast.Node{fallback}}}}
@@ -2723,13 +2809,13 @@ func (p *Parser) maybeInlineAssign(node ast.Node) ast.Node {
 			if n.Name == "[]" {
 				p.advance()
 				n.Name = "[]="
-				n.Args = append(n.Args, p.parseExprOrAssign())
+				n.Args = append(n.Args, p.assignRhsValue())
 				return n
 			}
 			if len(n.Args) == 0 {
 				p.advance()
 				n.Name += "="
-				n.Args = []ast.Node{p.parseExprOrAssign()}
+				n.Args = []ast.Node{p.assignRhsValue()}
 				return n
 			}
 		}
@@ -2757,13 +2843,13 @@ func (p *Parser) inlineOpAssign(node ast.Node) ast.Node {
 	switch n := node.(type) {
 	case *ast.VarRef:
 		op := p.advance().Lit
-		rhs := p.parseExprOrAssign()
+		rhs := p.assignRhsValue()
 		p.declareLocal(n.Name)
 		return &ast.OpAssign{Name: n.Name, Op: op, Value: rhs}
 	case *ast.Call:
 		if n.Recv == nil && len(n.Args) == 0 && n.Block == nil { // a bare local
 			op := p.advance().Lit
-			rhs := p.parseExprOrAssign()
+			rhs := p.assignRhsValue()
 			p.declareLocal(n.Name)
 			return &ast.OpAssign{Name: n.Name, Op: op, Value: rhs}
 		}
@@ -2771,7 +2857,7 @@ func (p *Parser) inlineOpAssign(node ast.Node) ast.Node {
 			// recv[i] OP= v → recv[i] = recv[i] OP v; recv.a OP= v → recv.a = recv.a OP v.
 			if n.Name == "[]" {
 				op := p.advance().Lit
-				rhs := p.parseExprOrAssign()
+				rhs := p.assignRhsValue()
 				read := &ast.Call{Recv: n.Recv, Name: "[]", Args: n.Args}
 				newVal := &ast.BinaryExpr{Op: op, Left: read, Right: rhs}
 				args := append(append([]ast.Node{}, n.Args...), newVal)
@@ -2779,7 +2865,7 @@ func (p *Parser) inlineOpAssign(node ast.Node) ast.Node {
 			}
 			if len(n.Args) == 0 {
 				op := p.advance().Lit
-				rhs := p.parseExprOrAssign()
+				rhs := p.assignRhsValue()
 				read := &ast.Call{Recv: n.Recv, Name: n.Name}
 				newVal := &ast.BinaryExpr{Op: op, Left: read, Right: rhs}
 				return &ast.Call{Recv: n.Recv, Name: n.Name + "=", Args: []ast.Node{newVal}}
@@ -2787,15 +2873,15 @@ func (p *Parser) inlineOpAssign(node ast.Node) ast.Node {
 		}
 	case *ast.IvarRef:
 		op := p.advance().Lit
-		rhs := p.parseExprOrAssign()
+		rhs := p.assignRhsValue()
 		return &ast.IvarAssign{Name: n.Name, Value: &ast.BinaryExpr{Op: op, Left: &ast.IvarRef{Name: n.Name}, Right: rhs}}
 	case *ast.CVarRef:
 		op := p.advance().Lit
-		rhs := p.parseExprOrAssign()
+		rhs := p.assignRhsValue()
 		return &ast.CVarAssign{Name: n.Name, Value: &ast.BinaryExpr{Op: op, Left: &ast.CVarRef{Name: n.Name}, Right: rhs}}
 	case *ast.GVarRef:
 		op := p.advance().Lit
-		rhs := p.parseExprOrAssign()
+		rhs := p.assignRhsValue()
 		return &ast.GVarAssign{Name: n.Name, Value: &ast.BinaryExpr{Op: op, Left: &ast.GVarRef{Name: n.Name}, Right: rhs}}
 	}
 	return nil
@@ -2845,6 +2931,18 @@ func (p *Parser) parseUnary() ast.Node {
 		return p.parseUnary() // unary plus is a no-op
 	case token.BANG:
 		p.advance()
+		// `!` is the ONE unary operator whose operand may be a paren-less command
+		// call, and the alternative that allows it is `expr: '!' command_call`
+		// (parse.y v3_4_0 3350) — a `command_call`, NOT an `expr`. The only other
+		// arm is `arg: '!' arg` (4009), whose operand is an `arg`. So the privilege
+		// does not nest: `!foo bar` parses in MRI and `!!foo bar` does not, because
+		// the inner `!foo bar` is not a `command_call` and the outer `!` therefore
+		// has to be the `arg` arm. `arg` has no `keyword_not` alternative either,
+		// so `!not …` falls the same way (which is where MRI's two parsers part
+		// company: prism accepts `!not x`, parse.y refuses it).
+		if p.is(token.BANG) || p.is(token.NOT) {
+			defer p.permitCommand(false)()
+		}
 		return &ast.UnaryExpr{Op: "!", Operand: p.parseUnary()}
 	case token.TILDE:
 		p.advance()
@@ -3854,10 +3952,10 @@ func (p *Parser) parseCommandArgs() []ast.Node {
 	// assignment value stops at the comma. Mirrors parameter-default handling.
 	savedMasgn := p.noMasgn
 	p.noMasgn = true
-	// A trailing modifier-`rescue` binds to the whole command call, not to its last
-	// argument, so suppress it here and let the enclosing expression consume it.
-	savedRescue := p.noRescueMod
-	p.noRescueMod = true
+	// An argument is an `arg_value`, which has no `modifier_rescue` alternative,
+	// so a trailing modifier-`rescue` binds to the whole command call and is left
+	// for the enclosing `stmt` to consume: `raise "x" rescue 42`.
+	restoreRescue := p.permitRescueMod(false)
 	// `command_args: call_args` and `call_args: command` (parse.y v3_4_0 4250,
 	// 4223) give the HEAD argument of a paren-less call the right to be a
 	// paren-less call itself — `foo bar baz` is `foo(bar(baz))` — while the later
@@ -3874,7 +3972,7 @@ func (p *Parser) parseCommandArgs() []ast.Node {
 		p.parseOneCallArg(&args, &kw)
 	}
 	restoreRest()
-	p.noRescueMod = savedRescue
+	restoreRescue()
 	p.noMasgn = savedMasgn
 	p.noDoBlock = saved
 	if kw != nil {
@@ -3903,11 +4001,12 @@ func (p *Parser) parseArrayElems() []ast.Node {
 
 func (p *Parser) parseArgList(until token.Type, headAdmitsCommand bool) []ast.Node {
 	p.bracketDepth++
-	// A parenthesised `(…)` argument list or `[…]` element list is a fresh,
-	// delimited context: an inner modifier-`rescue` (`foo(bar rescue baz)`) belongs
-	// to that argument, not to any enclosing command call, so re-enable it.
-	savedRescue := p.noRescueMod
-	p.noRescueMod = false
+	// Every element of the list is an `arg_value` (or, for the head, a `command`),
+	// and NEITHER has a `modifier_rescue` alternative: `f(bar rescue baz)`,
+	// `[x rescue nil]` and `a[x rescue nil]` are SyntaxErrors in MRI, which wants
+	// `f((bar rescue baz))`. The bracket is not a fresh statement context — only
+	// a `(…)` GROUP is, and that is a `compstmt` parsed elsewhere.
+	defer p.permitRescueMod(false)()
 	// The comma separates arguments (or array elements), so multiple-assignment
 	// detection must be off: `f(a = 1, b = 2, 3)` is three arguments (the first two
 	// assignments), not `f(a = [1, b = [2, 3]])`, and `[x = 1, 2]` is a two-element
@@ -3924,7 +4023,6 @@ func (p *Parser) parseArgList(until token.Type, headAdmitsCommand bool) []ast.No
 	defer p.enterBracket()()
 	defer func() {
 		p.bracketDepth--
-		p.noRescueMod = savedRescue
 		p.noMasgn = savedMasgn
 	}()
 	var args []ast.Node

@@ -3,6 +3,7 @@ package parser_test
 import (
 	"testing"
 
+	"github.com/go-ruby-parser/parser"
 	"github.com/go-ruby-parser/parser/ast"
 )
 
@@ -156,9 +157,11 @@ func TestModifierRescueUnchangedNonCommand(t *testing.T) {
 	})
 }
 
-// TestModifierRescueInsideDelimitedArg checks that a modifier rescue inside a
-// nested delimited context (an explicit paren group, or a parenthesised argument
-// list) is still consumed there — the command-call suppression must not leak in.
+// TestModifierRescueInsideDelimitedArg checks where a modifier rescue nested
+// inside a delimited context is consumed. A `(…)` GROUP is MRI's `compstmt`, so
+// the rescue is consumed there; a `(…)` ARGUMENT LIST is not — its contents are
+// `call_args`, which has no `modifier_rescue` alternative. Both directions
+// measured on ruby 4.0.5 with `ruby -c` and `ruby --parser=parse.y -c`.
 func TestModifierRescueInsideDelimitedArg(t *testing.T) {
 	// Explicit paren group as a command argument: the rescue binds inside the
 	// group, so the group becomes a Begin argument of the command.
@@ -171,10 +174,20 @@ func TestModifierRescueInsideDelimitedArg(t *testing.T) {
 		}
 	})
 
-	// Parenthesised argument list nested inside a command call: the inner rescue
-	// belongs to that argument (`foo(bar rescue baz)`), while `outer` keeps both.
-	t.Run("paren arglist inside command", func(t *testing.T) {
-		const src = `outer foo(bar rescue baz)`
+	// A parenthesised ARGUMENT LIST is not a statement context: `f(bar rescue
+	// baz)` is a SyntaxError in MRI, which wants `f((bar rescue baz))`. Both of
+	// MRI's parsers refuse it — prism says "unexpected 'rescue' modifier; expected
+	// a `)` to close the arguments" — because `call_args`/`args`/`arg_value` offer
+	// no `modifier_rescue` arm; only `stmt` (3184) and `arg_rhs` (4162) do. This
+	// subtest previously asserted the opposite and pinned our own divergence.
+	t.Run("paren arglist inside command refuses it", func(t *testing.T) {
+		for _, src := range []string{`outer foo(bar rescue baz)`, `foo(bar rescue baz)`} {
+			if _, err := parser.Parse(src); err == nil {
+				t.Errorf("Parse(%q) = nil error, want a parse error (MRI 4.0.5 refuses it)", src)
+			}
+		}
+		// The shape MRI does accept: the argument's own parentheses make it a group.
+		const src = `outer foo((bar rescue baz))`
 		outer := wantCall(t, src, parseOne(t, src), "outer", 1)
 		foo := wantCall(t, src, outer.Args[0], "foo", 1)
 		body, _ := beginWrapping(t, src, foo.Args[0])
