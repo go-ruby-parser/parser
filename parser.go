@@ -33,6 +33,16 @@ type scope struct {
 	explicitParams bool
 	maxNum         int  // highest _N referenced in the block body (0 = none)
 	usedIt         bool // bare `it` referenced in the block body
+	// savedNoDo/savedNoDoBlock hold the `do`-suppression flags a HARD scope
+	// displaced on entry; popScope restores them. A hard scope is MRI's
+	// local_push, which does `CMDARG_PUSH(0); COND_PUSH(0)` (parse.y v3_4_0
+	// 14936-14937) and pops both in local_pop (14977-14978), so a `def`, `class`,
+	// `module` or singleton-class body inside a loop condition is free of both
+	// suppressions: `while def f; y do end; end; end` parses in MRI 4.0.5. A soft
+	// scope is dyna_push, which touches neither stack — a `do…end` block body is
+	// not a fresh COND context of its own (parse.y v3_4_0 5376-5379: do_body
+	// pushes CMDARG only).
+	savedNoDo, savedNoDoBlock bool
 }
 
 func newScope(hard bool) *scope { return &scope{locals: map[string]bool{}, hard: hard} }
@@ -295,10 +305,40 @@ func (p *Parser) atDoBlock() bool {
 	return p.is(token.DO) && !p.noDo && !p.noDoBlock
 }
 
+// enterDoScope clears BOTH `do`-suppression flags and returns the function
+// restoring them; use it as `defer p.enterDoScope()()`. It is MRI's
+// `COND_PUSH(0); CMDARG_PUSH(0)` pair, which parse.y v3_4_0 performs at exactly
+// two kinds of place: the lexer's `(`, `[` and `{` (11193, 11221, 11245 — see
+// enterBracket) and `tSTRING_DBEG`, the `#{` that opens an interpolation (6181-
+// 6182, popped at string_dend, 6197-6198). Both stacks are reset together
+// there, so a `do` inside such a nesting opens a block for the call it follows
+// whatever the enclosing context was — a loop condition (COND) or a paren-less
+// command-argument list (CMDARG).
+//
+// Expressing it once is the point: the same reset is needed at every grouping
+// construct, and a rule restated at each call site drifts. The contexts MRI
+// resets only CMDARG at (`begin`, `if`, a `do…end` body, a `-> do … end` body)
+// must NOT come through here — that asymmetry is what keeps
+// `while begin; y do end; end; end` a SyntaxError, as it is in MRI.
+func (p *Parser) enterDoScope() func() {
+	savedDo, savedDoBlock := p.noDo, p.noDoBlock
+	p.noDo, p.noDoBlock = false, false
+	return func() { p.noDo, p.noDoBlock = savedDo, savedDoBlock }
+}
+
+// enterBracket enters a `(`, `[` or `{`. MRI's lexer treats the three
+// identically: `++paren_nest; COND_PUSH(0); CMDARG_PUSH(0)` (parse.y v3_4_0
+// 11192-11194, 11220-11222, 11244-11246). The paren_nest half is noBraceBlock
+// (a `{` inside a bracket is an ordinary block, never a lambda body); the two
+// bit-stacks are enterDoScope.
 func (p *Parser) enterBracket() func() {
 	saved := p.noBraceBlock
 	p.noBraceBlock = false
-	return func() { p.noBraceBlock = saved }
+	restoreDo := p.enterDoScope()
+	return func() {
+		restoreDo()
+		p.noBraceBlock = saved
+	}
 }
 
 func (p *Parser) skipNewlines() {
@@ -320,10 +360,27 @@ func (p *Parser) firstSignificantIs(tt token.Type) bool {
 
 // --- scope ---
 
-func (p *Parser) scope() *scope         { return p.scopes[len(p.scopes)-1] }
-func (p *Parser) pushScope()            { p.scopes = append(p.scopes, newScope(true)) }
-func (p *Parser) pushBlockScope()       { p.scopes = append(p.scopes, newScope(false)) }
-func (p *Parser) popScope()             { p.scopes = p.scopes[:len(p.scopes)-1] }
+func (p *Parser) scope() *scope { return p.scopes[len(p.scopes)-1] }
+
+// pushScope opens a hard scope — MRI's local_push, which also resets both
+// `do`-attachment bit-stacks (see the scope fields).
+func (p *Parser) pushScope() {
+	s := newScope(true)
+	s.savedNoDo, s.savedNoDoBlock = p.noDo, p.noDoBlock
+	p.noDo, p.noDoBlock = false, false
+	p.scopes = append(p.scopes, s)
+}
+
+func (p *Parser) pushBlockScope() { p.scopes = append(p.scopes, newScope(false)) }
+
+func (p *Parser) popScope() {
+	s := p.scopes[len(p.scopes)-1]
+	p.scopes = p.scopes[:len(p.scopes)-1]
+	if s.hard {
+		p.noDo, p.noDoBlock = s.savedNoDo, s.savedNoDoBlock
+	}
+}
+
 func (p *Parser) declareLocal(n string) { p.scope().locals[n] = true }
 
 // isLocal reports whether n is a visible local: it searches the scope chain but
@@ -647,7 +704,9 @@ func (p *Parser) parseDef() ast.Node {
 	// is not a single statement is rejected here too.
 	if p.is(token.LPAREN) {
 		p.advance() // (
+		restore := p.enterBracket()
 		stmts := p.parseStatements(map[token.Type]bool{token.RPAREN: true})
+		restore()
 		if len(stmts) != 1 {
 			p.fail("singleton def receiver must be a single expression")
 		}
@@ -1413,6 +1472,13 @@ var interpEnd = map[token.Type]bool{token.STRMID: true, token.STREND: true}
 // and several `;`-separated statements). Its value is the last statement; an
 // empty body (`#{}`) is nil.
 func (p *Parser) parseInterpBody() ast.Node {
+	// `#{` is MRI's tSTRING_DBEG, which pushes CMDARG 0 AND COND 0 (parse.y v3_4_0
+	// 6181-6182, popped at string_dend, 6197-6198), so a `do` inside an
+	// interpolation opens a block for the call it follows both in a paren-less
+	// command argument (`foo :a, "#{y do end}"`) and in a loop condition
+	// (`while "#{y do end}"; end`). It is not a bracket for noBraceBlock purposes:
+	// tSTRING_DBEG leaves paren_nest alone and tracks brace_nest instead.
+	defer p.enterDoScope()()
 	stmts := p.parseStatements(interpEnd)
 	switch len(stmts) {
 	case 0:
@@ -2788,12 +2854,11 @@ func (p *Parser) parseArrayLiteral() ast.Node {
 // here at expression-start; a `{` after a call is a block (see parsePostfix).
 func (p *Parser) parseHashLiteral() ast.Node {
 	p.expect(token.LBRACE)
-	// The `{` pushed CMDARG 0 in MRI's lexer (parse.y v3_4_0 11245), so a `do` in a
-	// value belongs to the call it follows even inside a paren-less command
-	// argument: `foo :a, {k: y do end}`.
-	savedDoBlock := p.noDoBlock
-	p.noDoBlock = false
-	defer func() { p.noDoBlock = savedDoBlock }()
+	// The `{` pushed COND 0 and CMDARG 0 in MRI's lexer (parse.y v3_4_0 11244-
+	// 11246), so a `do` in a value belongs to the call it follows both inside a
+	// paren-less command argument (`foo :a, {k: y do end}`) and inside a loop
+	// condition (`while {a: y do end}[:a]; end`).
+	defer p.enterBracket()()
 	h := &ast.HashLit{}
 	p.skipNewlines()
 	for !p.is(token.RBRACE) {
@@ -2916,10 +2981,9 @@ func (p *Parser) parseLambda() ast.Node {
 		// on top of the rule's own CMDARG_PUSH(0). So this body is free of BOTH
 		// suppressions, and `while -> { y do end }.call; end` parses.
 		p.expect(token.LBRACE)
-		savedNoDo := p.noDo
-		p.noDo = false
+		restore := p.enterDoScope()
 		body = p.parseStatements(braceBlockEnd)
-		p.noDo = savedNoDo
+		restore()
 		p.expect(token.RBRACE)
 	}
 	params = p.finishImplicitParams(bs, params)
@@ -2984,10 +3048,9 @@ func (p *Parser) parseBlockRest(stop map[token.Type]bool, end token.Type, withRe
 	// when COND_P() is already false — puts MRI's COND stack at 0 (parse.y v3_4_0
 	// 11245 and 10519-10527). So a block written inside a while/until condition
 	// still takes its own inner `do…end`: `while [1].each { |x| y do end }; end`.
-	savedNoDo := p.noDo
-	p.noDo = false
+	restoreDo := p.enterDoScope()
 	body := p.parseStatements(stop)
-	p.noDo = savedNoDo
+	restoreDo()
 	if withRescue && (p.is(token.RESCUE) || p.is(token.ELSE) || p.is(token.ENSURE)) {
 		body = []ast.Node{p.parseRescueTail(body)}
 	}
@@ -3658,18 +3721,17 @@ func (p *Parser) parseCallArgs(until token.Type) []ast.Node {
 	// less parseCommandArgs and def parameter-default handling.
 	savedMasgn := p.noMasgn
 	p.noMasgn = true
-	// The `(` / `[` that opened this list pushed CMDARG 0 in MRI's lexer (parse.y
-	// v3_4_0 11193, 11221), so a `do` inside belongs to the call it follows even
-	// when the whole list is an argument of a paren-less command call:
-	// `foo :a, bar(y do end)`, `foo :a, [y do end]`.
-	savedDoBlock := p.noDoBlock
-	p.noDoBlock = false
+	// The `(` / `[` that opened this list pushed COND 0 and CMDARG 0 in MRI's lexer
+	// (parse.y v3_4_0 11192-11194, 11220-11222) — enterBracket — so a `do` inside
+	// belongs to the call it follows both when the whole list is an argument of a
+	// paren-less command call (`foo :a, bar(y do end)`, `foo :a, [y do end]`) and
+	// when it sits in a loop condition (`while [y do end]; end`, `while a[y do
+	// end]; end`).
 	defer p.enterBracket()()
 	defer func() {
 		p.bracketDepth--
 		p.noRescueMod = savedRescue
 		p.noMasgn = savedMasgn
-		p.noDoBlock = savedDoBlock
 	}()
 	var args []ast.Node
 	var kw *ast.HashLit
