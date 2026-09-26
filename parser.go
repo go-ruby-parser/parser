@@ -1126,6 +1126,10 @@ func (p *Parser) parseParamDefault() ast.Node {
 	// `f_opt: f_arg_asgn f_eq arg_value` — an `arg`, so `def m(a = foo bar); end`
 	// is a SyntaxError in MRI.
 	defer p.permitCommand(false)()
+	// An `arg_value`, NOT an `arg_rhs`: a parameter default has no
+	// `modifier_rescue` alternative, so `def m(a = x rescue nil); end` is a
+	// SyntaxError where `def m(a = (x rescue nil)); end` is legal.
+	defer p.permitRescueMod(false)()
 	saved := p.noMasgn
 	p.noMasgn = true
 	def := p.parseExprOrAssign()
@@ -1141,6 +1145,10 @@ func (p *Parser) parseKwArgValue() ast.Node {
 	// a parameter list are both `arg`, so `{k: foo bar}`, `f(k: foo bar)` and
 	// `def m(a: foo bar); end` are SyntaxErrors in MRI.
 	defer p.permitCommand(false)()
+	// An `arg_value` too, so no modifier-`rescue`: `f(k: x rescue nil)` and
+	// `def m(a: x rescue nil); end` are SyntaxErrors where `f(k: (x rescue nil))`
+	// and `f(k: a = x rescue nil)` are legal.
+	defer p.permitRescueMod(false)()
 	saved := p.noMasgn
 	p.noMasgn = true
 	v := p.parseExprOrAssign()
@@ -1172,13 +1180,13 @@ func (p *Parser) parseCond() ast.Node {
 func (p *Parser) parseIf() ast.Node {
 	p.expect(token.IF)
 	cond := p.parseCond()
-	p.accept(token.THEN)
+	p.clauseHeadEnd("if", token.THEN)
 	then := p.parseStatements(ifBodyEnd)
 	node := &ast.If{Cond: cond, Then: then}
 	for p.is(token.ELSIF) {
 		p.advance()
 		c := p.parseCond()
-		p.accept(token.THEN)
+		p.clauseHeadEnd("elsif", token.THEN)
 		b := p.parseStatements(ifBodyEnd)
 		node.Elsifs = append(node.Elsifs, ast.Elsif{Cond: c, Body: b})
 	}
@@ -1193,7 +1201,7 @@ func (p *Parser) parseIf() ast.Node {
 func (p *Parser) parseUnless() ast.Node {
 	p.expect(token.UNLESS)
 	cond := p.parseCond()
-	p.accept(token.THEN)
+	p.clauseHeadEnd("unless", token.THEN)
 	then := p.parseStatements(ifBodyEnd)
 	node := &ast.If{Cond: not(cond), Then: then}
 	if p.accept(token.ELSE) {
@@ -1206,7 +1214,7 @@ func (p *Parser) parseUnless() ast.Node {
 func (p *Parser) parseWhile() ast.Node {
 	p.expect(token.WHILE)
 	cond := p.parseLoopCond()
-	p.accept(token.DO)
+	p.clauseHeadEnd("while", token.DO)
 	body := p.parseStatements(bodyEnd)
 	p.expect(token.END)
 	return &ast.While{Cond: cond, Body: body}
@@ -1226,7 +1234,7 @@ func (p *Parser) parseLoopCond() ast.Node {
 func (p *Parser) parseUntil() ast.Node {
 	p.expect(token.UNTIL)
 	cond := p.parseLoopCond()
-	p.accept(token.DO)
+	p.clauseHeadEnd("until", token.DO)
 	body := p.parseStatements(bodyEnd)
 	p.expect(token.END)
 	return &ast.While{Cond: not(cond), Body: body}
@@ -1242,7 +1250,7 @@ func (p *Parser) parseFor() ast.Node {
 	vars, target := p.parseForVar()
 	p.expect(token.IN)
 	iter := p.parseLoopCond()
-	p.accept(token.DO)
+	p.clauseHeadEnd("for", token.DO)
 	body := p.parseStatements(bodyEnd)
 	p.expect(token.END)
 	return &ast.For{Vars: vars, Target: target, Iter: iter, Body: body}
@@ -1470,31 +1478,43 @@ func (p *Parser) parseBegin() ast.Node {
 	return node
 }
 
-// clauseThen consumes MRI's `then` nonterminal — `term | keyword_then | term
-// keyword_then`, where a `term` is a newline or a `;` — which both
-// `opt_rescue: k_rescue exc_list exc_var then compstmt` (parse.y v3_4_0 5926)
-// and `case_body: k_when case_args then compstmt` (5397) REQUIRE: `begin; x;
-// rescue Foo end` and `case x; when 1 end` are SyntaxErrors in MRI.
+// clauseHeadEnd consumes MRI's `then` / `do` nonterminal — each spelled
+// `term | KEYWORD | term KEYWORD`, where a `term` is a newline or a `;` — which
+// every clause head in the grammar REQUIRES, never optionally:
 //
-// Requiring it is also what makes the `arg_value`-ness of those two lists
-// observable. `exc_list: arg_value` and `case_args: arg_value` have no
-// `command` alternative, so commandArgsFollow already declines to give `foo` the
-// argument `bar` in `rescue foo bar` / `when foo bar` — but with the terminator
-// optional the leftover `bar` was simply read as the clause's FIRST STATEMENT
-// and the whole clause parsed. A refused production only shows up as an error
-// if something downstream insists on what must come next.
-func (p *Parser) clauseThen(clause string) {
-	if p.accept(token.THEN) {
+//	opt_rescue : k_rescue exc_list exc_var then compstmt      (parse.y v3_4_0 5926)
+//	case_body  : k_when case_args then compstmt cases         (5397)
+//	primary    : k_if expr_value then compstmt if_tail k_end  (4300)
+//	if_tail    : ... | k_elsif expr_value then compstmt ...
+//	primary    : k_unless expr_value then compstmt ...
+//	primary    : k_while expr_value_do compstmt k_end         (with `do: term | keyword_do_cond`)
+//	primary    : k_until expr_value_do compstmt k_end
+//	primary    : k_for for_var keyword_in expr_value_do compstmt k_end
+//	p_case_body: keyword_in p_top_expr then compstmt p_cases
+//
+// so `begin; x; rescue Foo end`, `case x; when 1 end`, `if x end`, `while x end`
+// and `for i in a end` are all SyntaxErrors in MRI.
+//
+// Requiring it is also what makes the `arg_value`/`expr_value`-ness of the head
+// OBSERVABLE. `exc_list: arg_value` and `case_args: arg_value` have no `command`
+// alternative, so commandArgsFollow already declines to give `foo` the argument
+// `bar` in `rescue foo bar` / `when foo bar`; and a nested `!` operand is an
+// `arg` too, so `!!foo bar` leaves a stray `bar` in `if !!foo bar; end`. With
+// the terminator optional the leftover token was simply read as the clause's
+// FIRST STATEMENT and the whole clause parsed. A refused production only
+// surfaces as an error when something downstream insists on what must come next.
+func (p *Parser) clauseHeadEnd(clause string, kw token.Type) {
+	if p.accept(kw) {
 		return
 	}
 	if !p.is(token.NEWLINE) {
 		p.fail("expected a newline, %q or %q after the %s clause head, got %q (%s)",
-			";", "then", clause, p.cur().Lit, p.cur().Type)
+			";", kw, clause, p.cur().Lit, p.cur().Type)
 	}
 	p.advance()
-	// `term keyword_then` — `rescue Foo; then y` and `when 1; then 2` are legal.
+	// `term KEYWORD` — `rescue Foo; then y`, `when 1; then 2`, `while x; do end`.
 	p.skipNewlines()
-	p.accept(token.THEN)
+	p.accept(kw)
 }
 
 // parseRescueTail parses the `(rescue …)* [else …] [ensure …]` clauses that
@@ -1524,7 +1544,7 @@ func (p *Parser) parseRescueTail(body []ast.Node) *ast.Begin {
 				clause.VarTarget = p.rescueVarTarget()
 			}
 		}
-		p.clauseThen("rescue")
+		p.clauseHeadEnd("rescue", token.THEN)
 		clause.Body = p.parseStatements(beginBodyEnd)
 		node.Rescues = append(node.Rescues, clause)
 	}
@@ -1675,7 +1695,7 @@ func (p *Parser) parseCase() ast.Node {
 		for p.accept(token.COMMA) {
 			clause.Conds = append(clause.Conds, p.parseSplatOrExpr())
 		}
-		p.clauseThen("when")
+		p.clauseHeadEnd("when", token.THEN)
 		clause.Body = p.parseStatements(caseBodyEnd)
 		node.Whens = append(node.Whens, clause)
 	}
@@ -1700,7 +1720,7 @@ func (p *Parser) parseCaseIn(subject ast.Node) ast.Node {
 			clause.Guard = p.parseExprOrAssign()
 			clause.GuardNeg = true
 		}
-		p.accept(token.THEN)
+		p.clauseHeadEnd("in", token.THEN)
 		clause.Body = p.parseStatements(inBodyEnd)
 		node.Clauses = append(node.Clauses, clause)
 	}
@@ -2297,6 +2317,10 @@ func (p *Parser) parseMlhsGroup() ast.Node {
 // in MRI.
 func (p *Parser) parseSplatOrExpr() ast.Node {
 	defer p.permitCommand(false)()
+	// Being `arg`s, they have no `modifier_rescue` alternative either:
+	// `case x; when y rescue nil; end` and `begin; x; rescue Foo rescue nil; y;
+	// end` are SyntaxErrors where `when (y rescue nil)` is legal.
+	defer p.permitRescueMod(false)()
 	if p.accept(token.STAR) {
 		return &ast.SplatArg{Value: p.parseExprOrAssign()}
 	}
@@ -2373,10 +2397,21 @@ func isPostfixStart(tt token.Type) bool {
 }
 
 func (p *Parser) parseExprOrAssign() ast.Node {
-	// A `not EXPR` prefix in value position (assignment RHS, call argument, array
-	// element): `x = not true`, `foo(not flag)`. `not` binds looser than the
+	// A `not EXPR` prefix in value position (assignment RHS, head of a call's
+	// argument list): `x = not true`, `foo(not flag)`. `not` binds looser than the
 	// binary operators, so it wraps the whole following expression.
-	if p.accept(token.NOT) {
+	//
+	// `arg` has NO `keyword_not` alternative: MRI spells it only
+	// `expr: keyword_not '\n'? expr` (parse.y v3_4_0 3345), with `endless_arg`
+	// (4087) and the parenthesised `primary: keyword_not '(' expr rparen` (4464)
+	// as the other two. So `[not x]`, `{k: not x}`, `f(1, not x)`,
+	// `def m(a = not x); end`, `case y; when not x; end`, `[*not x]` and
+	// `f(&not x)` are SyntaxErrors in BOTH of MRI's parsers, and the same argOnly
+	// that refuses a `command` refuses this. (Where the position does admit an
+	// `expr` — an assignment RHS, the head of a paren argument list — MRI's two
+	// parsers disagree: prism accepts `x = not y` and `f(not x)`, parse.y refuses
+	// them. We keep prism's answer there and assert neither.)
+	if !p.argOnly && p.accept(token.NOT) {
 		return not(p.parseExprOrAssign())
 	}
 	// Multiple assignment to local targets: a, b = … / a, *b = … . Disabled while
@@ -3111,6 +3146,10 @@ func (p *Parser) parseHashLiteral() ast.Node {
 	// `command` alternative, so `{k: foo bar}`, `{1 => foo bar}` and `{**foo bar}`
 	// are SyntaxErrors in MRI while `{k: (foo bar)}` and `{k: foo(bar baz)}` parse.
 	defer p.permitCommand(false)()
+	// Being `arg`s, they have no `modifier_rescue` alternative either:
+	// `{k: x rescue nil}` and `{1 => x rescue nil}` are SyntaxErrors where
+	// `{k: (x rescue nil)}` and `{k: a = x rescue nil}` (an `arg_rhs`) are legal.
+	defer p.permitRescueMod(false)()
 	h := &ast.HashLit{}
 	p.skipNewlines()
 	for !p.is(token.RBRACE) {
@@ -3800,15 +3839,21 @@ func (p *Parser) parseIdentExpr() ast.Node {
 
 	// Otherwise it is a method call on self.
 	p.advance()
+	// The UNPARENTHESISED `defined?` is the other of MRI's two productions for it:
+	// `arg: keyword_defined '\n'? begin_defined arg` (parse.y v3_4_0 4021). It is
+	// an ARG production, not a `command`, so it is available in an `arg` position
+	// where a paren-less call is not: `[defined? x]`, `{k: defined? x}`,
+	// `1 + defined? x` and `def m(a = defined? x); end` are all legal MRI. It
+	// therefore asks the token-shape test DIRECTLY and must not go through
+	// commandArgsFollow, whose first act is to refuse everything in an `arg`
+	// position. Its operand is ONE `arg`, not a `command_args` list, so
+	// `defined? foo bar` is a SyntaxError where `defined? foo` and
+	// `defined?(foo bar)` are both legal.
+	if name == "defined?" && p.canStartCommandArg() {
+		defer p.permitCommand(false)()
+		return &ast.Call{Name: name, Args: []ast.Node{p.parseExprOrAssign()}}
+	}
 	if p.commandArgsFollow(cmdArgPlain) {
-		// The UNPARENTHESISED `defined?` is the other of MRI's two productions for
-		// it: `arg: keyword_defined '\n'? begin_defined arg`. Its operand is ONE
-		// `arg`, not a `command_args` list, so `defined? foo bar` is a SyntaxError
-		// where `defined? foo` and `defined?(foo bar)` are both legal.
-		if name == "defined?" {
-			defer p.permitCommand(false)()
-			return &ast.Call{Name: name, Args: []ast.Node{p.parseExprOrAssign()}}
-		}
 		call := &ast.Call{Name: name, Args: p.parseCommandArgs()}
 		p.attachCommandBrace(&call.Block)
 		return call
