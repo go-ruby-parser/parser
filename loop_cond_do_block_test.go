@@ -221,6 +221,14 @@ func TestDoBlockInLoopConditionStillRefusedWhereMRIRefusesIt(t *testing.T) {
 		`while [1].map do end; end`,
 		// a modifier `if` cannot follow a `while` header
 		`while (y do end) if true; end`,
+		// #35: clearing COND at `[` made the eighth member of the family REACHABLE,
+		// and it then turned out to be refused for a second, older reason — an array
+		// literal's contents are `arg_value`, which admits no paren-less command call
+		// at all. Both of these are SyntaxErrors in MRI and both are accepted by
+		// v0.4.0; see arg_position_command_test.go for the whole boundary.
+		`while [foo bar do end]; end`,
+		`while [foo bar]; end`,
+		`until [foo bar]; end`,
 	} {
 		_, err := Parse(src)
 		if err == nil {

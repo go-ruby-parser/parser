@@ -150,6 +150,23 @@ type Parser struct {
 	// nested delimited context (a parenthesised group, a `(…)`/`[…]` argument list,
 	// a `{…}` hash), where an inner modifier-`rescue` is again allowed.
 	noRescueMod bool
+	// argOnly marks a grammar position MRI reaches through `arg_value: arg`
+	// (parse.y v3_4_0 4133), which has NO `command` alternative: an array-literal
+	// element, a hash key or value, a splat/double-splat/block-pass operand, any
+	// argument after the first, an operand of a binary/unary/range/ternary
+	// operator, a `when` value, a pattern, a parameter default. A paren-less
+	// command call — `command`, 3464-3536 — is therefore a syntax error there,
+	// whatever the token shape says: `[foo bar]` and `{k: foo bar}` are
+	// SyntaxErrors in MRI where `(foo bar)`, `f(foo bar)` and `a[foo bar]` are
+	// legal, because those three reach `command` through `compstmt` and through
+	// `call_args: command` (4223) instead.
+	//
+	// It is inherited by the whole expression descent, so the sub-expressions of
+	// an arg stay args (`[!foo bar]`, `[a = foo bar]` are SyntaxErrors too), and it
+	// is cleared only where the grammar re-enters `compstmt`/`expr_value`/the head
+	// of `call_args`. permitCommand is the only writer and commandArgsFollow the
+	// only reader.
+	argOnly bool
 	// noBraceBlock suppresses `{ … }` block attachment while parsing the
 	// unparenthesised parameter list of a stabby lambda: there the next `{` at
 	// the lambda's own bracket nesting opens the lambda BODY, so `-> a=a() { a }`
@@ -341,6 +358,65 @@ func (p *Parser) enterBracket() func() {
 	}
 }
 
+// permitCommand records whether the position about to be parsed admits a
+// paren-less command call (MRI's `command`) and returns the function restoring
+// the previous answer; use it as `defer p.permitCommand(false)()`. It is the
+// only writer of argOnly — see that field for the rule it carries.
+func (p *Parser) permitCommand(allowed bool) func() {
+	saved := p.argOnly
+	p.argOnly = !allowed
+	return func() { p.argOnly = saved }
+}
+
+// commandArgShape selects which token shapes may open a paren-less argument list
+// for the name just decided on; the spellings differ only in that.
+type commandArgShape int
+
+const (
+	// cmdArgPlain — an ordinary receiver-less method name: the full
+	// `foo -1` / `foo *a` / `foo (x)` set.
+	cmdArgPlain commandArgShape = iota
+	// cmdArgRecv — a name after `.`, `&.` or `::`: the plain set, plus a string
+	// literal hugging the name (`obj.m"x"`).
+	cmdArgRecv
+	// cmdArgLocal — a bareword already in scope: only an unambiguous
+	// value-starting argument promotes it back to a call (`x = 5; x -1` is `x - 1`).
+	cmdArgLocal
+	// cmdArgConst — a constant (`BigDecimal "0.01"`).
+	cmdArgConst
+	// cmdArgHugString — the name is NOT yet consumed and only a string literal
+	// hugging it counts (`foo"bar"`).
+	cmdArgHugString
+	// cmdArgHugStringHere — the name IS consumed and only a string literal hugging
+	// it counts (`Integer"42"`).
+	cmdArgHugStringHere
+)
+
+// commandArgsFollow reports whether a paren-less argument list begins here, and
+// is the ONE place MRI's `arg`/`command` divide is applied: every site that would
+// build a paren-less command call asks it, so the rule cannot drift between them
+// (the lesson enterDoScope/atDoBlock already encodes for the `do` flags). The
+// position test comes first because it overrides the token shape entirely: in an
+// `arg_value` position the grammar offers no `command` alternative at all.
+func (p *Parser) commandArgsFollow(shape commandArgShape) bool {
+	if p.argOnly {
+		return false
+	}
+	switch shape {
+	case cmdArgRecv:
+		return p.canStartCommandArg() || p.atHuggingStringArg()
+	case cmdArgLocal:
+		return p.localCommandArgFollows()
+	case cmdArgConst:
+		return p.constCommandArgFollows()
+	case cmdArgHugString:
+		return p.huggingStringArg()
+	case cmdArgHugStringHere:
+		return p.atHuggingStringArg()
+	}
+	return p.canStartCommandArg()
+}
+
 func (p *Parser) skipNewlines() {
 	for p.is(token.NEWLINE) {
 		p.advance()
@@ -429,6 +505,12 @@ func (p *Parser) parseStatements(stop map[token.Type]bool) []ast.Node {
 	// for the duration and restore on exit.
 	savedMasgn := p.noMasgn
 	p.noMasgn = false
+	// A statement body is MRI's `compstmt`, which reaches `stmt` → `expr` →
+	// `command_call` (parse.y v3_4_0 3070, 3334, 3437), so a paren-less command
+	// call is legal here however deep inside an `arg` position the body sits:
+	// `[begin; foo bar; end]`, `[(foo bar)]`, `[proc do foo bar end]` all parse in
+	// MRI while `[foo bar]` does not.
+	defer p.permitCommand(true)()
 	// A nested statement body (a parenthesised group, an interpolation, a keyword
 	// block) is a fresh context: an inner modifier-`rescue` there is not the one
 	// that binds to an enclosing command call, so re-enable it.
@@ -1012,6 +1094,9 @@ func (p *Parser) parseDestructureParam(group *int) (outer *ast.MultiAssign, chai
 // detection suppressed, so the comma that separates parameters is not mistaken
 // for a multiple-assignment target separator (`def f(a = c(1), b = nil)`).
 func (p *Parser) parseParamDefault() ast.Node {
+	// `f_opt: f_arg_asgn f_eq arg_value` — an `arg`, so `def m(a = foo bar); end`
+	// is a SyntaxError in MRI.
+	defer p.permitCommand(false)()
 	saved := p.noMasgn
 	p.noMasgn = true
 	def := p.parseExprOrAssign()
@@ -1023,6 +1108,10 @@ func (p *Parser) parseParamDefault() ast.Node {
 // detection suppressed, so an assignment value does not swallow the comma before
 // the next argument (`f(a: x = 1, b: y = 2)` is two pairs, not one masgn value).
 func (p *Parser) parseKwArgValue() ast.Node {
+	// `assoc: tLABEL arg_value` at a call site and `f_kwarg: f_label arg_value` in
+	// a parameter list are both `arg`, so `{k: foo bar}`, `f(k: foo bar)` and
+	// `def m(a: foo bar); end` are SyntaxErrors in MRI.
+	defer p.permitCommand(false)()
 	saved := p.noMasgn
 	p.noMasgn = true
 	v := p.parseExprOrAssign()
@@ -1038,6 +1127,11 @@ func (p *Parser) parseCond() ast.Node {
 	// `while x => p`. Wrap the logical expression so a trailing `in`/`=>` pattern
 	// is consumed here too, not only at statement level. (A `case`'s `in` uses a
 	// separate path and never reaches parseCond.)
+	// `expr_value` (parse.y v3_4_0) reaches `expr` → `command_call`, and the
+	// if/while/until/for headers take it, so `while foo bar; end` parses — and goes
+	// on parsing inside an `arg` position too: `[while foo bar; end]` is legal
+	// where `[foo bar]` is not.
+	defer p.permitCommand(true)()
 	return p.parseOneLineMatch(p.parseKeywordLogical())
 }
 
@@ -1205,7 +1299,7 @@ func (p *Parser) parseReturn() ast.Node {
 	// `return a, b, …` returns an array of the values (a `*splat` element allowed).
 	elems := []ast.Node{first}
 	for p.accept(token.COMMA) {
-		elems = append(elems, p.parseRhsElem())
+		elems = append(elems, p.restElem())
 	}
 	return &ast.Return{Value: &ast.ArrayLit{Elems: elems}}
 }
@@ -1305,7 +1399,7 @@ func (p *Parser) parseJumpValue() ast.Node {
 	}
 	elems := []ast.Node{first}
 	for p.accept(token.COMMA) {
-		elems = append(elems, p.parseRhsElem())
+		elems = append(elems, p.restElem())
 	}
 	return &ast.ArrayLit{Elems: elems}
 }
@@ -1497,7 +1591,11 @@ func (p *Parser) parseCase() ast.Node {
 	p.expect(token.CASE)
 	var subject ast.Node
 	if !p.is(token.NEWLINE) {
+		// `k_case expr_value opt_terms case_body k_end` — the subject admits a
+		// command (`case foo bar` ⏎ `when 1` ⏎ `end` parses in MRI).
+		restore := p.permitCommand(true)
 		subject = p.parseExprOrAssign()
+		restore()
 	}
 	p.skipNewlines()
 	if p.is(token.IN) {
@@ -1552,6 +1650,9 @@ func (p *Parser) parseCaseIn(subject ast.Node) ast.Node {
 // comma-separated array pattern (`in a, b`, `in *a, b`), the implicit array
 // form.
 func (p *Parser) parsePattern() ast.Pattern {
+	// A pattern is its own sub-grammar and nowhere reaches `command`, so
+	// `case x; in foo bar; end` is a SyntaxError in MRI.
+	defer p.permitCommand(false)()
 	// A leading label is an implicit (brace-less) hash pattern: `in a:, b:`.
 	if p.atPatternLabel() || p.is(token.POW) {
 		return p.parseHashPatternBody(nil, token.NEWLINE)
@@ -2078,9 +2179,14 @@ func (p *Parser) parseMlhs() ast.Node {
 	}
 	p.expect(token.ASSIGN)
 	values := []ast.Node{p.parseMasgnValue()}
+	// Only the head value may be a command (`mrhs_arg: mrhs | arg_value`, with the
+	// `command` reached through `command_asgn`); a later one is an `arg`, so
+	// `x, y = 1, foo bar` is a SyntaxError in MRI.
+	restoreRest := p.permitCommand(false)
 	for p.accept(token.COMMA) {
 		values = append(values, p.parseMasgnValue())
 	}
+	restoreRest()
 	return &ast.MultiAssign{Names: names, Targets: targets, SplatIndex: splat, Values: values}
 }
 
@@ -2120,7 +2226,12 @@ func (p *Parser) parseMlhsGroup() ast.Node {
 // parseSplatOrExpr parses an expression that may be prefixed by a `*splat`,
 // spreading an array in a position that accepts several values (a `when`
 // candidate list, a `rescue` class list).
+// The positions it serves — a `when` candidate list (`case_args: arg_value`) and
+// a `rescue` exception list (`exc_list: arg_value`) — are both `arg`, so
+// `case x; when foo bar; end` and `begin; rescue foo bar; end` are SyntaxErrors
+// in MRI.
 func (p *Parser) parseSplatOrExpr() ast.Node {
+	defer p.permitCommand(false)()
 	if p.accept(token.STAR) {
 		return &ast.SplatArg{Value: p.parseExprOrAssign()}
 	}
@@ -2133,6 +2244,8 @@ func (p *Parser) parseSplatOrExpr() ast.Node {
 // destructured (`a, b = c = [1, 2]`, `_, h, _ = resp = call(x)`).
 func (p *Parser) parseMasgnValue() ast.Node {
 	if p.accept(token.STAR) {
+		// `mrhs: tSTAR arg_value` — an `arg`: `x, y = *foo bar` is a SyntaxError.
+		defer p.permitCommand(false)()
 		return &ast.SplatArg{Value: p.parseTernary()}
 	}
 	return p.parseExprOrAssign()
@@ -2374,7 +2487,7 @@ func (p *Parser) parseAssignRhs() ast.Node {
 		if p.atStatementEnd() {
 			break
 		}
-		elems = append(elems, p.parseRhsElem())
+		elems = append(elems, p.restElem())
 	}
 	return &ast.ArrayLit{Elems: elems}
 }
@@ -2383,9 +2496,23 @@ func (p *Parser) parseAssignRhs() ast.Node {
 // a `*splat`.
 func (p *Parser) parseRhsElem() ast.Node {
 	if p.accept(token.STAR) {
+		// `mrhs: tSTAR arg_value` / `arg_splat: tSTAR arg_value` — the splatted value
+		// is an `arg`, so `x = *foo bar` is a SyntaxError in MRI while `x = foo bar`
+		// is not.
+		defer p.permitCommand(false)()
 		return &ast.SplatArg{Value: p.parseTernary()}
 	}
 	return p.parseExprOrAssign()
+}
+
+// restElem parses a non-head element of an assignment right-hand side or of a
+// `return`/`break`/`next` value list. Those come through `mrhs: args ',' arg_value`
+// and are `arg`s, so `x = 1, foo bar` and `return 1, foo bar` are SyntaxErrors in
+// MRI while `x = foo bar, 1` — where the command swallows the comma into its own
+// arguments — is not.
+func (p *Parser) restElem() ast.Node {
+	defer p.permitCommand(false)()
+	return p.parseRhsElem()
 }
 
 // withRescueModifier consumes a trailing `rescue FALLBACK` on the same line (the
@@ -2436,6 +2563,9 @@ func (p *Parser) parseTernary() ast.Node {
 // super`), which MRI permits in this position even though `=` binds looser than
 // `?:`.
 func (p *Parser) ternaryArm() ast.Node {
+	// `arg: arg '?' arg opt_nl ':' arg` — both arms are `arg`, so
+	// `a ? foo bar : 1` is a SyntaxError in MRI.
+	defer p.permitCommand(false)()
 	if j, ok := p.valuelessJumpOperand(); ok {
 		return j
 	}
@@ -2448,6 +2578,9 @@ func (p *Parser) parseRange() ast.Node {
 	if p.is(token.DOTDOT) || p.is(token.DOTDOTDOT) { // beginless: ..hi / ...hi
 		excl := p.is(token.DOTDOTDOT)
 		p.advance()
+		// `arg: tBDOT2 arg` — the endpoint is an `arg`, so `..foo bar` is a
+		// SyntaxError in MRI.
+		defer p.permitCommand(false)()
 		return &ast.RangeLit{Hi: p.parseBinary(0), Exclusive: excl}
 	}
 	left := p.parseBinary(0)
@@ -2458,8 +2591,11 @@ func (p *Parser) parseRange() ast.Node {
 		if !rangeHiEnds[p.cur().Type] {
 			// The endpoint may be an assignment (`a..b = c`) or op-assignment
 			// (`@i...@i += n`), which MRI parses as the range's high bound, so feed
-			// the parsed expression through the inline-assignment handler.
+			// the parsed expression through the inline-assignment handler. `arg tDOT2
+			// arg` makes it an `arg`: `1 .. foo bar` is a SyntaxError in MRI.
+			restore := p.permitCommand(false)
 			hi = p.maybeInlineAssign(p.parseBinary(0))
+			restore()
 		}
 		return &ast.RangeLit{Lo: left, Hi: hi, Exclusive: excl}
 	}
@@ -2518,7 +2654,13 @@ func (p *Parser) parseBinary(minBP int) ast.Node {
 			left = &ast.BinaryExpr{Op: op, Left: left, Right: jump}
 			return left
 		}
+		// `arg: arg '+' arg` and friends — the right operand is an `arg`, so
+		// `1 + foo bar` is a SyntaxError in MRI. (The LEFT operand needs nothing:
+		// a command there swallows the operator into its own arguments, which is
+		// what makes `foo bar + 1` legal as `foo(bar + 1)`.)
+		restore := p.permitCommand(false)
 		right := p.maybeInlineAssign(p.parseBinary(rbp))
+		restore()
 		left = &ast.BinaryExpr{Op: op, Left: left, Right: right}
 	}
 }
@@ -2691,15 +2833,22 @@ func (p *Parser) parseUnary() ast.Node {
 			}
 			return p.parsePostfixTail(negateLiteral(lit))
 		}
+		// `arg: tUMINUS arg` — an `arg` operand, so `-foo bar` is a SyntaxError in
+		// MRI. `!` and `not` are the exception: they have an `expr: '!' command_call`
+		// alternative (3352), so `!foo bar` parses at statement level and the flag is
+		// inherited rather than set for them.
+		defer p.permitCommand(false)()
 		return &ast.UnaryExpr{Op: "-", Operand: p.parseUnary()}
 	case token.PLUS:
 		p.advance()
+		defer p.permitCommand(false)()
 		return p.parseUnary() // unary plus is a no-op
 	case token.BANG:
 		p.advance()
 		return &ast.UnaryExpr{Op: "!", Operand: p.parseUnary()}
 	case token.TILDE:
 		p.advance()
+		defer p.permitCommand(false)()
 		return &ast.UnaryExpr{Op: "~", Operand: p.parseUnary()}
 	}
 	return p.parsePostfix()
@@ -2732,7 +2881,7 @@ func (p *Parser) parsePostfixTail(node ast.Node) ast.Node {
 				p.advance()
 				args = p.parseCallArgs(token.RPAREN)
 				p.expect(token.RPAREN)
-			} else if p.canStartCommandArg() || p.atHuggingStringArg() {
+			} else if p.commandArgsFollow(cmdArgRecv) {
 				// Paren-less command call on a receiver: `obj.foo bar`,
 				// `Fiber.yield 1`, or a string hugging the method name
 				// (`obj.m"x"`). The space-separated argument list terminates
@@ -2771,7 +2920,7 @@ func (p *Parser) parsePostfixTail(node ast.Node) ast.Node {
 				// A capitalized scope-resolution name with a space-separated command
 				// argument is a method call (`obj::Down x, y`); otherwise it is a
 				// scoped constant (`Math::PI`).
-				if p.canStartCommandArg() || p.atHuggingStringArg() {
+				if p.commandArgsFollow(cmdArgRecv) {
 					call := &ast.Call{Recv: node, Name: name, Args: p.parseCommandArgs()}
 					p.attachCommandBrace(&call.Block)
 					if p.atDoBlock() {
@@ -2791,7 +2940,7 @@ func (p *Parser) parsePostfixTail(node ast.Node) ast.Node {
 				p.advance()
 				args = p.parseCallArgs(token.RPAREN)
 				p.expect(token.RPAREN)
-			} else if p.canStartCommandArg() || p.atHuggingStringArg() {
+			} else if p.commandArgsFollow(cmdArgRecv) {
 				// Paren-less scope-resolution command call: `Mod::meth arg`.
 				call := &ast.Call{Recv: node, Name: name, Args: p.parseCommandArgs()}
 				p.attachCommandBrace(&call.Block)
@@ -2845,7 +2994,7 @@ func (p *Parser) parseArrayLiteral() ast.Node {
 	// An array literal shares the argument grammar so trailing `key: value` (and
 	// the value-omitted `key:` shorthand) collapse into one implicit trailing Hash
 	// element, exactly as in a call: `[a, k: v]` == `[a, {k: v}]`.
-	elems := p.parseCallArgs(token.RBRACKET)
+	elems := p.parseArrayElems()
 	p.expect(token.RBRACKET)
 	return &ast.ArrayLit{Elems: elems}
 }
@@ -2859,6 +3008,11 @@ func (p *Parser) parseHashLiteral() ast.Node {
 	// paren-less command argument (`foo :a, {k: y do end}`) and inside a loop
 	// condition (`while {a: y do end}[:a]; end`).
 	defer p.enterBracket()()
+	// `assoc: arg_value tASSOC arg_value | tLABEL arg_value | tDSTAR arg_value`
+	// (parse.y v3_4_0 6789) — every key and every value is an `arg`, which has no
+	// `command` alternative, so `{k: foo bar}`, `{1 => foo bar}` and `{**foo bar}`
+	// are SyntaxErrors in MRI while `{k: (foo bar)}` and `{k: foo(bar baz)}` parse.
+	defer p.permitCommand(false)()
 	h := &ast.HashLit{}
 	p.skipNewlines()
 	for !p.is(token.RBRACE) {
@@ -3221,7 +3375,7 @@ func (p *Parser) parseYield() ast.Node {
 		p.expect(token.RPAREN)
 		return &ast.Yield{Args: args}
 	}
-	if p.canStartCommandArg() {
+	if p.commandArgsFollow(cmdArgPlain) {
 		return &ast.Yield{Args: p.parseCommandArgs()}
 	}
 	return &ast.Yield{}
@@ -3377,14 +3531,14 @@ func (p *Parser) parsePrimary() ast.Node {
 			return &ast.Call{Name: t.Lit, Args: args}
 		}
 		// A string hugging the constant is a paren-less call: `Integer"42"`.
-		if p.atHuggingStringArg() {
+		if p.commandArgsFollow(cmdArgHugStringHere) {
 			return &ast.Call{Name: t.Lit, Args: p.parseCommandArgs()}
 		}
 		// A space-separated command argument makes the constant a method call:
 		// `BigDecimal "0.01"`, `Integer str`. Restricted to unambiguous starts (a
 		// string/number/symbol value) so a bare `Foo` followed by an unrelated
 		// token still reads as a constant reference.
-		if p.constCommandArgFollows() {
+		if p.commandArgsFollow(cmdArgConst) {
 			return &ast.Call{Name: t.Lit, Args: p.parseCommandArgs()}
 		}
 		return &ast.ConstRef{Name: t.Lit}
@@ -3455,7 +3609,7 @@ func (p *Parser) parseSuper() ast.Node {
 		p.expect(token.RPAREN)
 		return &ast.Super{Args: args}
 	}
-	if p.canStartCommandArg() {
+	if p.commandArgsFollow(cmdArgPlain) {
 		return &ast.Super{Args: p.parseCommandArgs()}
 	}
 	return &ast.Super{Forward: true}
@@ -3480,7 +3634,12 @@ func (p *Parser) parseIdentExpr() ast.Node {
 		p.advance() // defined?
 		p.advance() // (
 		p.skipNewlines()
+		// `keyword_defined '\n'? '(' begin_defined expr rparen` — an `expr`, which
+		// reaches `command_call`, so `defined?(foo bar)` parses even inside an `arg`
+		// position where a bare `foo bar` may not: `[defined?(foo bar)]` is legal MRI.
+		restoreCmd := p.permitCommand(true)
 		arg := p.parseKeywordLogical()
+		restoreCmd()
 		p.skipNewlines()
 		p.expect(token.RPAREN)
 		return &ast.Call{Name: name, Args: []ast.Node{arg}}
@@ -3499,7 +3658,7 @@ func (p *Parser) parseIdentExpr() ast.Node {
 	// `step"Ensure ..." do … end`, `assert"x", y`, `foo"a"`. MRI reads this as a
 	// command call even when the name is otherwise a local — `x"y"` is `x("y")`.
 	// So this is checked before the local-variable resolution below.
-	if p.huggingStringArg() {
+	if p.commandArgsFollow(cmdArgHugString) {
 		p.advance() // name
 		call := &ast.Call{Name: name, Args: p.parseCommandArgs()}
 		p.attachCommandBrace(&call.Block)
@@ -3519,7 +3678,7 @@ func (p *Parser) parseIdentExpr() ast.Node {
 		if p.atDoBlock() {
 			return &ast.Call{Name: name, Block: p.parseDoBlock()}
 		}
-		if p.localCommandArgFollows() {
+		if p.commandArgsFollow(cmdArgLocal) {
 			call := &ast.Call{Name: name, Args: p.parseCommandArgs()}
 			p.attachCommandBrace(&call.Block)
 			if p.atDoBlock() {
@@ -3543,7 +3702,15 @@ func (p *Parser) parseIdentExpr() ast.Node {
 
 	// Otherwise it is a method call on self.
 	p.advance()
-	if p.canStartCommandArg() {
+	if p.commandArgsFollow(cmdArgPlain) {
+		// The UNPARENTHESISED `defined?` is the other of MRI's two productions for
+		// it: `arg: keyword_defined '\n'? begin_defined arg`. Its operand is ONE
+		// `arg`, not a `command_args` list, so `defined? foo bar` is a SyntaxError
+		// where `defined? foo` and `defined?(foo bar)` are both legal.
+		if name == "defined?" {
+			defer p.permitCommand(false)()
+			return &ast.Call{Name: name, Args: []ast.Node{p.parseExprOrAssign()}}
+		}
 		call := &ast.Call{Name: name, Args: p.parseCommandArgs()}
 		p.attachCommandBrace(&call.Block)
 		return call
@@ -3691,13 +3858,22 @@ func (p *Parser) parseCommandArgs() []ast.Node {
 	// argument, so suppress it here and let the enclosing expression consume it.
 	savedRescue := p.noRescueMod
 	p.noRescueMod = true
+	// `command_args: call_args` and `call_args: command` (parse.y v3_4_0 4250,
+	// 4223) give the HEAD argument of a paren-less call the right to be a
+	// paren-less call itself — `foo bar baz` is `foo(bar(baz))` — while the later
+	// arguments come through `args ',' arg_value` and may not: `foo a, bar baz` is
+	// a SyntaxError in MRI.
+	restoreHead := p.permitCommand(true)
 	var args []ast.Node
 	var kw *ast.HashLit
 	p.parseOneCallArg(&args, &kw)
+	restoreHead()
+	restoreRest := p.permitCommand(false)
 	for p.accept(token.COMMA) {
 		p.skipNewlines()
 		p.parseOneCallArg(&args, &kw)
 	}
+	restoreRest()
 	p.noRescueMod = savedRescue
 	p.noMasgn = savedMasgn
 	p.noDoBlock = saved
@@ -3707,7 +3883,25 @@ func (p *Parser) parseCommandArgs() []ast.Node {
 	return args
 }
 
+// parseCallArgs parses a delimited argument list whose HEAD may be a paren-less
+// command call: MRI's `paren_args`/`opt_call_args` → `call_args: command`
+// (parse.y v3_4_0 4171, 4205, 4223), which is why `f(foo bar)` and `a[foo bar]`
+// parse. An array LITERAL does not go through `call_args` and uses
+// parseArrayElems instead.
 func (p *Parser) parseCallArgs(until token.Type) []ast.Node {
+	return p.parseArgList(until, true)
+}
+
+// parseArrayElems parses the contents of an array literal: MRI's
+// `primary: tLBRACK aref_args ']'` → `aref_args: args` → `args: arg_value` →
+// `arg` (parse.y v3_4_0 4427, 4140, 4314, 4133). There is no `command`
+// alternative anywhere on that path, in any position, so `[foo bar]` is a
+// SyntaxError while `a[foo bar]` — an index, hence `call_args` — is not.
+func (p *Parser) parseArrayElems() []ast.Node {
+	return p.parseArgList(token.RBRACKET, false)
+}
+
+func (p *Parser) parseArgList(until token.Type, headAdmitsCommand bool) []ast.Node {
 	p.bracketDepth++
 	// A parenthesised `(…)` argument list or `[…]` element list is a fresh,
 	// delimited context: an inner modifier-`rescue` (`foo(bar rescue baz)`) belongs
@@ -3739,7 +3933,14 @@ func (p *Parser) parseCallArgs(until token.Type) []ast.Node {
 	if p.is(until) {
 		return args
 	}
+	// Only the head argument can be a `command`, and only where the caller says so:
+	// `call_args: command` covers the WHOLE list (so `f(foo bar, 1)` is
+	// `f(foo(bar, 1))`), while every later argument comes through
+	// `args ',' arg_value` and is an `arg` — `f(1, foo bar)` is a SyntaxError.
+	restoreHead := p.permitCommand(headAdmitsCommand)
 	p.parseOneCallArg(&args, &kw)
+	restoreHead()
+	restoreRest := p.permitCommand(false)
 	for p.accept(token.COMMA) {
 		p.skipNewlines()
 		// A trailing comma before the closing delimiter is allowed: foo(1, 2,).
@@ -3748,6 +3949,7 @@ func (p *Parser) parseCallArgs(until token.Type) []ast.Node {
 		}
 		p.parseOneCallArg(&args, &kw)
 	}
+	restoreRest()
 	p.skipNewlines()
 	// Trailing `key: value` / `key => value` pairs collapse into one implicit
 	// Hash argument (Ruby's keyword/last-hash sugar): foo(1, a: 2) → foo(1, {a:2}).
@@ -3775,6 +3977,9 @@ func (p *Parser) parseOneCallArg(args *[]ast.Node, kw **ast.HashLit) {
 			*args = append(*args, &ast.BlockPass{})
 			return
 		}
+		// `block_arg: tAMPER arg_value` (parse.y v3_4_0) — an `arg`, so
+		// `foo(&bar baz)` is a SyntaxError in MRI.
+		defer p.permitCommand(false)()
 		*args = append(*args, &ast.BlockPass{Value: p.parseExprOrAssign()})
 		return
 	}
@@ -3785,6 +3990,8 @@ func (p *Parser) parseOneCallArg(args *[]ast.Node, kw **ast.HashLit) {
 			p.addKwPair(kw, nil, nil)
 			return
 		}
+		// `assoc: tDSTAR arg_value` — an `arg`, so `foo(**bar baz)` is a SyntaxError.
+		defer p.permitCommand(false)()
 		p.addKwPair(kw, nil, p.parseExprOrAssign())
 		return
 	}
@@ -3822,17 +4029,24 @@ func (p *Parser) parseOneCallArg(args *[]ast.Node, kw **ast.HashLit) {
 			*args = append(*args, &ast.SplatArg{})
 			return
 		}
+		// `arg_splat: tSTAR arg_value` — an `arg`, so `[*foo bar]` and
+		// `f(*foo bar)` are SyntaxErrors in MRI.
+		defer p.permitCommand(false)()
 		*args = append(*args, &ast.SplatArg{Value: p.parseExprOrAssign()})
 		return
 	}
 	node := p.parseExprOrAssign()
 	if p.accept(token.HASHROCKET) {
+		// `assoc: arg_value tASSOC arg_value` — the value is an `arg`, so
+		// `{1 => foo bar}` is a SyntaxError in MRI.
+		defer p.permitCommand(false)()
 		p.addKwPair(kw, node, p.parseExprOrAssign())
 		return
 	}
 	// A quoted string key followed by `:` is a symbol-keyed pair (the quoted form
 	// of a `key:` keyword argument): `tag(:div, "@click": "f()")`.
 	if sym, ok := p.stringKeyColon(node); ok {
+		defer p.permitCommand(false)()
 		p.addKwPair(kw, sym, p.parseExprOrAssign())
 		return
 	}
