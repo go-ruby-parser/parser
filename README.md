@@ -15,6 +15,9 @@ It was extracted from the [go-embedded-ruby](https://github.com/go-embedded-ruby
 interpreter — which now consumes it — and is developed test-first against MRI
 Ruby 4.0.5.
 
+Current release: **v0.4.0**. (The interpreter currently pins v0.3.0.) There are no
+GitHub release notes; the tags are the record.
+
 ## Install
 
 ```sh
@@ -72,24 +75,54 @@ A broad, practical subset of Ruby 4.0, all differential-tested against MRI:
 
 ## Performance
 
-On the both-accept corpus (the 615 harvested snippets + 110 real CRuby-4.0.5
-stdlib files **both** engines parse), go-ruby-parser **beats MRI's reference C
-parser**: it parses **1.5× faster than `RubyVM::AbstractSyntaxTree.parse` on
-small snippets and 2.1× faster on real stdlib files**, ~6× faster than
-`Ripper.sexp`, and the lexer is ~24–30× faster than `Ripper.lex` — all while
-building a full Go AST. Methodology, full parity tables, and the allocation
-hotspots / action items are in [`BENCHMARKS.md`](BENCHMARKS.md); reproduce with
-[`benchmarks/run.sh`](benchmarks) (an isolated module, outside the coverage
-gate).
+Fast enough for tooling, and **not** faster than MRI's own C parser. Measured on
+2026-09-26, darwin/arm64, against MRI 4.0.5: 46 real CRuby 4.0.5 stdlib files
+(768 KB) that **both** engines accept, each parsed 20 times in-process.
+
+| | per file | vs go-ruby-parser |
+| --- | ---: | --- |
+| **go-ruby-parser `Parse`** (full Go AST) | **0.45 ms** | — |
+| `RubyVM::AbstractSyntaxTree.parse` (MRI's C parser) | 0.29 ms | **1.6× faster than us** |
+| `Ripper.sexp` | 0.86 ms | 1.9× slower than us |
+| | | |
+| **go-ruby-parser `lexer.Tokenize`** | **0.36 ms** | — |
+| `Ripper.lex` | 2.16 ms | 6.0× slower than us |
+
+So: comfortably quicker than `Ripper`, the thing most Ruby tooling actually uses,
+and roughly **1.6× slower** than the C parser built into CRuby. The token counts are
+not comparable between the two lexers (82 k vs 125 k over the same corpus — `Ripper`
+emits whitespace and comment tokens), so only the per-file times are.
+
+> **Note.** Earlier revisions of this file claimed go-ruby-parser *beat* MRI's C
+> parser (2.1× on stdlib files, ~6× on `Ripper.sexp`, 24–30× on `Ripper.lex`).
+> **None of those reproduced** on the measurement above. The corpus and host differ
+> from the original run, so treat the table above as this host's numbers rather than
+> a refutation of the method — but do not quote the old figures.
+
+Methodology, the full parity tables and the allocation hotspots are in
+[`BENCHMARKS.md`](BENCHMARKS.md); reproduce with
+[`benchmarks/run.sh`](benchmarks) (an isolated module, outside the coverage gate).
 
 ## Known limitations
 
-The following are not yet parsed (they remain on go-embedded-ruby's roadmap;
-contributions welcome):
+As of **v0.4.0**, the three limitations this section used to list all parse. Verified
+against v0.4.0:
 
-- paren-less command calls with keyword/splat/block args (`foo a: 1`)
-- default **block** parameters (`{ |a = 1| }`) — splat block params (`{ |*a| }`) are supported
-- the positional `Class(a)` find-pattern (`Class[a]` is supported)
+```go
+parser.Parse("foo a: 1")                        // paren-less command call with kwargs — OK
+parser.Parse("[1].each { |a = 1| a }")          // default block parameter — OK
+parser.Parse("case x\nin Point(a, b)\n  a\nend") // positional find-pattern — OK
+```
+
+What still does not parse:
+
+- **`BEGIN { }` and `END { }` blocks** — `parse error: unexpected "{" after statement`.
+
+A broader note on completeness: of 47 top-level CRuby 4.0.5 stdlib files that MRI
+accepts, go-ruby-parser accepts **46**. The one refusal is `mkmf.rb`
+(`expected CONST, got "log_open"`). The parser is deliberately
+**under**-permissive rather than over-permissive: it aims never to accept Ruby that
+MRI rejects.
 
 ## License
 
