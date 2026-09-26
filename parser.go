@@ -3703,6 +3703,14 @@ func (p *Parser) parseIdentExpr() ast.Node {
 	// Otherwise it is a method call on self.
 	p.advance()
 	if p.commandArgsFollow(cmdArgPlain) {
+		// The UNPARENTHESISED `defined?` is the other of MRI's two productions for
+		// it: `arg: keyword_defined '\n'? begin_defined arg`. Its operand is ONE
+		// `arg`, not a `command_args` list, so `defined? foo bar` is a SyntaxError
+		// where `defined? foo` and `defined?(foo bar)` are both legal.
+		if name == "defined?" {
+			defer p.permitCommand(false)()
+			return &ast.Call{Name: name, Args: []ast.Node{p.parseExprOrAssign()}}
+		}
 		call := &ast.Call{Name: name, Args: p.parseCommandArgs()}
 		p.attachCommandBrace(&call.Block)
 		return call
