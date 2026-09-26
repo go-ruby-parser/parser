@@ -96,10 +96,32 @@ type Parser struct {
 	toks   []token.Token
 	pos    int
 	scopes []*scope
-	// noDo suppresses `do…end` block attachment while parsing a while/until
-	// condition, so the `do` there belongs to the loop, not to a call in the
-	// condition.
+	// noDo is MRI's COND_P(): it suppresses `do…end` block attachment while
+	// parsing a while/until condition or a `for` iterator, so the `do` there
+	// closes the loop header rather than opening a block for a call inside it.
+	// parse.y v3_4_0: `expr_value_do: {COND_PUSH(1);} expr_value do {COND_POP();}`
+	// (3430), and the lexer answers `keyword_do_cond` for a `do` reached with it
+	// set (10524).
 	noDo bool
+	// noDoBlock is MRI's CMDARG_P(): it suppresses `do…end` block attachment while
+	// parsing a PAREN-LESS command-argument list, so the `do` there belongs to the
+	// command call rather than to an argument that happens to be a call
+	// (`foo bar do…end` → the block is foo's). parse.y v3_4_0: `command_args` does
+	// CMDARG_PUSH(1) (4252-4265), and the lexer answers `keyword_do_block` for a
+	// `do` reached with it set (10525-10526).
+	//
+	// It has to be a SECOND flag rather than a reuse of noDo, because MRI keeps two
+	// independent bit-stacks that are reset in different places, and one flag gets
+	// one of the two wrong. Entering a nested statement body pushes CMDARG 0 — at
+	// `k_begin` (4392), in the `lambda` rule between f_larglist and lambda_body
+	// (5182), in `do_body` (5378), at `tSTRING_DBEG` (6181), and in the lexer for
+	// `(`, `[` and `{` (11193, 11221, 11245) — but only the bracket and
+	// interpolation entries also push COND 0. Hence, measured on ruby 4.0.5 (both
+	// its parsers): `foo :a, begin; y do end; end` parses while
+	// `while begin; y do end; end; end` is a SyntaxError, and
+	// `foo :a, -> do y do end end` parses while
+	// `while -> do y do end end.call; end` is a SyntaxError.
+	noDoBlock bool
 	// patternDepth > 0 while parsing a pattern atom, where a top-level `|` is the
 	// alternation separator rather than the bitwise-or operator.
 	patternDepth int
@@ -262,6 +284,17 @@ func (p *Parser) attachCommandBrace(block **ast.Block) {
 	}
 }
 
+// atDoBlock reports whether the cursor sits on a `do` that may open a block for
+// the call just parsed — MRI's plain `keyword_do`, as opposed to
+// `keyword_do_cond` (the `do` that closes a while/until/for header, chosen when
+// COND_P()) or `keyword_do_block` (the `do` that belongs to an enclosing
+// paren-less command call, chosen when CMDARG_P()): parse.y v3_4_0 10519-10527
+// decides between the three in that order. Reading both flags in one place is
+// what keeps the rule from drifting across the call sites that need it.
+func (p *Parser) atDoBlock() bool {
+	return p.is(token.DO) && !p.noDo && !p.noDoBlock
+}
+
 func (p *Parser) enterBracket() func() {
 	saved := p.noBraceBlock
 	p.noBraceBlock = false
@@ -344,7 +377,27 @@ func (p *Parser) parseStatements(stop map[token.Type]bool) []ast.Node {
 	// that binds to an enclosing command call, so re-enable it.
 	savedRescue := p.noRescueMod
 	p.noRescueMod = false
-	defer func() { p.noMasgn = savedMasgn; p.noRescueMod = savedRescue }()
+	// A nested statement body also resets MRI's CMDARG bit-stack, so a `do` inside
+	// it opens a block for the call it follows even when the body itself sits in a
+	// paren-less command-argument list: `foo :a, begin; y do end; end`,
+	// `foo :a, (y do end)`, `foo :a, "#{y do end}"`, `foo :a, -> { y do end }`,
+	// `foo :a, if c; y do end; end`. parse.y v3_4_0 does CMDARG_PUSH(0) at every
+	// such entry — `k_begin` (4392), the `lambda` rule (5182), `do_body` (5378),
+	// `tSTRING_DBEG` (6181) and the lexer's `(`, `[`, `{` (11193, 11221, 11245) —
+	// and MRI accepts a `do` in the bodies it does not name too (`if`, `case`,
+	// `def`, `class`, a loop body), all measured on ruby 4.0.5.
+	//
+	// noDo is deliberately NOT cleared here: only the bracket and interpolation
+	// entries push COND 0, which is why `while begin; y do end; end; end` and
+	// `while if true then y do end end; end` are SyntaxErrors in MRI. The contexts
+	// that do reset it clear it themselves (parseBlockRest, parseLambda's `{` body).
+	savedDoBlock := p.noDoBlock
+	p.noDoBlock = false
+	defer func() {
+		p.noMasgn = savedMasgn
+		p.noRescueMod = savedRescue
+		p.noDoBlock = savedDoBlock
+	}()
 	var body []ast.Node
 	for {
 		p.skipNewlines()
@@ -2623,7 +2676,7 @@ func (p *Parser) parsePostfixTail(node ast.Node) ast.Node {
 				// argument call.
 				call := &ast.Call{Recv: node, Name: name, Args: p.parseCommandArgs(), Safe: safe}
 				p.attachCommandBrace(&call.Block)
-				if p.is(token.DO) && !p.noDo {
+				if p.atDoBlock() {
 					call.Block = p.parseDoBlock()
 					// The block-bearing command call may itself be chained
 					// (`obj.foo bar do … end.baz`), so continue the postfix loop.
@@ -2655,7 +2708,7 @@ func (p *Parser) parsePostfixTail(node ast.Node) ast.Node {
 				if p.canStartCommandArg() || p.atHuggingStringArg() {
 					call := &ast.Call{Recv: node, Name: name, Args: p.parseCommandArgs()}
 					p.attachCommandBrace(&call.Block)
-					if p.is(token.DO) && !p.noDo {
+					if p.atDoBlock() {
 						call.Block = p.parseDoBlock()
 						node = call
 						break
@@ -2676,7 +2729,7 @@ func (p *Parser) parsePostfixTail(node ast.Node) ast.Node {
 				// Paren-less scope-resolution command call: `Mod::meth arg`.
 				call := &ast.Call{Recv: node, Name: name, Args: p.parseCommandArgs()}
 				p.attachCommandBrace(&call.Block)
-				if p.is(token.DO) && !p.noDo {
+				if p.atDoBlock() {
 					call.Block = p.parseDoBlock()
 					node = call
 					break
@@ -2690,7 +2743,7 @@ func (p *Parser) parsePostfixTail(node ast.Node) ast.Node {
 			p.expect(token.RBRACKET)
 			node = &ast.Call{Recv: node, Name: "[]", Args: args}
 		case (p.is(token.LBRACE) && !p.noBraceBlock && !p.atCommandBrace()) ||
-			(p.is(token.DO) && !p.noDo):
+			p.atDoBlock():
 			// A block binds to the immediately preceding method call; chaining
 			// then continues (`recv.map { … }.join`). A `super` also takes a block
 			// (`super { … }`, `super(x) do … end`).
@@ -2735,6 +2788,12 @@ func (p *Parser) parseArrayLiteral() ast.Node {
 // here at expression-start; a `{` after a call is a block (see parsePostfix).
 func (p *Parser) parseHashLiteral() ast.Node {
 	p.expect(token.LBRACE)
+	// The `{` pushed CMDARG 0 in MRI's lexer (parse.y v3_4_0 11245), so a `do` in a
+	// value belongs to the call it follows even inside a paren-less command
+	// argument: `foo :a, {k: y do end}`.
+	savedDoBlock := p.noDoBlock
+	p.noDoBlock = false
+	defer func() { p.noDoBlock = savedDoBlock }()
 	h := &ast.HashLit{}
 	p.skipNewlines()
 	for !p.is(token.RBRACE) {
@@ -2843,11 +2902,24 @@ func (p *Parser) parseLambda() ast.Node {
 	bs := p.scope()
 	var body []ast.Node
 	if p.accept(token.DO) {
+		// `-> do … end`. The only reset the `lambda` rule performs is CMDARG_PUSH(0)
+		// between f_larglist and lambda_body (parse.y v3_4_0 5182, popped at 5192);
+		// there is no `{` here, so nothing pushes COND. A `do` in this body therefore
+		// still closes an enclosing while/until/for header, and
+		// `while -> do y do end end.call; end` is a SyntaxError in MRI 4.0.5 under
+		// both its parsers. parseStatements clears noDoBlock; noDo stays.
 		body = p.parseStatements(bodyEnd)
 		p.expect(token.END)
 	} else {
+		// `-> { … }`. The `{` is lexed as tLAMBEG, and that lexer case still runs
+		// `++paren_nest; COND_PUSH(0); CMDARG_PUSH(0)` (parse.y v3_4_0 11226-11246)
+		// on top of the rule's own CMDARG_PUSH(0). So this body is free of BOTH
+		// suppressions, and `while -> { y do end }.call; end` parses.
 		p.expect(token.LBRACE)
+		savedNoDo := p.noDo
+		p.noDo = false
 		body = p.parseStatements(braceBlockEnd)
+		p.noDo = savedNoDo
 		p.expect(token.RBRACE)
 	}
 	params = p.finishImplicitParams(bs, params)
@@ -2906,10 +2978,12 @@ func (p *Parser) parseBlockRest(stop map[token.Type]bool, end token.Type, withRe
 		p.scope().explicitParams = true
 	}
 	bs := p.scope()
-	// A block body is a fresh statement context: a `do…end` inside it attaches
-	// normally even when this block is itself a paren-less command argument whose
-	// own trailing `do` was being held back (`include Module.new { … define_method
-	// (:x) do … end }`). Clear noDo for the duration of the body.
+	// A block body is a fresh statement context. The CMDARG side of that is
+	// parseStatements' business; what is cleared here is noDo (COND), because the
+	// `{` — and, for a `do…end` block, the fact that `keyword_do` is only produced
+	// when COND_P() is already false — puts MRI's COND stack at 0 (parse.y v3_4_0
+	// 11245 and 10519-10527). So a block written inside a while/until condition
+	// still takes its own inner `do…end`: `while [1].each { |x| y do end }; end`.
 	savedNoDo := p.noDo
 	p.noDo = false
 	body := p.parseStatements(stop)
@@ -3366,7 +3440,7 @@ func (p *Parser) parseIdentExpr() ast.Node {
 		p.advance() // name
 		call := &ast.Call{Name: name, Args: p.parseCommandArgs()}
 		p.attachCommandBrace(&call.Block)
-		if p.is(token.DO) && !p.noDo {
+		if p.atDoBlock() {
 			call.Block = p.parseDoBlock()
 		}
 		return call
@@ -3379,13 +3453,13 @@ func (p *Parser) parseIdentExpr() ast.Node {
 	// binds tighter and is handled by the postfix chain.
 	if p.is(token.IDENT) && p.isLocal(name) {
 		p.advance()
-		if p.is(token.DO) && !p.noDo {
+		if p.atDoBlock() {
 			return &ast.Call{Name: name, Block: p.parseDoBlock()}
 		}
 		if p.localCommandArgFollows() {
 			call := &ast.Call{Name: name, Args: p.parseCommandArgs()}
 			p.attachCommandBrace(&call.Block)
-			if p.is(token.DO) && !p.noDo {
+			if p.atDoBlock() {
 				call.Block = p.parseDoBlock()
 			}
 			return call
@@ -3415,7 +3489,7 @@ func (p *Parser) parseIdentExpr() ast.Node {
 	// single parameter (Ruby 3.4). With args/parens — or a block, as in RSpec's
 	// `it { … }` / `it do … end` — it stays a method call taking that block, not
 	// the implicit parameter followed by a stray block.
-	if name == "it" && !p.is(token.LBRACE) && !(p.is(token.DO) && !p.noDo) {
+	if name == "it" && !p.is(token.LBRACE) && !p.atDoBlock() {
 		if s := p.implicitParamScope(); s != nil {
 			s.usedIt = true
 			return &ast.VarRef{Name: name}
@@ -3538,10 +3612,11 @@ func (p *Parser) parseCommandArgs() []ast.Node {
 	// A trailing `do…end` binds to the command call, not to an argument that is
 	// itself a call (`foo bar do…end` → the block is foo's). Suppress block
 	// attachment while parsing the arguments so the enclosing postfix chain picks
-	// the `do` up for the command call. A braced `{…}` block is unaffected: it
-	// binds tighter and always attaches to the nearest call.
-	saved := p.noDo
-	p.noDo = true
+	// the `do` up for the command call — MRI's CMDARG_PUSH(1) in `command_args`
+	// (parse.y v3_4_0 4252-4265). A braced `{…}` block is unaffected: it binds
+	// tighter and always attaches to the nearest call.
+	saved := p.noDoBlock
+	p.noDoBlock = true
 	// In a paren-less argument list the comma separates arguments, so multiple-
 	// assignment detection must be off: `assert_equal a(1), tag = b(2)` is two
 	// arguments (the second an assignment), not an mlhs `a(1), tag = …`. A single
@@ -3562,7 +3637,7 @@ func (p *Parser) parseCommandArgs() []ast.Node {
 	}
 	p.noRescueMod = savedRescue
 	p.noMasgn = savedMasgn
-	p.noDo = saved
+	p.noDoBlock = saved
 	if kw != nil {
 		args = append(args, kw)
 	}
@@ -3583,8 +3658,19 @@ func (p *Parser) parseCallArgs(until token.Type) []ast.Node {
 	// less parseCommandArgs and def parameter-default handling.
 	savedMasgn := p.noMasgn
 	p.noMasgn = true
+	// The `(` / `[` that opened this list pushed CMDARG 0 in MRI's lexer (parse.y
+	// v3_4_0 11193, 11221), so a `do` inside belongs to the call it follows even
+	// when the whole list is an argument of a paren-less command call:
+	// `foo :a, bar(y do end)`, `foo :a, [y do end]`.
+	savedDoBlock := p.noDoBlock
+	p.noDoBlock = false
 	defer p.enterBracket()()
-	defer func() { p.bracketDepth--; p.noRescueMod = savedRescue; p.noMasgn = savedMasgn }()
+	defer func() {
+		p.bracketDepth--
+		p.noRescueMod = savedRescue
+		p.noMasgn = savedMasgn
+		p.noDoBlock = savedDoBlock
+	}()
 	var args []ast.Node
 	var kw *ast.HashLit
 	p.skipNewlines()
