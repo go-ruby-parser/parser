@@ -155,6 +155,26 @@ func (l *Lexer) regexAmbiguousAfterValueKeyword() bool {
 	return l.prevType == token.SUPER || l.prevType == token.YIELD
 }
 
+// atMethodName reports whether the cursor sits where a method NAME is expected,
+// so an operator character there spells that name instead of opening a literal.
+// MRI's two lexer states for this are EXPR_FNAME (just after `def`) and EXPR_DOT
+// (just after `.`, `&.` or `::`), and neither belongs to EXPR_BEG_ANY — the set
+// `parser_yylex` tests before it will call `parse_percent` for a `%` or open a
+// regexp for a `/`. So `def %(o)` and `6543.21.%(137)` both name the modulo
+// method, and `def /(o)` and `6.0./(2)` both name division, where a value
+// position would have read `%(…)` as a %Q string and `/…/` as a regexp.
+//
+// One predicate rather than a repeated `prevType != token.DEF` at each call site:
+// the previous form named only `def`, so all four literal openers silently
+// carried the wrong rule after a dot, and `x.%(1)` / `x./(1)` were refused.
+func (l *Lexer) atMethodName() bool {
+	switch l.prevType {
+	case token.DEF, token.DOT, token.SAFEDOT, token.SCOPE:
+		return true
+	}
+	return false
+}
+
 // isContinuationOp reports whether a line ending in token type t is incomplete,
 // so the trailing newline continues onto the next line rather than terminating
 // the statement. These are infix operators (plus comma and a trailing dot) that
@@ -172,7 +192,18 @@ func isContinuationOp(t token.Type) bool {
 		// Trailing low-precedence keyword operators and modifiers whose operand /
 		// condition may sit on the next line: `... or\n fail`, `... and\n x`,
 		// `do_it unless\n cond`, `foo if\n bar` (MRI joins these lines too).
-		token.AND, token.OR, token.IF, token.UNLESS, token.WHILE, token.UNTIL:
+		token.AND, token.OR, token.IF, token.UNLESS, token.WHILE, token.UNTIL,
+		// The clause keywords whose value also may sit on the next line. MRI does
+		// not list these anywhere: each sets a value-expecting lexer state, and
+		// `parser_yylex`'s '\n' case discards a newline in such a state, so the
+		// terminator the grammar wants is simply never emitted. `case_body: k_when
+		// case_args then` (parse.y v3_4_0 6191) has no `terms` between `k_when` and
+		// `case_args`, so `when`⏎`VALUE then …` can only parse if the newline is
+		// swallowed — which is the shape rubygems/request.rb:125 uses. `in` covers
+		// both `for x in`⏎`list` and a pattern clause `in`⏎`PATTERN`; `case` covers
+		// `case`⏎`subject` (and `k_case terms?` at 6136 already allows the
+		// subject-less `case`⏎`when …`).
+		token.WHEN, token.IN, token.CASE:
 		return true
 	}
 	return false
@@ -195,25 +226,26 @@ func (l *Lexer) lexToken() token.Token {
 	switch {
 	case c == 0:
 		return mk(token.EOF, "")
-	case c == '/' && l.state == exprBegin && l.prevType != token.DEF &&
+	case c == '/' && l.state == exprBegin && !l.atMethodName() &&
 		!(l.regexAmbiguousAfterValueKeyword() && spaceBefore && l.peek2() == ' '):
 		// At expression-begin position a '/' opens a regexp literal, not division
-		// (the same disambiguation MRI uses via its lexer state). The one exception
-		// is right after `def`, where `/` names the division-operator method
-		// (`def /(other)`) rather than opening a pattern.
+		// (the same disambiguation MRI uses via its lexer state). The exception is a
+		// method-name position — after `def` or after a `.`/`&.` — where `/` names
+		// the division-operator method (`def /(other)`, `6.0./(2)`) rather than
+		// opening a pattern.
 		//
 		// `super`/`yield` may be used as bare values (`super / x`, `yield / 2`),
 		// where a `/` spaced on both sides is division, not a regexp argument. The
 		// `spaceBefore && spaceAfter` heuristic keeps `super /re/` (arg, no space
 		// after) a regexp while making `super / x` division — matching MRI.
 		return l.lexRegexp(spaceBefore, line, col)
-	case c == '%' && l.prevType != token.DEF && l.percentBeginsLiteral(spaceBefore) && l.atPercentArray():
+	case c == '%' && !l.atMethodName() && l.percentBeginsLiteral(spaceBefore) && l.atPercentArray():
 		// %w[…] / %i[…] / %W[…] / %I[…] word- and symbol-array literals.
 		return l.lexPercentArray(spaceBefore, line, col)
-	case c == '%' && l.prevType != token.DEF && l.percentBeginsLiteral(spaceBefore) && l.atPercentRXS():
+	case c == '%' && !l.atMethodName() && l.percentBeginsLiteral(spaceBefore) && l.atPercentRXS():
 		// %r{…}flags regexp, %x{…} backtick command, %s{…} symbol literals.
 		return l.lexPercentRXS(spaceBefore, line, col)
-	case c == '%' && l.prevType != token.DEF && l.percentBeginsLiteral(spaceBefore) && l.atPercentString():
+	case c == '%' && !l.atMethodName() && l.percentBeginsLiteral(spaceBefore) && l.atPercentString():
 		// %q(…) / %Q(…) / %(…) / %W(…) string literals.
 		return l.lexPercentString(spaceBefore, line, col)
 	case c == '?' && l.charLiteralBegins(spaceBefore) && l.atCharLiteral():
@@ -711,23 +743,56 @@ func (l *Lexer) lexNumber(spaceBefore bool, line, col int) token.Token {
 		}
 	}
 	lit := stripUnderscores(string(l.src[start:l.pos]))
-	// Trailing `r` (rational) and/or `i` (imaginary) suffixes: `2r`, `0.5r`,
-	// `3i`, `2.5ri`. Recorded in Flags so the parser wraps the literal accordingly.
-	suffix := ""
-	if l.peek() == 'r' {
-		l.advance()
-		suffix += "r"
-	}
-	if l.peek() == 'i' {
-		l.advance()
-		suffix += "i"
-	}
+	suffix := l.numberLiteralSuffix()
 	l.state = exprEnd
 	tt := token.INT
 	if isFloat {
 		tt = token.FLOAT
 	}
 	return token.Token{Type: tt, Lit: lit, Flags: suffix, Line: line, Col: col, SpaceBefore: spaceBefore}
+}
+
+// numberLiteralSuffix consumes a trailing `r` (rational) and/or `i` (imaginary)
+// suffix at the cursor and returns it ("", "r", "i" or "ri"), mirroring MRI's
+// number_literal_suffix (parse.y v3_4_0 9044-9071). Two details of that function
+// are load-bearing and are the reason this is one helper rather than an inline
+// test at each numeric path:
+//
+//   - an `r` after an `i` is masked off ("rational of complex is disallowed"), so
+//     `2ri` carries both suffixes while `2ir` carries neither;
+//   - if the character that ends the scan is a letter, `_`, or non-ASCII, the
+//     WHOLE suffix is rejected and the cursor rewinds (`p->lex.pcur = lastp`).
+//     That is why `2rescue nil` is `2` followed by the modifier `rescue` and not
+//     the rational `2r` followed by `escue`, and why `2x` is `2` then `x`.
+//
+// Every numeric path (decimal, and each radix prefix — parse.y calls it at 9839,
+// 9863, 9892 and 9920) uses NUM_SUFFIX_ALL, so no caller needs a mask argument.
+func (l *Lexer) numberLiteralSuffix() string {
+	startPos, startCol := l.pos, l.col
+	suffix := ""
+	mayI, mayR := true, true
+	for {
+		switch c := l.peek(); {
+		case c == 'i' && mayI:
+			mayI, mayR = false, false // `2ri` is legal; `2ir` is not
+			suffix += "i"
+			l.advance()
+			continue
+		case c == 'r' && mayR:
+			mayR = false
+			suffix += "r"
+			l.advance()
+			continue
+		case isIdentStart(c): // letters, `_`, and every non-ASCII byte
+			// The suffix scan ran into a letter or `_`: reject the whole suffix and
+			// rewind, so the digits stand alone and the letters lex as their own
+			// token. No suffix character is ever a newline, so the column rewinds by
+			// the same amount as the position.
+			l.pos, l.col = startPos, startCol
+			return ""
+		}
+		return suffix
+	}
 }
 
 // lexRadixInt lexes a prefixed integer literal (cursor on the leading '0'). The
@@ -751,15 +816,23 @@ func (l *Lexer) lexRadixInt(spaceBefore bool, line, col int) token.Token {
 		}
 		digits = append(digits, l.advance())
 	}
-	l.state = exprEnd
 	if len(digits) == 0 {
+		l.state = exprEnd
 		return token.Token{Type: token.ILLEGAL, Lit: "invalid numeric literal", Line: line, Col: col, SpaceBefore: spaceBefore}
 	}
+	// A radix-prefixed integer takes the same `r`/`i` suffixes as a decimal one:
+	// parse.y v3_4_0 calls number_literal_suffix(NUM_SUFFIX_ALL) on the hex (9839),
+	// binary (9863), explicit-decimal (9892) and octal (9920) paths exactly as it
+	// does on the decimal one, so `0x10r` is (16/1) and `0b10i` is (0+2i). The
+	// suffix letters cannot be mistaken for digits: `r` and `i` are outside every
+	// radix's digit set, so the digit scan above always stops before them.
+	suffix := l.numberLiteralSuffix()
+	l.state = exprEnd
 	lit := string(digits)
 	if kind != 'd' {
 		lit = "0" + string(kind) + lit
 	}
-	return token.Token{Type: token.INT, Lit: lit, Line: line, Col: col, SpaceBefore: spaceBefore}
+	return token.Token{Type: token.INT, Lit: lit, Flags: suffix, Line: line, Col: col, SpaceBefore: spaceBefore}
 }
 
 // radixDigit returns the digit-membership test for a radix prefix letter.
