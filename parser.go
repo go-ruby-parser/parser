@@ -821,6 +821,42 @@ func (p *Parser) parseConstPath() (name string, path ast.Node) {
 	return name, scoped
 }
 
+// checkSingletonRecv refuses a `def` receiver that names a literal. MRI does it
+// in the `singleton` production itself, with the message this one copies, over a
+// fixed list of node types: NODE_STR, DSTR, XSTR, DXSTR, REGX, DREGX, SYM, DSYM,
+// LINE, FILE, ENCODING, INTEGER, FLOAT, RATIONAL, IMAGINARY, LIST and ZLIST
+// (parse.y v3_4_0 6724-6744). Notably absent: hashes and nil/true/false/self, so
+// `def (nil).m` and `def ({}).m` are accepted.
+//
+// Ruby 4.0 moved the check: v3_4_0 applies it only to the `'(' expr rparen`
+// alternative, while 4.0.5 restructured `singleton` into
+// `value_expr(singleton_expr)` and applies it to the bare `var_ref` spelling too.
+// The pseudo-literals are the only shapes that distinguishes: `def __FILE__.m`
+// parses under the v3_4_0 grammar and is refused by ruby 4.0.5 under BOTH its
+// parsers. The oracle this repo measures against is 4.0.5, so the check covers
+// both paths — named here once so the two call sites cannot drift apart.
+//
+// One shape is knowingly left accepted: an interpolated symbol `:"a#{b}"`, which
+// this parser desugars to `"a#{b}".to_sym` (see parseSymbolLiteral). That is an
+// *ast.Call indistinguishable from a real `"a#{b}".to_sym`, which MRI accepts as
+// a receiver, so refusing on the shape would refuse a legal program.
+func (p *Parser) checkSingletonRecv(n ast.Node) {
+	switch lit := n.(type) {
+	case *ast.IntLit, *ast.BignumLit, *ast.FloatLit, *ast.RationalLit, *ast.ImaginaryLit,
+		*ast.StringLit, *ast.StrInterp, *ast.SymbolLit, *ast.RegexpLit, *ast.XStr, *ast.ArrayLit:
+		p.fail("can't define singleton method for literals")
+	case *ast.VarRef:
+		// __FILE__, __LINE__ and __ENCODING__ are `keyword_variable`s in MRI, so they
+		// reach the receiver position as themselves; here the lexer yields plain
+		// identifiers. Matching the name is sound because none of the three can ever
+		// be a local: they are reserved words, so no assignment can introduce them.
+		switch lit.Name {
+		case "__FILE__", "__LINE__", "__ENCODING__":
+			p.fail("can't define singleton method for literals")
+		}
+	}
+}
+
 func (p *Parser) parseClass() ast.Node {
 	p.expect(token.CLASS)
 	// `class << target` opens target's singleton (metaclass). A SHOVEL here is
@@ -914,6 +950,7 @@ func (p *Parser) parseDef() ast.Node {
 			p.fail("singleton def receiver must be a single expression")
 		}
 		recv = stmts[0]
+		p.checkSingletonRecv(recv)
 		p.expect(token.RPAREN)
 		if !isDefRecvSep(p.cur().Type) {
 			p.fail("expected . or :: after a parenthesised def receiver")
@@ -951,6 +988,9 @@ func (p *Parser) parseDef() ast.Node {
 			recv = &ast.BoolLit{Value: false}
 		}
 		if recv != nil || singleton {
+			if recv != nil {
+				p.checkSingletonRecv(recv)
+			}
 			p.advance() // . or ::
 		}
 	}

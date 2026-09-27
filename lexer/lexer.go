@@ -50,6 +50,13 @@ type Lexer struct {
 	// trailing one continue the line; in operand position those open a block-param
 	// list, a block-pass, a heredoc, or a pattern pin instead.
 	prevBinary bool
+	// prevFname records whether the last token stood in a method-NAME position —
+	// after `def`, or after `.`/`&.`/`::` (see atMethodName). A reserved word there
+	// is a method name, not the operator it usually spells, so a line ending in it
+	// does not continue: `def in`⏎`in_loc.slice` and `def then`⏎`…` (both in
+	// prism/node.rb) are a `def` whose body starts on the next line, where a
+	// statement-position `in`⏎`PATTERN` is one clause spanning two lines.
+	prevFname bool
 	// pendingBinary is set within lexToken when the token being emitted is an
 	// ambiguous operator in binary position; next() latches it into prevBinary.
 	pendingBinary bool
@@ -127,7 +134,14 @@ func (l *Lexer) Tokenize() []token.Token {
 func (l *Lexer) next() token.Token {
 	l.pendingBinary = false
 	l.pendingSetterAssign = false
+	// Whether the token about to be lexed stands in a method-NAME position has to
+	// be captured before lexToken moves prevType on, because isContinuationOp is
+	// asked about it one token later: a keyword used as a method name
+	// (`def in`, `x.then`) is not the keyword operator and does not continue the
+	// line, where the same spelling in statement position does.
+	fname := l.atMethodName()
 	t := l.lexToken()
+	l.prevFname = fname
 	l.prevType = t.Type
 	l.prevBinary = l.pendingBinary
 	l.setterAssign = l.pendingSetterAssign
@@ -281,7 +295,7 @@ func (l *Lexer) lexToken() token.Token {
 		// Trailing-operator continuation: a line ending in an infix operator
 		// (`a ||`, `x +`, a trailing comma, …) is incomplete and joins the next
 		// line. `;` is an explicit terminator and is never suppressed this way.
-		if c == '\n' && isContinuationOp(l.prevType) && !l.setterAssign {
+		if c == '\n' && isContinuationOp(l.prevType) && !l.setterAssign && !l.prevFname {
 			return l.next()
 		}
 		// The ambiguous bitwise/shift operators `|`/`&`/`^`/`<<` continue a line
