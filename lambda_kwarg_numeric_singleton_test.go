@@ -703,6 +703,8 @@ func TestWt47RefuseTable(t *testing.T) {
 	refused := []string{
 		// over-acceptances removed by this batch
 		"def M::Bar::baz; end", "def obj&.m; end",
+		// dot_or_colon is the ONLY thing that may follow a parenthesised receiver
+		"def (foo)m; end", "def (foo) m; end",
 		"def __FILE__.m; end", "def __LINE__.m; end", "def __ENCODING__.m; end",
 		"def (1).m; end", "def (1.5).m; end", `def ("s").m; end`, `def ("a#{1}").m; end`,
 		"def (:sym).m; end", "def ([]).m; end", "def ([1]).m; end", "def (/re/).m; end",
