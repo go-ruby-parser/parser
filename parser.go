@@ -216,6 +216,19 @@ type Parser struct {
 	// lines collects the 1-based source line each statement node began on; it
 	// becomes ast.Program.Lines.
 	lines map[ast.Node]int
+	// stmtDepth is the nesting of statement LISTS: parseStatements increments it,
+	// so depth 1 is the program's own list. It exists for `BEGIN { }`, which MRI
+	// reaches only from `top_stmt` (parse.y v3_4_0 3020) — every nested body goes
+	// through `stmt_or_begin` (3093), whose `keyword_BEGIN` alternative exists
+	// solely to say "BEGIN is permitted only at toplevel". A depth is enough
+	// because MRI's own nesting rule is the same shape: `begin_block` reads a
+	// `top_compstmt` (3029), so a BEGIN inside a BEGIN is at top level again, which
+	// parseExeBlock spells by lending its body the enclosing depth.
+	stmtDepth int
+	// preExe collects the statements of every `BEGIN { }` block. MRI accumulates
+	// them in `p->eval_tree_begin` and runs them before the program body; Parse
+	// prepends them for the same reason, in source order.
+	preExe []ast.Node
 }
 
 // parseHook, when non-nil, runs at the start of Parse. It exists only so a
@@ -257,6 +270,11 @@ func Parse(src string) (prog *ast.Program, err error) {
 	}
 	body := p.parseStatements(map[token.Type]bool{})
 	p.expect(token.EOF)
+	// Every `BEGIN { }` block runs before the program body (MRI's
+	// `p->eval_tree_begin`, prepended in the `program` rule), in source order.
+	if len(p.preExe) > 0 {
+		body = append(p.preExe, body...)
+	}
 	return &ast.Program{Body: body, Lines: p.lines}, nil
 }
 
@@ -562,9 +580,11 @@ func (p *Parser) parseStatements(stop map[token.Type]bool) []ast.Node {
 	// that do reset it clear it themselves (parseBlockRest, parseLambda's `{` body).
 	savedDoBlock := p.noDoBlock
 	p.noDoBlock = false
+	p.stmtDepth++
 	defer func() {
 		p.noMasgn = savedMasgn
 		p.noDoBlock = savedDoBlock
+		p.stmtDepth--
 	}()
 	var body []ast.Node
 	for {
@@ -617,9 +637,67 @@ func (p *Parser) parseStatement1() ast.Node {
 		return p.applyModifiers(p.parseAlias())
 	case token.UNDEF:
 		return p.applyModifiers(p.parseUndef())
+	case token.CONST:
+		// `BEGIN { … }` and `END { … }`. Both spellings are reserved words in MRI
+		// (`reswords` lists keyword_BEGIN and keyword_END, parse.y v3_4_0 3819), but
+		// they are the only two that read as ordinary constants everywhere else, so
+		// they arrive here as a CONST token and are recognised by a hugging `{`.
+		// `do…end` is not an alternative in either production: MRI answers
+		// "unexpected 'do', expecting '{'".
+		if p.cur().Lit == "BEGIN" || p.cur().Lit == "END" {
+			if p.peekTok().Type == token.LBRACE {
+				return p.parseExeBlock()
+			}
+		}
+		return p.applyModifiers(p.parseOneLineMatch(p.parseKeywordLogical()))
 	default:
 		return p.applyModifiers(p.parseOneLineMatch(p.parseKeywordLogical()))
 	}
+}
+
+// parseExeBlock parses `BEGIN { body }` (parse.y v3_4_0 3020 `top_stmt:
+// keyword_BEGIN begin_block`, 3029 `begin_block: '{' top_compstmt '}'`) or
+// `END { body }` (3193 `stmt: k_END allow_exits '{' compstmt '}'`).
+//
+// BEGIN runs before the program body, which MRI does by accumulating the block
+// into `p->eval_tree_begin` and leaving a void `NEW_BEGIN(0)` where it stood.
+// Both halves are reproduced: the body is appended to p.preExe (Parse prepends
+// it) and an empty *ast.Begin — a begin with no body, which evaluates to nil and
+// does nothing — is returned in its place. BEGIN introduces no scope of its own
+// in MRI (its body is a `top_compstmt` in the enclosing one), and hoisting into
+// the same Program.Body keeps that.
+//
+// END is desugared to `at_exit { body }`. That is the replacement MRI itself
+// names (`rb_warn0("END in method; use at_exit")`, 3196) and it was measured
+// equivalent for what a parser can affect: MRI compiles the body to a
+// NEW_SCOPE2 with an empty local table, and on ruby 4.0.5 `x = 1; END { p x }`
+// and `x = 1; at_exit { p x }` both print 1 — the enclosing locals are visible
+// either way. The alternative, a dedicated AST node, would need every consumer
+// to learn it for no measurable difference here.
+func (p *Parser) parseExeBlock() ast.Node {
+	pre := p.advance().Lit == "BEGIN" // BEGIN or END
+	if pre && p.stmtDepth != 1 {
+		p.fail("BEGIN is permitted only at toplevel")
+	}
+	p.expect(token.LBRACE)
+	if pre {
+		// begin_block's body is a `top_compstmt`, so a BEGIN nested in a BEGIN is
+		// still at top level (`BEGIN { BEGIN { } }` parses in MRI): lend the body the
+		// enclosing depth rather than a deeper one.
+		p.stmtDepth--
+	}
+	restore := p.enterDoScope()
+	body := p.parseStatements(braceBlockEnd)
+	restore()
+	if pre {
+		p.stmtDepth++
+	}
+	p.expect(token.RBRACE)
+	if pre {
+		p.preExe = append(p.preExe, body...)
+		return &ast.Begin{}
+	}
+	return &ast.Call{Name: "at_exit", Block: &ast.Block{Body: body}}
 }
 
 // parseKeywordLogical parses the low-precedence keyword operators `and`, `or`,
@@ -743,6 +821,42 @@ func (p *Parser) parseConstPath() (name string, path ast.Node) {
 	return name, scoped
 }
 
+// checkSingletonRecv refuses a `def` receiver that names a literal. MRI does it
+// in the `singleton` production itself, with the message this one copies, over a
+// fixed list of node types: NODE_STR, DSTR, XSTR, DXSTR, REGX, DREGX, SYM, DSYM,
+// LINE, FILE, ENCODING, INTEGER, FLOAT, RATIONAL, IMAGINARY, LIST and ZLIST
+// (parse.y v3_4_0 6724-6744). Notably absent: hashes and nil/true/false/self, so
+// `def (nil).m` and `def ({}).m` are accepted.
+//
+// Ruby 4.0 moved the check: v3_4_0 applies it only to the `'(' expr rparen`
+// alternative, while 4.0.5 restructured `singleton` into
+// `value_expr(singleton_expr)` and applies it to the bare `var_ref` spelling too.
+// The pseudo-literals are the only shapes that distinguishes: `def __FILE__.m`
+// parses under the v3_4_0 grammar and is refused by ruby 4.0.5 under BOTH its
+// parsers. The oracle this repo measures against is 4.0.5, so the check covers
+// both paths — named here once so the two call sites cannot drift apart.
+//
+// One shape is knowingly left accepted: an interpolated symbol `:"a#{b}"`, which
+// this parser desugars to `"a#{b}".to_sym` (see parseSymbolLiteral). That is an
+// *ast.Call indistinguishable from a real `"a#{b}".to_sym`, which MRI accepts as
+// a receiver, so refusing on the shape would refuse a legal program.
+func (p *Parser) checkSingletonRecv(n ast.Node) {
+	switch lit := n.(type) {
+	case *ast.IntLit, *ast.BignumLit, *ast.FloatLit, *ast.RationalLit, *ast.ImaginaryLit,
+		*ast.StringLit, *ast.StrInterp, *ast.SymbolLit, *ast.RegexpLit, *ast.XStr, *ast.ArrayLit:
+		p.fail("can't define singleton method for literals")
+	case *ast.VarRef:
+		// __FILE__, __LINE__ and __ENCODING__ are `keyword_variable`s in MRI, so they
+		// reach the receiver position as themselves; here the lexer yields plain
+		// identifiers. Matching the name is sound because none of the three can ever
+		// be a local: they are reserved words, so no assignment can introduce them.
+		switch lit.Name {
+		case "__FILE__", "__LINE__", "__ENCODING__":
+			p.fail("can't define singleton method for literals")
+		}
+	}
+}
+
 func (p *Parser) parseClass() ast.Node {
 	p.expect(token.CLASS)
 	// `class << target` opens target's singleton (metaclass). A SHOVEL here is
@@ -790,14 +904,28 @@ func (p *Parser) parseModule() ast.Node {
 
 // isDefRecvStart reports whether tt can begin an explicit `def` receiver
 // (`def self.x`, `def obj.x`, `def Const.x`, `def @ivar.x`, `def @@c.x`,
-// `def $g.x`).
+// `def $g.x`, `def nil.x`). MRI's receiver is `singleton: var_ref | '(' expr
+// rparen` (parse.y v3_4_0 6711), and `var_ref: user_variable | keyword_variable`
+// — one token, never a constant PATH, which is why `def M::Bar::baz` is a
+// SyntaxError in MRI. `keyword_variable` (6711 ff.) is nil/self/true/false and
+// the three pseudo-literals __FILE__/__LINE__/__ENCODING__; the first four are
+// accepted here, the pseudo-literals deliberately are not (see parseDef).
 func isDefRecvStart(tt token.Type) bool {
 	switch tt {
-	case token.SELF, token.IDENT, token.CONST, token.IVAR, token.CVAR, token.GVAR:
+	case token.SELF, token.IDENT, token.CONST, token.IVAR, token.CVAR, token.GVAR,
+		token.NIL, token.TRUE, token.FALSE:
 		return true
 	}
 	return false
 }
+
+// isDefRecvSep reports whether tt separates a `def` receiver from the method
+// name. MRI spells it `dot_or_colon: '.' | tCOLON2` (parse.y v3_4_0 6839) and
+// `defs_head: k_def singleton dot_or_colon def_name` (3405) accepts either, so
+// `def M::name(v)` and `def self::m` are the same production as `def M.name(v)`
+// and `def self.m`. `&.` is NOT in it: `dot_or_colon` omits the `call_op`
+// alternative tANDDOT, so `def obj&.m` is a SyntaxError.
+func isDefRecvSep(tt token.Type) bool { return tt == token.DOT || tt == token.SCOPE }
 
 func (p *Parser) parseDef() ast.Node {
 	p.expect(token.DEF)
@@ -822,13 +950,19 @@ func (p *Parser) parseDef() ast.Node {
 			p.fail("singleton def receiver must be a single expression")
 		}
 		recv = stmts[0]
+		p.checkSingletonRecv(recv)
 		p.expect(token.RPAREN)
-		p.expect(token.DOT)
+		if !isDefRecvSep(p.cur().Type) {
+			p.fail("expected . or :: after a parenthesised def receiver")
+		}
+		p.advance() // . or ::
 	}
 	// A receiver before the method name: def self.foo / def obj.foo / def Const.foo
-	// / def @ivar.foo / def $g.foo. The kind guard keeps peekTok in range (the
-	// receiver is always a single name token followed by a dot).
-	if recv == nil && isDefRecvStart(p.cur().Type) && p.peekTok().Type == token.DOT {
+	// / def @ivar.foo / def $g.foo / def nil.foo, and each of those spelled with
+	// `::` instead of `.` (`def M::name(v)`, `def self::m`) — one `dot_or_colon`
+	// production, see isDefRecvSep. The kind guard keeps peekTok in range (the
+	// receiver is always a single name token followed by the separator).
+	if recv == nil && isDefRecvStart(p.cur().Type) && isDefRecvSep(p.peekTok().Type) {
 		switch p.cur().Type {
 		case token.SELF:
 			p.advance() // self
@@ -843,9 +977,21 @@ func (p *Parser) parseDef() ast.Node {
 			recv = &ast.CVarRef{Name: p.advance().Lit}
 		case token.GVAR:
 			recv = &ast.GVarRef{Name: p.advance().Lit}
+		case token.NIL: // keyword_variable receivers: MRI parses them, then raises
+			p.advance()
+			recv = &ast.NilLit{}
+		case token.TRUE:
+			p.advance()
+			recv = &ast.BoolLit{Value: true}
+		case token.FALSE:
+			p.advance()
+			recv = &ast.BoolLit{Value: false}
 		}
 		if recv != nil || singleton {
-			p.advance() // .
+			if recv != nil {
+				p.checkSingletonRecv(recv)
+			}
+			p.advance() // . or ::
 		}
 	}
 	name, ok := p.parseDefName()
@@ -1671,7 +1817,13 @@ func (p *Parser) parseInterpBody() ast.Node {
 func (p *Parser) parseCase() ast.Node {
 	p.expect(token.CASE)
 	var subject ast.Node
-	if !p.is(token.NEWLINE) {
+	// `k_case terms? case_body k_end` (parse.y v3_4_0 6136) is the subject-less
+	// `case`, and its `terms?` is OPTIONAL — so the first clause keyword may follow
+	// `case` with no terminator at all (`case when x then … end`), not only after a
+	// newline. That shape also arrives here once the lexer joins `case`⏎`when …`
+	// (see isContinuationOp), which is why the guard names the keywords rather than
+	// just the newline.
+	if !p.is(token.NEWLINE) && !p.is(token.WHEN) && !p.is(token.IN) {
 		// `k_case expr_value opt_terms case_body k_end` — the subject admits a
 		// command (`case foo bar` ⏎ `when 1` ⏎ `end` parses in MRI) but, being an
 		// `expr_value`, not a modifier-`rescue`: `case x rescue nil; when 1; end`
@@ -2923,20 +3075,36 @@ func (p *Parser) inlineOpAssign(node ast.Node) ast.Node {
 }
 
 // negateLiteral returns the negation of a numeric literal node. The MINUS path
-// in parseUnary reaches here only after parsePrimary consumed an INT or FLOAT
-// token, which yields exactly one of these three kinds: a FLOAT is always a
-// FloatLit, and an INT is an IntLit or — when it overflows int64, e.g.
-// -9999999999999999999999999999999 — a BignumLit. (An INT with invalid digits
-// fails inside parsePrimary and never returns here.)
-func negateLiteral(n ast.Node) ast.Node {
+// in parseUnary reaches here after parsePrimary consumed an INT or FLOAT token,
+// so the node is an IntLit, a BignumLit (an INT that overflows int64, e.g.
+// -9999999999999999999999999999999), or a FloatLit — each possibly wrapped by
+// applyNumSuffix in a RationalLit and/or an ImaginaryLit for an `r`/`i` suffix
+// (`-3r`, `-3i`, `-2.5ri`). Those wrappers are why this is a full switch with a
+// default arm and not a trailing `n.(*ast.FloatLit)` assertion: that assertion
+// panicked on every negated `r`/`i` literal, and the default keeps the parser's
+// never-panics contract for a node kind that does not belong here by refusing
+// the input instead of asserting.
+//
+// Negating through the wrapper matches MRI, which sets a `minus` flag on the
+// OUTERMOST node (`negate_lit`, parse.y v3_4_0 — NODE_RATIONAL and NODE_IMAGINARY
+// each carry their own `minus`). For these shapes negating the innermost numeric
+// is the same number: (-3)/1 is (-3/1), and 0 + (-3/1)i is (0-(3/1)*i), which is
+// exactly what `p(-3ri)` prints.
+func (p *Parser) negateLiteral(n ast.Node) ast.Node {
 	switch lit := n.(type) {
 	case *ast.IntLit:
 		return &ast.IntLit{Value: -lit.Value}
 	case *ast.BignumLit:
 		return &ast.BignumLit{Val: new(big.Int).Neg(lit.Val)}
+	case *ast.FloatLit:
+		return &ast.FloatLit{Value: -lit.Value}
+	case *ast.RationalLit:
+		return &ast.RationalLit{Value: p.negateLiteral(lit.Value)}
+	case *ast.ImaginaryLit:
+		return &ast.ImaginaryLit{Value: p.negateLiteral(lit.Value)}
 	}
-	fl := n.(*ast.FloatLit)
-	return &ast.FloatLit{Value: -fl.Value}
+	p.fail("cannot negate a non-numeric literal")
+	return nil
 }
 
 func (p *Parser) parseUnary() ast.Node {
@@ -2952,7 +3120,7 @@ func (p *Parser) parseUnary() ast.Node {
 				right := p.parseBinary(binBP(token.POW) - 1)
 				return &ast.UnaryExpr{Op: "-", Operand: &ast.BinaryExpr{Op: "**", Left: lit, Right: right}}
 			}
-			return p.parsePostfixTail(negateLiteral(lit))
+			return p.parsePostfixTail(p.negateLiteral(lit))
 		}
 		// `arg: tUMINUS arg` — an `arg` operand, so `-foo bar` is a SyntaxError in
 		// MRI. `!` and `not` are the exception: they have an `expr: '!' command_call`
@@ -3243,12 +3411,26 @@ func (p *Parser) parseLambda() ast.Node {
 		restore()
 		p.expect(token.RPAREN)
 		p.scope().explicitParams = true
-	} else if p.is(token.IDENT) || p.is(token.STAR) || p.is(token.POW) || p.is(token.AMPER) {
+	} else if p.is(token.IDENT) || p.is(token.LABEL) || p.is(token.STAR) || p.is(token.POW) || p.is(token.AMPER) {
 		// Unparenthesized parameters: `->x { }`, `-> ctx { }`, `->a, b { }`,
-		// `-> message do … end`. The list runs up to the block opener (`{`/`do`);
-		// parseBlockParams stops at the first token that is not a parameter. A `{`
-		// reached at this nesting is the lambda body, not a block on whatever the
-		// last default expression called: `-> a=a() { a }` (see noBraceBlock).
+		// `-> message do … end`, and — the case this set used to miss — a list that
+		// BEGINS with a keyword parameter: `-> x: 1 { x }`, `-> x: { x }`.
+		//
+		// The paren-less form is the plain `f_larglist: f_args` alternative (parse.y
+		// v3_4_0 5216), i.e. the SAME `f_args` the parenthesised form takes, and
+		// `f_args: args_tail` (6473) makes a bare `args_tail` a complete parameter
+		// list. `args_tail` starts with `f_kwarg(f_kw)` (6371), `f_kw: f_label
+		// arg_value | f_label` (6611) and `f_label: tLABEL` (6591) — so a tLABEL is
+		// a legal FIRST token here, exactly as `**kw` (f_any_kwrest) and `&b`
+		// (f_block_arg) already were. Omitting it made the whole list invisible, so
+		// `-> x: 1 { x }` was read as `->` followed immediately by a body and failed
+		// on "expected {"; `-> x, y: 2 { }` parsed only because a positional came
+		// first and parseBlockParams then handled the label itself.
+		//
+		// The list runs up to the block opener (`{`/`do`); parseBlockParams stops at
+		// the first token that is not a parameter. A `{` reached at this nesting is
+		// the lambda body, not a block on whatever the last default expression
+		// called: `-> a=a() { a }` (see noBraceBlock).
 		savedBrace := p.noBraceBlock
 		p.noBraceBlock = true
 		params, defaults, prepends, splat, blockParam = p.parseBlockParams(token.LBRACE)
@@ -3411,15 +3593,27 @@ func (p *Parser) parseBlockParams(until token.Type) (names []string, defaults, p
 			}
 			break
 		}
-		if p.accept(token.POW) { // **rest keyword-splat / anonymous ** (lambda params)
+		if p.accept(token.POW) { // **rest keyword-splat / anonymous ** / **nil
 			// parseBlockParams folds a keyword-splat into the splat slot using the
 			// sentinel name "**rest"/"**"; a consumer treats it as the kwrest. (Block
 			// kwargs are rare; record it as a trailing rest so the shape round-trips.)
-			if p.is(token.IDENT) {
+			switch {
+			case p.is(token.IDENT):
 				name := p.advance().Lit
 				p.declareLocal(name)
 				names = append(names, "**"+name)
-			} else {
+			case p.is(token.NIL):
+				// `{ |**nil| }` / `-> (**nil) { }` — the block list takes the same
+				// "accepts no keywords" marker a method list does: MRI reaches it through
+				// `block_args_tail: f_any_kwrest opt_f_block_arg` (parse.y v3_4_0 5006),
+				// `f_any_kwrest: f_kwrest | f_no_kwarg` and `f_no_kwarg: p_kwnorest:
+				// kwrest_mark keyword_nil`. parseDefParams already spelled it "nil";
+				// here the sentinel keeps the "**" prefix the rest of this list uses, so
+				// it cannot collide with a parameter actually named `nil` (there can be
+				// none — `nil` is a keyword).
+				p.advance()
+				names = append(names, "**nil")
+			default:
 				names = append(names, "**")
 			}
 			defaults = append(defaults, nil)
