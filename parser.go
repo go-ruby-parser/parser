@@ -3173,13 +3173,15 @@ func (p *Parser) parsePostfixTail(node ast.Node) ast.Node {
 				p.advance()
 				args := p.parseCallArgs(token.RPAREN)
 				p.expect(token.RPAREN)
-				node = &ast.Call{Recv: node, Name: "call", Args: args, Safe: safe}
+				node = &ast.Call{Recv: node, Name: "call", Args: args, Safe: safe, Paren: true}
 				break
 			}
 			name := p.methodName()
 			var args []ast.Node
+			paren := false
 			if p.is(token.LPAREN) && !p.cur().SpaceBefore {
 				p.advance()
+				paren = true
 				args = p.parseCallArgs(token.RPAREN)
 				p.expect(token.RPAREN)
 			} else if p.commandArgsFollow(cmdArgRecv) {
@@ -3201,7 +3203,7 @@ func (p *Parser) parsePostfixTail(node ast.Node) ast.Node {
 				}
 				return call
 			}
-			node = &ast.Call{Recv: node, Name: name, Args: args, Safe: safe}
+			node = &ast.Call{Recv: node, Name: name, Args: args, Safe: safe, Paren: paren}
 		case p.is(token.SCOPE):
 			p.advance()
 			// `Const::Name(args)` — a capitalized scope-resolution method call:
@@ -3213,7 +3215,7 @@ func (p *Parser) parsePostfixTail(node ast.Node) ast.Node {
 				p.advance() // consume '('
 				args := p.parseCallArgs(token.RPAREN)
 				p.expect(token.RPAREN)
-				node = &ast.Call{Recv: node, Name: name, Args: args}
+				node = &ast.Call{Recv: node, Name: name, Args: args, Paren: true}
 				break
 			}
 			if p.is(token.CONST) {
@@ -3237,8 +3239,10 @@ func (p *Parser) parsePostfixTail(node ast.Node) ast.Node {
 			// Foo::bar(args) or `Mod::meth arg` — a method call, like the dot form.
 			name := p.methodName()
 			var args []ast.Node
+			paren := false
 			if p.is(token.LPAREN) && !p.cur().SpaceBefore {
 				p.advance()
+				paren = true
 				args = p.parseCallArgs(token.RPAREN)
 				p.expect(token.RPAREN)
 			} else if p.commandArgsFollow(cmdArgRecv) {
@@ -3252,7 +3256,7 @@ func (p *Parser) parsePostfixTail(node ast.Node) ast.Node {
 				}
 				return call
 			}
-			node = &ast.Call{Recv: node, Name: name, Args: args}
+			node = &ast.Call{Recv: node, Name: name, Args: args, Paren: paren}
 		case p.is(token.LBRACKET): // index: recv[args] → recv.[](args)
 			p.advance()
 			args := p.parseCallArgs(token.RBRACKET)
@@ -3863,7 +3867,7 @@ func (p *Parser) parsePrimary() ast.Node {
 			p.advance()
 			args := p.parseCallArgs(token.RPAREN)
 			p.expect(token.RPAREN)
-			return &ast.Call{Name: t.Lit, Args: args}
+			return &ast.Call{Name: t.Lit, Args: args, Paren: true}
 		}
 		// A string hugging the constant is a paren-less call: `Integer"42"`.
 		if p.commandArgsFollow(cmdArgHugStringHere) {
@@ -3977,16 +3981,20 @@ func (p *Parser) parseIdentExpr() ast.Node {
 		restoreCmd()
 		p.skipNewlines()
 		p.expect(token.RPAREN)
-		return &ast.Call{Name: name, Args: []ast.Node{arg}}
+		return &ast.Call{Name: name, Args: []ast.Node{arg}, Paren: true}
 	}
 
-	// foo(...) — paren call (the '(' must hug the name).
+	// foo(...) — paren call (the '(' must hug the name). This is MRI's
+	// `method_call: fcall paren_args` (parse.y-ruby_4_0:5242-5248), an FCALL,
+	// and Paren records it: `foo()` reaches here with an empty argument list,
+	// where the bare `foo` handled at the end of this function does not reach
+	// here at all.
 	if next.Type == token.LPAREN && !next.SpaceBefore {
 		p.advance() // name
 		p.advance() // (
 		args := p.parseCallArgs(token.RPAREN)
 		p.expect(token.RPAREN)
-		return &ast.Call{Name: name, Args: args}
+		return &ast.Call{Name: name, Args: args, Paren: true}
 	}
 
 	// A string literal hugging the name (no space) is a paren-less argument:
@@ -4066,6 +4074,9 @@ func (p *Parser) parseIdentExpr() ast.Node {
 			return &ast.VarRef{Name: name}
 		}
 	}
+	// A bare name, no parentheses, no arguments: MRI's VCALL (gettable,
+	// parse.y-ruby_4_0:13086). Paren stays false, and that is the whole of
+	// the difference from the `foo(…)` branch above.
 	return &ast.Call{Name: name}
 }
 
