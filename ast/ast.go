@@ -72,9 +72,28 @@ type XStr struct{ Command string }
 type ArrayLit struct{ Elems []Node }
 
 // HashLit is a hash literal {k => v, …}; Keys[i] maps to Values[i].
+//
+// Braced records one bit of WRITTEN FORM, exactly as MRI's own parser does:
+// `primary: tLBRACE assoc_list '}'` sets `RNODE_HASH($$)->nd_brace = TRUE`
+// (parse.y-ruby_4_0:4415-4419), while `rb_node_hash_new` leaves it 0 for every
+// hash the grammar assembles itself (parse.y-ruby_4_0:11784-11791). The two
+// spellings mean different things at a call site: `f({k: 1})` passes a
+// POSITIONAL Hash and `f(k: 1)` passes KEYWORDS. MRI reads the bit back for
+// exactly that question (aryset_check, parse.y-ruby_4_0:13669).
+//
+// The bit says only "written with braces". It is NOT conditional on being an
+// argument, again as in MRI: `x = {a: 1}` is Braced too. A consumer that wants
+// "positional Hash argument" asks Braced of a node it already found in
+// Call.Args. A `{` that opens a BLOCK never reaches the hash-literal
+// production at all — that disambiguation is the lexer's
+// (parse.y-ruby_4_0:11141-11153) and ours (see parseHashLiteral) — so
+// `obj.m {}` builds no HashLit to ask.
 type HashLit struct {
 	Keys   []Node
 	Values []Node
+	// Braced is true when the hash was written as `{…}`, and false when the
+	// parser collected it from bare `k: v` pairs in an argument list.
+	Braced bool
 }
 
 // RangeLit is a range literal: Lo..Hi (inclusive) or Lo...Hi (Exclusive).

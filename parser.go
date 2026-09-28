@@ -3318,7 +3318,11 @@ func (p *Parser) parseHashLiteral() ast.Node {
 	// `{k: x rescue nil}` and `{1 => x rescue nil}` are SyntaxErrors where
 	// `{k: (x rescue nil)}` and `{k: a = x rescue nil}` (an `arg_rhs`) are legal.
 	defer p.permitRescueMod(false)()
-	h := &ast.HashLit{}
+	// The only place a `{…}` hash literal is built, which is why Braced can be
+	// set unconditionally here: MRI sets nd_brace on exactly this production
+	// (`primary: tLBRACE assoc_list '}'`, parse.y-ruby_4_0:4415-4419). A `{`
+	// that opens a block is routed away before this point (see above).
+	h := &ast.HashLit{Braced: true}
 	p.skipNewlines()
 	for !p.is(token.RBRACE) {
 		var k, v ast.Node
@@ -4414,7 +4418,10 @@ func (p *Parser) atAnonForwardEnd() bool {
 }
 
 // addKwPair appends a key/value pair to the implicit trailing-hash argument,
-// allocating it on first use.
+// allocating it on first use. This hash is assembled by the parser from bare
+// `k: v` pairs, so it is deliberately NOT Braced: it is the KEYWORD form, the
+// `f(k: 1)` of #40. MRI leaves nd_brace at its 0 default here for the same
+// reason (rb_node_hash_new, parse.y-ruby_4_0:11784-11791).
 func (p *Parser) addKwPair(kw **ast.HashLit, k, v ast.Node) {
 	if *kw == nil {
 		*kw = &ast.HashLit{}
