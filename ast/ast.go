@@ -122,6 +122,30 @@ type Call struct {
 	Args  []Node
 	Block *Block
 	Safe  bool // &. safe navigation: nil receiver short-circuits to nil
+	// Paren records one bit of WRITTEN FORM: the call site had a parenthesised
+	// argument list, `foo(…)`, rather than none. It is what separates MRI's
+	// FCALL from its VCALL, which are different nodes built by different
+	// productions — `fcall: operation` feeding `method_call: fcall paren_args`
+	// (parse.y-ruby_4_0:3572-3577 and 5242-5248) makes an FCALL, while a bare
+	// name reaching `gettable` makes a VCALL (parse.y-ruby_4_0:13086). The
+	// difference is observable: `nope` raises NameError, `nope()` raises
+	// NoMethodError.
+	//
+	// It is written form and nothing else. It is true for an empty list
+	// (`foo()`, where Args is nil) and false for every call written without
+	// parentheses whatever else is there — `puts 1`, `obj.m`, and `a[0]`,
+	// since brackets are not parentheses. It is also false on the Calls the
+	// parser synthesises with no source of their own, such as the read half
+	// of an op-assign.
+	//
+	// Deciding VCALL takes more than this one bit, because MRI's `operation`
+	// admits tFID: `foo!` and `foo?` are FCALLs with no parentheses
+	// (parse.y-ruby_4_0:4370-4374 and 6696-6698), and a literal block makes an
+	// FCALL too (`primary: fcall brace_block`, parse.y-ruby_4_0:4458-4463). A
+	// consumer wanting VCALL should ask for Recv == nil && !Paren &&
+	// len(Args) == 0 && Block == nil && a Name that is a plain identifier
+	// (no trailing ! or ?).
+	Paren bool
 }
 
 // Block is a literal block: parameters and a body. It is a closure over the
