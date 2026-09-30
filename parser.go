@@ -3130,8 +3130,26 @@ func (p *Parser) parseUnary() ast.Node {
 		return &ast.UnaryExpr{Op: "-", Operand: p.parseUnary()}
 	case token.PLUS:
 		p.advance()
+		// A plus directly before a NUMERIC LITERAL is absorbed into it, exactly as
+		// the minus above is: `+1` is the Integer 1 and dispatches nothing, which
+		// ruby 4.0.5 confirms -- with Integer#+@ redefined, `+1` still answers 1.
+		//
+		// Everything else dispatches #+@, per `arg: tUPLUS arg` calling
+		// call_uni_op(p, $2, idUPlus) (parse.y-ruby_4_0:3962-3966). The fold is
+		// LEXICAL, not semantic: measured on 4.0.5, `+(1)` and `+(1+1)` both
+		// dispatch, and so does a variable holding a number. Only the bare literal
+		// token is absorbed.
+		//
+		// Eliding it instead was wrong in a way that only became easy to hit with
+		// the frozen_string_literal pragma: `+"..."` is THE idiom for asking a
+		// frozen literal for a mutable copy, and eliding the operator handed back
+		// the frozen literal itself, so `buf = +"start"; buf << "-more"` raised
+		// FrozenError where ruby prints "start-more".
+		if p.is(token.INT) || p.is(token.FLOAT) {
+			return p.parsePostfixTail(p.parsePrimary())
+		}
 		defer p.permitCommand(false)()
-		return p.parseUnary() // unary plus is a no-op
+		return &ast.UnaryExpr{Op: "+@", Operand: p.parseUnary()}
 	case token.BANG:
 		p.advance()
 		// `!` is the ONE unary operator whose operand may be a paren-less command
