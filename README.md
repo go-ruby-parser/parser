@@ -107,7 +107,10 @@ Methodology, the full parity tables and the allocation hotspots are in
 
 **As of v0.11.0, measured 2026-10-04, this section lists none.** Every
 limitation it used to name now parses, and the claims are pinned by
-`TestReadmeClaimsStillHold` so this page cannot contradict the code again:
+`TestReadmeClaimsStillHold` so this page cannot contradict the code again.
+(It did not survive the hour: adding the stdlib sweep below found a real
+refusal — `alias / +` — which is fixed and pinned by
+`TestAliasAndUndefNameAnOperator`. "None" is a measurement, not a promise.)
 
 ```go
 parser.Parse("foo a: 1")                         // paren-less command call with kwargs
@@ -121,11 +124,16 @@ parser.Parse("class C\n  def self::m; 1; end\nend") // def self::name
 The last three were listed here as broken and are not. `def self::name` is the
 construct the stdlib refusal below actually tripped on.
 
-**CRuby stdlib: 47 of 47.** Every top-level `.rb` file of a real CRuby 4.0.5
-installation parses — the one refusal this section used to name, `mkmf.rb`, is
-gone with `def self::name`. That is a **dated local measurement**: CI has no
-CRuby, so `TestCRubyStdlibTopLevelParses` runs the sweep when a tree is present
-and skips when it is not. Reproduce it with
+**CRuby stdlib: 47 of 47 on 4.0.5, 66 of 66 on 3.2.** Every top-level `.rb`
+file of a real CRuby installation parses — the one refusal this section used to
+name, `mkmf.rb`, is gone with `def self::name`.
+
+`TestCRubyStdlibTopLevelParses` runs that sweep against **whatever CRuby is on
+the machine**, and skips only when there is none. That is deliberate and it has
+already paid: CI's runner carries Ruby 3.2 rather than 4.0.5, and its
+`pathname.rb` refused on `alias / +` — a construct valid in every Ruby, which no
+4.0.5 file happens to use. A sweep restricted to the targeted version would
+have missed it. Reproduce with
 
 ```sh
 go test -run TestCRubyStdlibTopLevelParses -v .   # or RUBYLIBDIR=<dir> to point it
