@@ -25,8 +25,12 @@ type Node interface{ node() }
 // CHANGE, not per instruction — and every reader resolves a pc to the nearest
 // preceding entry. Statement boundaries are where the line changes in all but
 // pathological source, so this map holds the same information at the
-// granularity a consumer can observe, without a position field on all 55 node
-// types.
+// granularity a consumer can observe, without a position field on every node
+// type.
+//
+// ("55" stood here and the count is 56 as of parser v0.11.0. A count of
+// something the file itself defines rots on the next addition and says nothing
+// the reader needs, so it is gone rather than corrected.)
 type Program struct {
 	Body  []Node
 	Lines map[Node]int
