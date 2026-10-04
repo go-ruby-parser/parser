@@ -3422,6 +3422,10 @@ func (p *Parser) stringKeyColon(key ast.Node) (ast.Node, bool) {
 // parseLambda parses a stabby lambda `->(params) { body }` / `-> { body }` /
 // `->(params) do body end`, desugaring it to `lambda { |params| body }`.
 func (p *Parser) parseLambda() ast.Node {
+	// The `->` itself, not its `{`: ruby reports the arrow's line as the lambda's
+	// location.first_lineno (measured; they are the same line in all but
+	// deliberately odd layouts).
+	lambdaLine := p.cur().Line
 	p.expect(token.ARROW)
 	p.pushBlockScope()
 	var params []string
@@ -3490,20 +3494,26 @@ func (p *Parser) parseLambda() ast.Node {
 	if len(prepends) > 0 {
 		body = append(prepends, body...)
 	}
-	return &ast.Call{Name: "lambda", Block: &ast.Block{Params: params, Defaults: defaults, SplatIndex: splat, BlockParam: blockParam, Body: body}}
+	return &ast.Call{Name: "lambda", Block: &ast.Block{Line: lambdaLine, Params: params, Defaults: defaults, SplatIndex: splat, BlockParam: blockParam, Body: body}}
 }
 
 // parseBraceBlock parses `{ [|params|] body }`.
 func (p *Parser) parseBraceBlock() *ast.Block {
+	line := p.cur().Line
 	p.expect(token.LBRACE)
-	return p.parseBlockRest(map[token.Type]bool{token.RBRACE: true}, token.RBRACE, false)
+	b := p.parseBlockRest(map[token.Type]bool{token.RBRACE: true}, token.RBRACE, false)
+	b.Line = line
+	return b
 }
 
 // parseDoBlock parses `do [|params|] body end`. A do…end block body may carry
 // rescue/else/ensure clauses without an explicit begin (unlike a brace block).
 func (p *Parser) parseDoBlock() *ast.Block {
+	line := p.cur().Line
 	p.expect(token.DO)
-	return p.parseBlockRest(beginBodyEnd, token.END, true)
+	b := p.parseBlockRest(beginBodyEnd, token.END, true)
+	b.Line = line
+	return b
 }
 
 // parseBlockRest parses a block's optional `|params|` and body, having already

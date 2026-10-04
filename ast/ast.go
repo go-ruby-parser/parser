@@ -172,6 +172,32 @@ type Call struct {
 // *splat param; non-nil for an optional `name = expr` param), exactly as
 // MethodDef records its method-parameter defaults.
 type Block struct {
+	// Line is the 1-based source line the block's OPENER sits on -- its `{`, its
+	// `do`, or the `->` of an arrow lambda. It lives here rather than in
+	// Program.Lines because a Block is not a Node (it is a field of Call), so
+	// that map cannot key on it.
+	//
+	// It is observable as MRI's location.first_lineno: Proc#source_location,
+	// Method#source_location for a define_method, and the line a Proc prints
+	// when it inspects itself. A consumer previously had to take the line of the
+	// enclosing STATEMENT, which is the same only when the block opens on that
+	// statement's first line. Measured against ruby 4.0.5:
+	//
+	//	h = {                      # line 1
+	//	  :a => proc {             # line 2
+	//	    1
+	//	  },
+	//	  :b => proc { 2 },        # line 5
+	//	}
+	//	h[:a].source_location[1]   # ruby 2    from the statement, 1
+	//	h[:b].source_location[1]   # ruby 5    from the statement, 1
+	//
+	// The body's first line is not a substitute either: ruby answers 2 for :a,
+	// whose first statement is on line 3, and an empty block has no statement at
+	// all.
+	//
+	// 0 means "not recorded" -- read it as unknown, not as line 0.
+	Line       int
 	Params     []string
 	Defaults   []Node // parallel to Params; nil for a required or *splat param
 	SplatIndex int    // index of the top-level *splat param in Params, or -1

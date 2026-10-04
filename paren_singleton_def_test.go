@@ -123,11 +123,11 @@ func TestParenSingletonDefMethodCallReceiver(t *testing.T) {
 // applies unchanged after the receiver.
 func TestParenSingletonDefParamForms(t *testing.T) {
 	cases := []struct {
-		src        string
-		name       string
-		params     []string
-		kw         []string
-		bodyLen    int
+		src     string
+		name    string
+		params  []string
+		kw      []string
+		bodyLen int
 	}{
 		{src: "def (obj).m(a, b); a; end", name: "m", params: []string{"a", "b"}, bodyLen: 1},
 		{src: "def (obj).m(a:); a; end", name: "m", kw: []string{"a"}, bodyLen: 1},
