@@ -178,12 +178,25 @@ func (l *Lexer) regexAmbiguousAfterValueKeyword() bool {
 // method, and `def /(o)` and `6.0./(2)` both name division, where a value
 // position would have read `%(…)` as a %Q string and `/…/` as a regexp.
 //
+// `alias` and `undef` are in the set for the same reason: MRI's grammar sets
+// EXPR_FNAME|EXPR_FITEM for the items of both --
+//
+//	k_alias fitem {SET_LEX_STATE(EXPR_FNAME|EXPR_FITEM);} fitem
+//	k_undef undef_list
+//
+// -- so an operator character after either spells a method name. Without them
+// `alias / +` was refused with "expected a method name", because the `/` opened
+// a regexp instead: it is how Pathname aliases its `/`, and CRuby's own
+// pathname.rb line 358 is exactly that line.
+//
 // One predicate rather than a repeated `prevType != token.DEF` at each call site:
 // the previous form named only `def`, so all four literal openers silently
-// carried the wrong rule after a dot, and `x.%(1)` / `x./(1)` were refused.
+// carried the wrong rule after a dot, and `x.%(1)` / `x./(1)` were refused. The
+// `alias`/`undef` omission is the same shape a second time, which is the
+// argument for the predicate rather than against it.
 func (l *Lexer) atMethodName() bool {
 	switch l.prevType {
-	case token.DEF, token.DOT, token.SAFEDOT, token.SCOPE:
+	case token.DEF, token.DOT, token.SAFEDOT, token.SCOPE, token.ALIAS, token.UNDEF:
 		return true
 	}
 	return false

@@ -105,24 +105,51 @@ Methodology, the full parity tables and the allocation hotspots are in
 
 ## Known limitations
 
-As of **v0.4.0**, the three limitations this section used to list all parse. Verified
-against v0.4.0:
+**As of v0.11.0, measured 2026-10-04, this section lists none.** Every
+limitation it used to name now parses, and the claims are pinned by
+`TestReadmeClaimsStillHold` so this page cannot contradict the code again.
+(It did not survive the hour: adding the stdlib sweep below found a real
+refusal — `alias / +` — which is fixed and pinned by
+`TestAliasAndUndefNameAnOperator`. "None" is a measurement, not a promise.)
 
 ```go
-parser.Parse("foo a: 1")                        // paren-less command call with kwargs — OK
-parser.Parse("[1].each { |a = 1| a }")          // default block parameter — OK
-parser.Parse("case x\nin Point(a, b)\n  a\nend") // positional find-pattern — OK
+parser.Parse("foo a: 1")                         // paren-less command call with kwargs
+parser.Parse("[1].each { |a = 1| a }")           // default block parameter
+parser.Parse("case x\nin Point(a, b)\n  a\nend")  // positional find-pattern
+parser.Parse("BEGIN { puts 1 }")                 // BEGIN block  — listed as failing until v0.11.0
+parser.Parse("END { puts 1 }")                   // END block    — likewise
+parser.Parse("class C\n  def self::m; 1; end\nend") // def self::name
 ```
 
-What still does not parse:
+The last three were listed here as broken and are not. `def self::name` is the
+construct the stdlib refusal below actually tripped on.
 
-- **`BEGIN { }` and `END { }` blocks** — `parse error: unexpected "{" after statement`.
+**CRuby stdlib: 47 of 47 on 4.0.5, 66 of 66 on 3.2.** Every top-level `.rb`
+file of a real CRuby installation parses — the one refusal this section used to
+name, `mkmf.rb`, is gone with `def self::name`.
 
-A broader note on completeness: of 47 top-level CRuby 4.0.5 stdlib files that MRI
-accepts, go-ruby-parser accepts **46**. The one refusal is `mkmf.rb`
-(`expected CONST, got "log_open"`). The parser is deliberately
-**under**-permissive rather than over-permissive: it aims never to accept Ruby that
-MRI rejects.
+`TestCRubyStdlibTopLevelParses` runs that sweep against **whatever CRuby is on
+the machine**, and skips only when there is none. That is deliberate and it has
+already paid: CI's runner carries Ruby 3.2 rather than 4.0.5, and its
+`pathname.rb` refused on `alias / +` — a construct valid in every Ruby, which no
+4.0.5 file happens to use. A sweep restricted to the targeted version would
+have missed it. Reproduce with
+
+```sh
+go test -run TestCRubyStdlibTopLevelParses -v .   # or RUBYLIBDIR=<dir> to point it
+```
+
+The parser is deliberately **under**-permissive rather than over-permissive: it
+aims never to accept Ruby that MRI rejects. `TestUnderPermissiveNotOver` pins
+the discriminating case — MRI refuses `BEGIN` inside a method body, and so does
+this.
+
+A 23-construct probe against `ruby -c` (flip-flops, `redo`, `__END__`/`DATA`,
+heredoc-with-method-call, `_1`, `it`, endless methods, rightward assignment,
+one-line pattern match, hash shorthand, all three anonymous forwards,
+refinements, `?a`, imaginary/rational literals, …) found **no gap and no
+over-acceptance**. Twenty-three hand-picked constructs are not a completeness
+proof, and this section does not claim one.
 
 ## License
 
