@@ -31,27 +31,69 @@ func nested(kind string, n int) string {
 		return "x = " + strings.Repeat("f { ", n) + "1" + strings.Repeat(" }", n) + "\n"
 	case "ternary":
 		return "x = " + strings.Repeat("1 ? ", n) + "1" + strings.Repeat(" : 2", n) + "\n"
+	case "assign":
+		return "x = " + strings.Repeat("y = ", n) + "1\n"
 	}
 	t := "unknown production " + kind
 	panic(t)
 }
 
-var deepKinds = []string{"array", "hash", "paren", "call", "interp", "block", "ternary"}
+// deepKinds pairs each production with a depth comfortably past the limit FOR
+// THAT PRODUCTION. The depths differ because the limit counts frames entered,
+// not brackets nested, and the ratio is not the same everywhere: every
+// bracket-like production enters parseExprOrAssign and parseTernary in turn and
+// so runs at 2x the source nesting, while a ternary chain re-enters only
+// parseTernary and runs at 1x. Measured at nesting 2000: array 4001,
+// hash/paren/call/interp/block 4003, ternary 2003.
+//
+// A single depth of 20000 for all of them looked right and was not: it is 40000
+// frames for the first six and only 20001 for the ternary, which sits UNDER the
+// 32768 ceiling, so the ternary case silently stopped testing anything. This
+// test caught that, which is the argument for keeping the depths explicit
+// rather than computing one from a constant.
+var deepKinds = []struct {
+	kind  string
+	depth int
+}{
+	{"array", 20_000},
+	{"hash", 20_000},
+	{"paren", 20_000},
+	{"call", 20_000},
+	{"interp", 20_000},
+	{"block", 20_000},
+	{"ternary", 35_000},
+	// An assignment chain is the one shape that recurses through
+	// parseExprOrAssign ALONE -- the other eleven probed shapes all cross the
+	// limit inside parseTernary. Without this row the check in
+	// parseExprOrAssign is never exercised, the coverage gate says so, and
+	// deleting it as dead code would leave `y = `*N unguarded. Ratio 1.0, so
+	// it needs a depth past the frame limit like the ternary does.
+	{"assign", 40_000},
+}
 
 // Source deep enough to have overflowed the Go stack must now come back as an
 // ordinary error. A Go stack overflow is a FATAL runtime error rather than a
 // panic, so this test cannot assert it with recover(): before the limit existed
 // the process died and the test binary went with it. That is why the assertion
 // is "an error, and we are still running".
+// The depth is 20000 levels and not 100000. 20000 is already past the limit for
+// every production here -- the ceiling is 32768 FRAMES, which is 16384 levels of
+// any bracket production and 32768 of a ternary chain -- so a deeper input
+// proves nothing more and costs real time: CI runs this with -race AND coverage
+// instrumentation under go test's 10-minute default, and a first revision at
+// 100000 took 2.8s locally, 33s locally under -race alone, and timed out the
+// whole package on all three OS lanes at 600s. Deep enough to fire is the
+// requirement; deeper is only slower.
 func TestDeepNestingIsAnErrorNotAStackOverflow(t *testing.T) {
-	for _, kind := range deepKinds {
-		t.Run(kind, func(t *testing.T) {
-			_, err := parser.Parse(nested(kind, 100_000))
+	for _, tc := range deepKinds {
+		t.Run(tc.kind, func(t *testing.T) {
+			_, err := parser.Parse(nested(tc.kind, tc.depth))
 			if err == nil {
-				t.Fatalf("%s nested 100000 deep parsed without error; the depth limit did not fire", kind)
+				t.Fatalf("%s nested %d deep parsed without error; the depth limit did not fire",
+					tc.kind, tc.depth)
 			}
 			if !strings.Contains(err.Error(), "too deep") {
-				t.Fatalf("%s: error is %q, want one naming the nesting limit", kind, err)
+				t.Fatalf("%s: error is %q, want one naming the nesting limit", tc.kind, err)
 			}
 		})
 	}
@@ -78,15 +120,17 @@ func TestNestingMriAcceptsIsStillAccepted(t *testing.T) {
 // Ordinary source must not pay for the limit in behaviour: a program nested a
 // normal amount parses, and the counter does not accumulate across the many
 // expressions of one parse -- which it would if the decrement were skipped on
-// any ordinary return path. 40000 statements, each with a little nesting, is
-// far more total frames than the limit allows at once.
+// any ordinary return path. 10000 statements enter parseExprOrAssign tens of
+// thousands of times in total, far past the 32768 ceiling, so a leaked
+// decrement fails this; it is kept at 10000 rather than higher because this
+// runs under -race and coverage in CI.
 func TestDepthDoesNotAccumulateAcrossStatements(t *testing.T) {
 	var b strings.Builder
-	for i := 0; i < 40_000; i++ {
+	for i := 0; i < 10_000; i++ {
 		b.WriteString("x = f(g([1, {a: 2}]))\n")
 	}
 	if _, err := parser.Parse(b.String()); err != nil {
-		t.Fatalf("40000 shallow statements: %v; the depth counter is leaking per statement", err)
+		t.Fatalf("10000 shallow statements: %v; the depth counter is leaking per statement", err)
 	}
 }
 

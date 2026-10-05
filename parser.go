@@ -362,6 +362,15 @@ func (p *Parser) expect(tt token.Type) token.Token {
 // saved value stale by the relocation delta. MRI can use bytes; we cannot. The
 // honest consequence is that a production costing far more Go stack per frame
 // than any probed here would reach the real ceiling first.
+//
+// BOTH check sites are load-bearing, and that was measured rather than assumed.
+// Eleven bracket-like and ternary shapes all cross the limit inside
+// parseTernary -- but an assignment chain (`y = `*N) recurses through
+// parseExprOrAssign ALONE, at ratio 1.0, and crosses it there. Deleting the
+// check in parseExprOrAssign as dead code would therefore have left `y = `*N
+// unguarded; at 300000 it is 1.2 MB of source. The coverage gate named that
+// statement as uncovered, which was a missing TEST and not dead code -- the
+// distinction is worth the two minutes it takes to settle.
 const maxNestingDepth = 32768
 
 // failNestingTooDeep reports the limit as an ordinary parse error, because that
