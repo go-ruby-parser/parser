@@ -225,6 +225,16 @@ type Parser struct {
 	// `top_compstmt` (3029), so a BEGIN inside a BEGIN is at top level again, which
 	// parseExeBlock spells by lending its body the enclosing depth.
 	stmtDepth int
+
+	// exprDepth is the recursive-descent depth of the EXPRESSION grammar, and it
+	// exists to bound the Go stack rather than to disambiguate anything -- unlike
+	// patternDepth, bracketDepth and stmtDepth above. Without it, nested source
+	// overflows the goroutine stack, which is a FATAL Go error and not a panic:
+	// `recover()` never sees it, so neither this package's own recover in Parse
+	// nor an embedder's can contain it, and the process dies. Measured on
+	// v0.11.1: `x = ` + `f(`*50000 dies with `fatal error: stack overflow`,
+	// where MRI refuses the same shape at 10000 with a catchable SystemStackError.
+	exprDepth int
 	// preExe collects the statements of every `BEGIN { }` block. MRI accumulates
 	// them in `p->eval_tree_begin` and runs them before the program body; Parse
 	// prepends them for the same reason, in source order.
@@ -319,6 +329,46 @@ func (p *Parser) expect(tt token.Type) token.Token {
 		p.fail("expected %s, got %q (%s)", tt, p.cur().Lit, p.cur().Type)
 	}
 	return p.advance()
+}
+
+// maxNestingDepth is the ceiling on expression recursion.
+//
+// IT COUNTS FRAMES ENTERED, NOT BRACKETS NESTED, and the two are not the same
+// number. parseExprOrAssign and parseTernary nest within each other, and they
+// share this counter, so for every bracket-like production the counter runs at
+// exactly 2x the source nesting -- measured at nesting 2000: array 4001, and
+// hash/paren/call/interp/block 4003 each, i.e. 2.00. A ternary chain runs at
+// 1.00 (2003), because it re-enters only parseTernary. Getting this wrong is
+// not academic: an earlier revision set the limit to 16384 believing it was a
+// nesting count, which capped nesting at 8192 and rejected `[`*9500 -- a shape
+// MRI ACCEPTS. The test suite pins both ends for that reason.
+//
+// The bounds, both measured on v0.11.1, in nesting and in counter units:
+//
+//   - MRI 4.0.5 accepts `[`*9500 (`ruby -c` says "Syntax OK") and raises
+//     SystemStackError at 10000; it refuses hash/call/interp/block/ternary by
+//     8000 already, as a Prism SyntaxError. So 9500 nesting = 19000 counter
+//     units is the highest any probed shape must keep accepting.
+//   - this parser's own FATAL threshold is 50000 nesting for its worst
+//     productions (`f(`*N and `f { `*N; safe at 45000) and 55000 for `[`*N and
+//     `"#{`*N. So 45000 nesting = 90000 counter units is the deepest observed
+//     to be safe.
+//
+// 32768 sits 1.7x above the first and 2.7x below the second.
+//
+// The limit is a frame count rather than a stack-byte budget because Go offers
+// no portable stack-pointer read, and a saved stack address is useless as a
+// baseline: the runtime COPIES a goroutine's stack when it grows, leaving the
+// saved value stale by the relocation delta. MRI can use bytes; we cannot. The
+// honest consequence is that a production costing far more Go stack per frame
+// than any probed here would reach the real ceiling first.
+const maxNestingDepth = 32768
+
+// failNestingTooDeep reports the limit as an ordinary parse error, because that
+// is what callers can handle: Parse recovers parseError into its error return,
+// so an embedder gets an error instead of losing the process.
+func (p *Parser) failNestingTooDeep() {
+	p.fail("nesting of %d is too deep", p.exprDepth)
 }
 
 // fail never returns; the ast.Node result lets primary parsers write
@@ -2548,7 +2598,21 @@ func isPostfixStart(tt token.Type) bool {
 	return false
 }
 
+// parseExprOrAssign counts its own recursion before descending. The decrement is
+// deliberately NOT deferred: p.fail panics, that panic unwinds all the way to
+// Parse, and the Parser is discarded there -- so a skipped decrement on the
+// error path cannot be observed, and the hot path pays nothing for a defer.
 func (p *Parser) parseExprOrAssign() ast.Node {
+	p.exprDepth++
+	if p.exprDepth > maxNestingDepth {
+		p.failNestingTooDeep()
+	}
+	n := p.parseExprOrAssignBody()
+	p.exprDepth--
+	return n
+}
+
+func (p *Parser) parseExprOrAssignBody() ast.Node {
 	// A `not EXPR` prefix in value position (assignment RHS, head of a call's
 	// argument list): `x = not true`, `foo(not flag)`. `not` binds looser than the
 	// binary operators, so it wraps the whole following expression.
@@ -2810,7 +2874,21 @@ func (p *Parser) withRescueModifier(node ast.Node) ast.Node {
 // parseTernary handles `cond ? then : else`, binding looser than ranges/binary
 // operators but tighter than assignment, and right-associative. It desugars to
 // an If expression.
+// parseTernary counts its own recursion before descending. The decrement is
+// deliberately NOT deferred: p.fail panics, that panic unwinds all the way to
+// Parse, and the Parser is discarded there -- so a skipped decrement on the
+// error path cannot be observed, and the hot path pays nothing for a defer.
 func (p *Parser) parseTernary() ast.Node {
+	p.exprDepth++
+	if p.exprDepth > maxNestingDepth {
+		p.failNestingTooDeep()
+	}
+	n := p.parseTernaryBody()
+	p.exprDepth--
+	return n
+}
+
+func (p *Parser) parseTernaryBody() ast.Node {
 	cond := p.parseRange()
 	if !p.accept(token.QUESTION) {
 		return cond
