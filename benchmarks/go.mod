@@ -5,7 +5,7 @@
 // from inside this directory, or via `benchmarks/run.sh`.
 module github.com/go-ruby-parser/parser/benchmarks
 
-go 1.26.4
+go 1.27.1
 
 require github.com/go-ruby-parser/parser v0.8.0
 
