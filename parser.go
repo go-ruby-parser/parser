@@ -756,7 +756,21 @@ func (p *Parser) parseExeBlock() ast.Node {
 		p.preExe = append(p.preExe, body...)
 		return &ast.Begin{}
 	}
-	return &ast.Call{Name: "at_exit", Block: &ast.Block{Body: body}}
+	// SplatIndex MUST be set here. Its "no splat" value is -1, and Go's zero
+	// value for an int is 0 -- a perfectly good index. An END block desugared
+	// without it therefore announced a *splat parameter at position 0 with no
+	// parameters to hold it, and go-embedded-ruby's compiler emitted a
+	// rest-binding that read past an empty environment:
+	//
+	//	$ echo 'END { puts "E" }' > p.rb && rbgo p.rb
+	//	panic: runtime error: slice bounds out of range [:1] with capacity 0
+	//
+	// taking the whole process down on ordinary Ruby (go-embedded-ruby/ruby#805).
+	//
+	// The other two &ast.Block literals in this file set it, because they build
+	// their value from parsed parameters. This one has no parameters to parse,
+	// which is exactly how it came to be the one that forgot.
+	return &ast.Call{Name: "at_exit", Block: &ast.Block{SplatIndex: -1, Body: body}}
 }
 
 // parseKeywordLogical parses the low-precedence keyword operators `and`, `or`,
