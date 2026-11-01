@@ -68,7 +68,11 @@ A broad, practical subset of Ruby 4.0, all differential-tested against MRI:
   `(a, b)` destructuring group params, stabby lambdas `->(){}`, numbered params
   (`_1`) and `it`, `yield`, `super`, **multiple-value `return a, b`**.
 - **Classes/modules/metaprogramming:** `class`/`module`, inheritance, `@ivars`,
-  **`@@class variables`**, constants, singleton method defs
+  **`@@class variables`**, constants — including **non-ASCII** ones, since Ruby
+  decides constant-ness from the first character's *case* and not from `A-Z`, so
+  `Ἅbb` and the titlecase `ǅx` are constants while `μm`, `日x` and `אx` are
+  local variables (`token.IsConstStart` carries the rule and its citations) —
+  singleton method defs
   (`def self.foo`/`def obj.foo`/`def Const.foo`), **global-variable assignment**
   (`$g = …`), multiple assignment / destructuring, **adjacent string-literal
   concatenation** (`"a" "b"`).

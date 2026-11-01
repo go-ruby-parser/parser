@@ -6,6 +6,11 @@
 // the grammar grows (plan-rbgo.md §10).
 package token
 
+import (
+	"unicode"
+	"unicode/utf8"
+)
+
 type Type int
 
 const (
@@ -167,8 +172,52 @@ func LookupIdent(s string) Type {
 	if kw, ok := Keywords[s]; ok {
 		return kw
 	}
-	if c := s[0]; c >= 'A' && c <= 'Z' {
+	if IsConstStart(s) {
 		return CONST
 	}
 	return IDENT
+}
+
+// IsConstStart reports whether s begins with a character Ruby treats as the
+// start of a CONSTANT, rather than of a local variable.
+//
+// ⛔ The test used to be `s[0] >= 'A' && s[0] <= 'Z'`, which reads a BYTE. For
+// any multibyte character s[0] is a UTF-8 lead byte of 0xC2 or more, never in
+// 'A'..'Z', so every non-ASCII name was classified as a local — `ἍBB = 1`
+// created a local variable and no constant existed afterwards, where MRI reports
+// `defined?(ἍBB)` as "constant".
+//
+// The rule is not the lexer's: parse.y assumes tCONSTANT provisionally and
+// DOWNGRADES it with `if (result == tCONSTANT && is_local_id(ident)) result =
+// tIDENTIFIER` (parse.y:10453 at v4.0.9), so the decision belongs to the ID
+// system. rb_sym_constant_char_p (symbol.c:508-542) is where it is made:
+//
+//	ASCII                     -> ISUPPER
+//	non-ASCII, rb_enc_isupper -> constant
+//	non-ASCII, rb_enc_islower -> local
+//	titlecase letter, Unicode -> constant
+//	anything else (caseless)  -> local
+//
+// Go's unicode.IsUpper is that isupper and unicode.IsTitle that titlecase
+// property, so the two clauses below are those four lines. Measured against
+// /usr/bin/ruby through `Object.const_defined?`, which raises NameError for a
+// name that is not a constant name (rb_is_const_name, symbol.c:1287): Greek Ἅ,
+// Cyrillic Д and Turkish İ are constants; the titlecase digraphs ǅ and ǈ are
+// constants too; Greek μ, CJK 日, Hebrew א and Arabic ب are not — a caseless
+// letter starts a LOCAL variable in Ruby, which is why neither clause may be
+// loosened to "not lower".
+func IsConstStart(s string) bool {
+	if s == "" {
+		return false
+	}
+	if c := s[0]; c < utf8.RuneSelf {
+		return c >= 'A' && c <= 'Z'
+	}
+	r, size := utf8.DecodeRuneInString(s)
+	if r == utf8.RuneError && size <= 1 {
+		// Invalid UTF-8: rb_sym_constant_char_p returns FALSE when
+		// rb_enc_precise_mbclen finds no character, so this is a local.
+		return false
+	}
+	return unicode.IsUpper(r) || unicode.IsTitle(r)
 }
